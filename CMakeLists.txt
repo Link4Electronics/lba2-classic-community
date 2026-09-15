@@ -75,6 +75,11 @@ endif()
 # Performance options
 option(LBA2_NATIVE_ARCH "Use -march=native for host-optimized build (not portable)" OFF)
 
+# GPU renderer backends (OpenGL and SDL3 GPU), runtime-selectable via the
+# Display menu / config. Default ON builds them but keeps the software
+# renderer as the default at runtime; see docs/ (GPU renderer).
+option(GPURENDERER "Build the GPU renderer backends (OpenGL + SDL3 GPU)" ON)
+
 # Release packaging — static-link SDL3 and the GCC runtime so the binary
 # has no DLL dependencies beyond OS libraries. Used by the Windows release
 # workflow (single-exe portable ZIP). Default OFF; dev workflows keep the

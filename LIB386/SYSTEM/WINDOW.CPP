@@ -93,6 +93,77 @@ bool IsWindowInitialized() {
     return windowSystemInitialized;
 }
 
+SDL_Window *Window_GetSDLWindow(void) {
+    return sdlWindow;
+}
+
+/* ── OpenGL context (GL renderer backend) ────────────────────────────────── */
+
+static SDL_GLContext s_glContext = NULL;
+
+S32 Window_CreateGLContext(void) {
+    if (s_glContext != NULL) {
+        return TRUE;
+    }
+    if (sdlWindow == NULL) {
+        Log_Warn("Window_CreateGLContext: no window to attach a context to");
+        return FALSE;
+    }
+    if ((SDL_GetWindowFlags(sdlWindow) & SDL_WINDOW_OPENGL) == 0) {
+        /* The window was created for the software present path. The GL backend
+           must be selected before window creation so the present mode can add
+           the OpenGL flag; see INITMODE. */
+        Log_Warn("Window_CreateGLContext: window is not an OpenGL window "
+                 "(select the GL renderer before creating the window)");
+        return FALSE;
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    s_glContext = SDL_GL_CreateContext(sdlWindow);
+    if (s_glContext == NULL) {
+        Log_Warn("Window_CreateGLContext: SDL_GL_CreateContext failed: %s",
+                 SDL_GetError());
+        return FALSE;
+    }
+
+    if (!Window_GLMakeCurrent()) {
+        SDL_GL_DestroyContext(s_glContext);
+        s_glContext = NULL;
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+S32 Window_GLMakeCurrent(void) {
+    if (s_glContext == NULL || sdlWindow == NULL) {
+        return FALSE;
+    }
+    if (SDL_GL_MakeCurrent(sdlWindow, s_glContext) != 0) {
+        Log_Warn("Window_GLMakeCurrent: %s", SDL_GetError());
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void Window_GL_SwapWindow(void) {
+    if (s_glContext != NULL && sdlWindow != NULL) {
+        SDL_GL_SwapWindow(sdlWindow);
+    }
+}
+
+void Window_DestroyGLContext(void) {
+    if (s_glContext == NULL) {
+        return;
+    }
+    if (sdlWindow != NULL) {
+        SDL_GL_MakeCurrent(sdlWindow, NULL);
+    }
+    SDL_GL_DestroyContext(s_glContext);
+    s_glContext = NULL;
+}
+
 // --- Interface ---------------------------------------------------------------
 /* A platform with no windowed mode has no way back out of a windowed window:
    the Display submenu drops its Fullscreen row (Window_SupportsWindowedMode),

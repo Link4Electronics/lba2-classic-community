@@ -26,6 +26,12 @@ add_subdirectory(pol_work)
 add_subdirectory(SVGA)
 add_subdirectory(SYSTEM)
 
+if(GPURENDERER)
+  add_subdirectory(COMMON)
+  add_subdirectory(GL)
+  add_subdirectory(SDL3GPU)
+endif()
+
 if(ENABLE_POLY_RECORDING OR LBA2_BUILD_TESTS)
   add_subdirectory(SNAPSHOT)
 endif()

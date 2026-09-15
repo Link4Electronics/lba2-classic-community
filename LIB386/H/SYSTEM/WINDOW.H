@@ -78,6 +78,24 @@ bool Window_CanLoseNativeWindow(void);
 // pixels or simulation state.
 void Window_SetVSync(int enabled);
 
+// The native SDL window handle. GPU renderer backends (GL, SDL3 GPU) bind to a
+// context/device on this window and never go through the SDL software renderer.
+// Pointer identity only; the type is forward-declared so the header does not
+// pull in SDL3.
+typedef struct SDL_Window SDL_Window;
+SDL_Window *Window_GetSDLWindow(void);
+
+// OpenGL context lifecycle for the GL renderer backend. The context lives with
+// the window (it must be created on the same thread that owns the window);
+// the renderer backend consumes it via Window_GLMakeCurrent. CreateGLContext
+// requires the window to have been created as an OpenGL window (the present
+// mode selection does that when the GL backend is active); it returns FALSE
+// otherwise so a wrongly-ordered boot fails at init, not first draw.
+S32 Window_CreateGLContext(void);
+S32 Window_GLMakeCurrent(void);
+void Window_GL_SwapWindow(void);
+void Window_DestroyGLContext(void);
+
 void SetWindowRelativeMouse(bool enable);
 void ManageWindow();
 void HandleEventsWindow(const void *event);

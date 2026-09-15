@@ -12,6 +12,10 @@
    module's header belongs outside the backend guard below. */
 #include "AMBIANCE.H"
 
+/* TheEndCheckFile is called from PlayAllAcf with the MVIDEO_BACKEND=null builds
+   too, so the exit-path header must not be locked behind the SMACKER guard. */
+#include "BOOT_EXIT.H"
+
 #ifdef USE_MVIDEO_SMACKER
 #include "INPUT.H"
 #include "MESSAGE.H"
@@ -41,7 +45,6 @@ int VideoLogIsEnabled(void) {
 #include <stdio.h>
 #include <string.h>
 #include "CONSOLE/CONSOLE.H"
-#include "BOOT_EXIT.H"
 #endif
 
 char PathAcf[ADELINE_MAX_PATH];
