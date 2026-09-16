@@ -54,6 +54,11 @@ endif()
 # Activity wrapper. On all other platforms it is a standalone executable.
 if(ANDROID)
     add_library(${LBA2_EXECUTABLE_NAME} SHARED ${SOURCES_FILES} ${SOURCES_FILES_ASM} ${SOURCES_FILES_WIN} ${SOURCES_FILES_MACOS} ${EMBEDDED_LBA2_CFG_CPP})
+    # The APK ships the library as libmain.so, the name SDL's activity loads, and a
+    # tombstone names a library by its SONAME. Matching them lets a tombstone and
+    # the engine's crash block name the same module.
+    set_target_properties(${LBA2_EXECUTABLE_NAME} PROPERTIES NO_SONAME ON)
+    target_link_options(${LBA2_EXECUTABLE_NAME} PRIVATE -Wl,-soname,libmain.so)
 else()
     add_executable(${LBA2_EXECUTABLE_NAME} ${SOURCES_FILES} ${SOURCES_FILES_ASM} ${SOURCES_FILES_WIN} ${SOURCES_FILES_MACOS} ${EMBEDDED_LBA2_CFG_CPP})
 endif()
@@ -105,6 +110,14 @@ if(APPLE)
                 $<TARGET_BUNDLE_DIR:${LBA2_EXECUTABLE_NAME}>
         COMMENT "Ad-hoc codesigning ${LBA2_PRODUCT_NAME}.app"
         VERBATIM)
+
+    # A Mach-O binary carries no DWARF: dsymutil collects it from the object files
+    # the link read. With LTO those are temporaries the linker deletes, and the dSYM
+    # comes out empty unless the linker is told to keep them.
+    if(LBA2_RELEASE_SYMBOLS)
+        target_link_options(${LBA2_EXECUTABLE_NAME} PRIVATE
+            "-Wl,-object_path_lto,${CMAKE_CURRENT_BINARY_DIR}/${LBA2_EXECUTABLE_NAME}-lto")
+    endif()
 endif()
 # GCC LTO mis-infers T_PLASMA::data_start size when ptrc writes into Malloc tail (see ANIMTEX.CPP plasma case).
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
