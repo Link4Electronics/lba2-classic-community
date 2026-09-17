@@ -21,7 +21,7 @@ set(SOURCES_FILES AMBIANCE.CPP BOOT_EXIT.CPP DISTRIB.CPP AUDIO_BALANCE.CPP AUDIO
         CONFIG_FILE.CPP DART.CPP DEMO_SEED.CPP DIRECTORIES.CPP DISKFUNC.CPP EMBEDDED_CFG_WRITE.CPP EXIT_SCREEN.CPP EXTFUNC.CPP EXTRA.CPP FICHE.CPP FLOW.CPP FOLLOWCAM.CPP GAMEMENU.CPP GAMEMENU_MOUSE.CPP MENU_KEYNAV.CPP MENU_LABELS.CPP GERELIFE.CPP
         GERETRAK.CPP GLOBAL.CPP GRILLE.CPP HOLOBODY.CPP HOLOGLOB.CPP HOLOPLAN.CPP IMPACT.CPP INCRUST.CPP INITADEL.C
         INPUT.CPP INPUT_BINDINGS.CPP INTEXT.CPP INVENT.CPP JOYSTICK.CPP LZSS.CPP MEM.CPP MESSAGE.CPP MUSIC.CPP OBJECT.CPP PATCH.CPP IMAGE_LOAD.CPP PERFTRACE.CPP PERSO.CPP
-        RES_CATALOG.CPP RES_DISCOVERY.CPP RES_MENU.CPP RES_PICKER.CPP RES_SWITCH.CPP
+        RES_CATALOG.CPP RES_DISCOVERY.CPP RES_MENU.CPP RES_PICKER.CPP RES_SWITCH.CPP RENDER_SWITCH.CPP
         PLAYACF.CPP POF.CPP RAIN.CPP RECORD.CPP RECORD_FORMAT.CPP SETTINGS.CPP SAVEGAME.CPP SAVEGAME_WIRE.CPP SAVEGAME_LOAD_BOUNDS.CPP SAVENAME_VALIDATION.CPP SCAN.CPP SORT.CPP TOUCH_INPUT.CPP VALIDPOS.CPP VERSION.CPP WAGON.CPP ZV.CPP)
 # set(SOURCES_FILES_ASM COMPRESS.ASM FIRE.ASM FLOW_A.ASM FUNC.ASM GRILLE_A.ASM PLASMA.ASM)
 #set(SOURCES_FILES_ASM_EXCLUDED COPY.ASM)
@@ -129,11 +129,15 @@ target_link_libraries(${LBA2_EXECUTABLE_NAME} PRIVATE console)
 target_include_directories(${LBA2_EXECUTABLE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/CONSOLE)
 # Explicit order matters for GNU static linking: poly references RoundType/ROUND in libsys (UTILS.CPP);
 # sys must follow poly. (Transitive deps from 3dext alone order sys before poly and break -m32 links.)
-target_link_libraries(${LBA2_EXECUTABLE_NAME} PRIVATE 3dext 3D ail ani fio obj poly svg sys ${LBA2_SDL3_TARGET})
+target_link_libraries(${LBA2_EXECUTABLE_NAME} PRIVATE 3dext 3D ail ani fio obj poly svg sys gpur gly gs3 ${LBA2_SDL3_TARGET})
+# The GL renderer core is always built (DEFINES/OFF picks stubs in
+# LIB386/GL/RENDER_GL.CPP), so the engine always links it. USE_GPURENDERER
+# selects the parts of SOURCES that are GPU-specific (boot path, menu rows,
+# terrain hook call sites) — a GPURENDERER=OFF build compiles them out and
+# the runtime renderer state stays 0.
+target_link_libraries(${LBA2_EXECUTABLE_NAME} PRIVATE gly)
 if(GPURENDERER)
-    # The GPU renderer's common layer and backends. The engine does not touch
-    # these symbols yet; the link proves the archives resolve.
-    target_link_libraries(${LBA2_EXECUTABLE_NAME} PRIVATE gpur gly gs3)
+    target_compile_definitions(${LBA2_EXECUTABLE_NAME} PRIVATE USE_GPURENDERER)
 endif ()
 if (WIN32)
     target_link_libraries(${LBA2_EXECUTABLE_NAME} PRIVATE gdi32 user32 ddraw winmm kernel32)

@@ -10,6 +10,7 @@
 #include "FOLLOWCAM_CFG.H"   /* and their defaults */
 #include "INPUT.H"           /* Read/WriteInputConfig, Read/WriteGamepadConfig */
 #include "RES_SWITCH.H"
+#include "RENDER_SWITCH.H"
 #include <POLYGON/POLYFILT.H> /* PolyTexFilter / EnvTexFilter */
 #include <SVGA/SCREEN.H>
 #include <SYSTEM/KEYBOARD_KEYS.H> /* K_F12, the console toggle default */
@@ -102,6 +103,12 @@ static const T_SETTING BootSettings[] = {
     {"DetailLevel", NULL, NULL, &DetailLevel, SETTING_CLAMP, MAX_DETAIL_LEVEL, 0, MAX_DETAIL_LEVEL, NULL, NULL, NULL},
     {"FullScreen", NULL, NULL, &VideoFullScreen, SETTING_OR_DEFAULT, TRUE, 0, 1, NULL, NULL, NULL},
     {"DisplayFullScreen", NULL, NULL, &DisplayFullScreen, SETTING_OR_DEFAULT, TRUE, 0, 1, NULL, NULL, NULL},
+    /* The renderer's backend, a GpuRendererBackendId value (0 = software). Boot
+       reads it before InitGraphics via Renderer_LoadBootChoice; the runtime
+       switch (Display menu) and the settings pass below converge on the same
+       global, so a choice always describes what the display shows. */
+    {"Renderer", NULL, NULL, &DisplayRenderer, SETTING_OR_DEFAULT, GPU_RENDERER_BACKEND_NONE,
+     0, GPU_RENDERER_BACKEND_COUNT - 1, NULL, NULL, NULL},
     {"VSync", NULL, NULL, &DisplayVSync, SETTING_OR_DEFAULT, TRUE, 0, 1, &StoredVSync, ForcedVSync, NULL, &SourceVSync},
     {"DitherShading", NULL, "gfx_dither", &GfxDitherShading, SETTING_OR_DEFAULT, FALSE, 0, 1, NULL, NULL, NULL, NULL,
      "Ordered dither on Gouraud shade rows (softens 16-step banding)"},

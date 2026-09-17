@@ -1,5 +1,6 @@
 #include "C_EXTERN.H"
 
+#include "ANIMTEX.H" /* AtlasTextureDirty (defined in LIB386/GL/RENDER_GL.CPP) */
 #include "PLASMA.H"
 #include "FIRE.H"
 
@@ -215,6 +216,11 @@ void DoTextureAnimation() {
         return;
 
     LastAnimationTimer = timer;
+
+    /* The effects below rewrite atlas pages (PtrMap) in place; the GPU
+       renderer must re-upload the page it mirrored. Raised after the timing
+       gate so it only fires on frames that actually animation. */
+    AtlasTextureDirty = 1;
 
     for (n = 0; n < NbTexEffects; n++) {
         switch (TexEffectList[n].Type) {

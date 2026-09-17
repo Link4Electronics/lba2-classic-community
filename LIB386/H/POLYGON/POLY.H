@@ -76,6 +76,7 @@ typedef struct {
     U16 Pt_Light; ///< intensity (0.8.0)
     U16 Pt_ZO;    ///< normalized Z
     S32 Pt_W;     ///< 2^31 / Z (non normalized)
+    U16 Pt_RepMask; ///< texture repeat mask (GL only; unused by SW rasterizer)
 } Struc_Point;
 #pragma pack(pop)
 
@@ -174,6 +175,18 @@ void Switch_Fillers(U32 Bank);
 
 S32 Fill_Poly(S32 Type_Poly, S32 Color_Poly, S32 Nb_Points,
               Struc_Point *Ptr_Points);
+
+/* Optional GPU-acceleration seam. When a hook is set, every Fill_Poly call is
+   handed to it with the raw engine arguments. A non-zero return means the
+   hook consumed the polygon (the GL renderer drew it into its own buffer) and
+   the software rasteriser does not run; zero lets the software path handle it
+   (polys the GL renderer does not cover fall back to SW). NULL (the default)
+   keeps Fill_Poly byte-identical to the ASM original, which the equivalence
+   tests rely on. The GPU renderer registers itself via Fill_Poly_SetHook on
+   init and unregisters on shutdown. */
+typedef S32 (*FillPolyHookFn)(S32 Type_Poly, S32 Color_Poly, S32 Nb_Points,
+                              Struc_Point *Ptr_Points);
+void Fill_Poly_SetHook(FillPolyHookFn hook);
 
 extern void Fill_Sphere(S32 Type_Sphere, S32 Color_Sphere, S32 Centre_X,
                         S32 Centre_Y, S32 Rayon, S32 zBufferValue); ///< Do Not call from C

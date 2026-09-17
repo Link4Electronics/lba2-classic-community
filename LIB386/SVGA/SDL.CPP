@@ -35,11 +35,36 @@ static PrePresentFn s_overlayPrePresent = NULL;
 static PresentTimingFn s_presentBegin = NULL;
 static PresentTimingFn s_presentEnd = NULL;
 static U32 paletteLUT[PAL_MAX_COLORS];
+
+/* GPU-acceleration seam for the present step. Registered by the GPU renderer
+   when it goes active (see SetGpuPresentHooks below); NULL on the software
+   path. The function-pointer indirection (rather than calling the renderer
+   directly) keeps this library free of GPU dependencies, which the ASM
+   equivalence tests link without. */
+static GpuPresentFn s_gpuPresent = NULL;
+static GpuIsActiveFn s_gpuIsActive = NULL;
+
+void SetGpuPresentHooks(GpuPresentFn present, GpuIsActiveFn isActive) {
+    s_gpuPresent = present;
+    s_gpuIsActive = isActive;
+}
+
+S32 GpuPresentIsActive(void) {
+    return (s_gpuIsActive != NULL) ? s_gpuIsActive() : 0;
+}
 #if defined(__ANDROID__)
 /* Persistent staging buffer for the Android present path (see
  * AcquirePresentTarget): reused across frames, resized on demand, freed in
  * DestroyVideoSurface. */
 static StagingBuffer s_androidStaging = {NULL, 0, 0};
+#else
+/* Persistent staging buffer for desktop GPU-present frames. Desktop normally
+ * locks the streaming texture (zero-copy), but a GPU renderer backend owns a
+ * window that has no such texture, so the lock cannot be taken there; the
+ * frame is staged here (same pattern as the Android path) and handed to the
+ * GPU present hook, which composites the Log overlay over its own framebuffer.
+ * Same lifetime contract as s_androidStaging. */
+static StagingBuffer s_gpuPresentStaging = {NULL, 0, 0};
 #endif
 
 // --- Private functions -------------------------------------------------------
@@ -53,6 +78,14 @@ static void RebuildPaletteLUT() {
         SDL_Color c = sdlPalette->colors[i];
         paletteLUT[i] = ((U32)0xFF << 24) | ((U32)c.r << 16) | ((U32)c.g << 8) | c.b;
     }
+}
+
+/* The GPU renderer (LIB386/GL/RENDER_GL.CPP) converts this palette LUT to an
+   RGBA texture atlas; it must see the same entries the present path uses, or
+   GPU-drawn content would disagree with what Log shows. This is the same
+   256-entry ARGB table PresentFrame fills Log with. */
+const U32 *GL_GetPaletteLUT(void) {
+    return paletteLUT;
 }
 
 // --- Initialization ----------------------------------------------------------
@@ -74,6 +107,8 @@ void EndVideo() {
 void DestroyVideoSurface() {
 #if defined(__ANDROID__)
     StagingBufferFree(&s_androidStaging);
+#else
+    StagingBufferFree(&s_gpuPresentStaging);
 #endif
     if (Phys) {
         free(Phys);
@@ -275,6 +310,21 @@ static void CommitPresentTarget(void *pixels, U32 pitch) {
 }
 #else
 static bool AcquirePresentTarget(void **pixels, U32 *pitch) {
+    if (s_gpuPresent != NULL && s_gpuIsActive != NULL && s_gpuIsActive()) {
+        /* A GPU backend owns the window: recreating it for GL/SDL3GPU tore
+           the software renderer and streaming texture down, so there is
+           nothing to lock. Stage the frame here; PresentFrame hands exactly
+           this buffer to the GPU present hook below. */
+        void *p = StagingBufferEnsure(&s_gpuPresentStaging, ModeDesiredX,
+                                      ModeDesiredY);
+        if (p == NULL) {
+            return false;
+        }
+        *pixels = p;
+        *pitch = ModeDesiredX * sizeof(U32);
+        return true;
+    }
+
     int texPitch;
     if (!LockRendererTexture(pixels, &texPitch)) {
         return false;
@@ -321,6 +371,22 @@ static void PresentFrame() {
             s_prePresent((U32 *)stagingPixels, stagingPitch, ModeResX, ModeResY, paletteRgb);
         if (s_overlayPrePresent)
             s_overlayPrePresent((U32 *)stagingPixels, stagingPitch, ModeResX, ModeResY, paletteRgb);
+    }
+
+    if (s_gpuPresent != NULL && s_gpuIsActive != NULL && s_gpuIsActive()) {
+        /* GPU present: hand the Log ARGB overlay to the renderer, which
+           composites it over its GPU framebuffer (the GL 3D pass) and swaps
+           the window itself. When no renderer is active these hooks are NULL
+           and the software streaming-texture commit below runs, exactly as
+           before. The Log buffer uses palette index 0 as the transparent
+           colour (sprites, INCRUST panels), so the overlay only shows 3D
+           behind those pixels if entry 0 carries alpha 0 — the GL 3D path
+           already forces this on its own palette texture via GL_UploadPalette,
+           and the same is applied here to the overlay's ARGB conversion. */
+        paletteLUT[0] &= 0x00FFFFFF;
+        s_gpuPresent(stagingPixels, stagingPitch, ModeDesiredX, ModeDesiredY,
+                     FALSE);
+        return;
     }
 
     CommitPresentTarget(stagingPixels, stagingPitch);

@@ -8,6 +8,13 @@
 extern "C" {
 #endif
 
+/* GPU renderer signals, both defined once in LIB386/GL/RENDER_GL.CPP with C
+   linkage. AtlasTextureDirty is raised here whenever DoTextureAnimation bakes
+   page content in place (the GPU must re-upload the atlas page); DisplayTexFilter
+   is the bilinear sampling toggle the Display settings table and menu own. */
+extern S32 AtlasTextureDirty;
+extern S32 DisplayTexFilter;
+
 #ifdef __cplusplus
 }
 #endif

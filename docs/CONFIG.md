@@ -54,6 +54,7 @@ lba2.cfg stores user preferences and last-save info. Read at startup, written at
 | DetailLevel | int | 0–3 | 3 | 0=min (no rain, no sea, no horizon), 1=486, 2=base Pentium, 3=max. Drives Shadow, RainEnable, MaxPolySea, FlagDrawHorizon |
 | FullScreen | int | 0, 1 | 1 | 0=small videos, 1=fullscreen videos. Invalid values → 1 |
 | DisplayFullScreen | int | 0, 1 | 1 | 0=windowed display, 1=fullscreen display. Invalid values → 0 |
+| Renderer | int | 0–2 | 0 | Render backend: 0=software, 1=OpenGL/ES, 2=SDL3 GPU. Invalid values → 0. Set by the Display submenu's Renderer entry and honoured at boot (the window is created to match the choice); `LBA2_GPU_RENDERER=opengl\|sdl3gpu` overrides for one run without persisting. A runtime switch that cannot start falls back to software, the same as a boot-time failure. See [RENDERER.md](RENDERER.md) |
 | FlagDisplayText | string | ON, OFF | ON | Case-insensitive. Any other value → ON |
 | WaveVolume | int | 0–127 | 97 | Sample/SFX volume |
 | VoiceVolume | int | 0–127 | 112 | Voice volume |

@@ -9,10 +9,6 @@
 // post-process — lives in the common layer (LIB386/COMMON) and arrives here
 // precomputed. That layer also owns the SW fallbacks; a triangle reaching
 // DrawTriangles is by definition taking the GL path.
-//
-// Shaders are the shared sources in LIB386/COMMON/*.glsl (embedded at build
-// time); GpuShader_FilterGL resolves GL_ES/GL_CORE at runtime so desktop
-// and GLES use identical code with only the #version header differing.
 //──────────────────────────────────────────────────────────────────────────
 #include <GL/RENDER_GL.H>
 
@@ -20,11 +16,25 @@
 #include <SYSTEM/WINDOW.H>
 #include <GPU/GPURENDERER_BACKEND.H>
 
+/* ── Renderer state shared with the engine (C linkage) ─────────────────────
+   Owned by the GL renderer even in software builds (gly is always built, as
+   stubs when GPURENDERER is off) so every consumer links against one
+   definition. DisplayTexFilter selects bilinear CLUT/overlay sampling in GL
+   mode; RenderQuality is the FBO supersample factor; AtlasTextureDirty is
+   raised by DoTextureAnimation when the 256x256 atlas page is mutated in
+   place. */
+extern "C" {
+S32 DisplayTexFilter = TRUE; /* bilinear by default in GL mode */
+S32 RenderQuality = 1;       /* native resolution by default */
+S32 AtlasTextureDirty = 0;
+}
+
+#ifdef USE_GPURENDERER
+
 /* ── GL headers ───────────────────────────────────────────────────────────
-   The GL dialect is a build decision: USE_GLES2 (set for Android in
-   CMakeLists.txt) selects the SDL GLES2 header set, otherwise the desktop
-   SDL_opengl.h. This file must not name a platform: it renders against
-   whatever GL dialect the build configured. */
+   The GL dialect is a build decision: CMake defines USE_GLES2 for Android
+   (this file never names a platform, per CODESTYLE "Layers"). USE_GLES2 picks
+   the SDL GLES2 header set, otherwise the desktop SDL_opengl.h. */
 #ifdef USE_GLES2
 #include <SDL3/SDL_opengles2.h>
 #else
@@ -34,7 +44,6 @@
 
 #include <SDL3/SDL.h>
 #include <string.h>
-#include <stdlib.h>
 
 /* paletteLUT builds 0xAARRGGBB which in little-endian memory is
    [B, G, R, A] — use GL_BGRA to match the byte layout. */
@@ -44,17 +53,264 @@
 #define FMT_BGRA 0x80E1 /* GL_BGRA_EXT */
 #endif
 
-/* ── Embedded shared shaders (LIB386/COMMON, raw .glsl) ─────────────────── */
-#include "present.vert.glsl.h"
-#include "present.frag.glsl.h"
-#include "clut.vert.glsl.h"
-#include "clut.frag.glsl.h"
+/* ── Shader sources (GL 2.1 / GLES 2.0 compatible) ─────────────────────── */
+
+#ifdef USE_GLES2
+#define GLSL_VERT_HEADER "#version 100\n"
+#define GLSL_FRAG_HEADER "#version 100\nprecision mediump float;\n"
+#else
+#define GLSL_VERT_HEADER "#version 110\n"
+#define GLSL_FRAG_HEADER "#version 110\n"
+#endif
+
+/* ── Present shader (2D overlay quad) ───────────────────────────────────── */
+
+static const char *s_vertSrc =
+    GLSL_VERT_HEADER
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aTexCoord;\n"
+    "varying vec2 vTexCoord;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+    "    vTexCoord = aTexCoord;\n"
+    "}\n";
+
+static const char *s_fragSrc =
+    GLSL_FRAG_HEADER
+    "uniform sampler2D uTex;\n"
+    "varying vec2 vTexCoord;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(uTex, vTexCoord);\n"
+    "}\n";
+
+/* ── CLUT shader (3D Gouraud-textured polygons) ─────────────────────────── */
+/* Replicates the SW CLUT pipeline:
+   1. Sample atlas  → 8-bit palette index (texel)
+   2. CLUT lookup   → texel lit by gouraud intensity
+   3. Palette lookup → ARGB color
+   The CLUT is the full 64 KB fog table (256×256). SetCLUT selects a
+   16-row block within it, but the gouraud value's high byte indexes
+   into the correct rows directly. */
+
+static const char *s_clutVertSrc =
+    GLSL_VERT_HEADER
+    "attribute vec2 aPos;\n"
+    "attribute vec2 aTexCoord;\n"
+    "attribute float aLight;\n"
+    "attribute float aZ;\n"
+    "attribute float aRepMask;\n"
+    "uniform vec2 uScreenScale;\n" /* 2.0/resX, 2.0/resY */
+    /* Perspective-correct interpolation: the SW rasterizer
+       (POLYTZF/POLYTEXZ, Z-textured types 16-24) interpolates
+       MapU/MapV/ZBuf over W = 1/Z.  w=1.0 in clip space makes varyings
+       interpolate affinely in screen space, so premultiply by 1/Z here
+       and divide in the fragment shader.  aZ is GET_ZO(Z0) (proportional
+       to Z0); the constant of proportionality cancels in the fragment
+       division.  uPerspCorrect selects the corrected pair; otherwise the
+       raw affine varyings are used (types 8-15, SW POLYTEXT/POLYGTEX). */
+    "varying vec2 vTexCoord;\n"
+    "varying vec2 vTexCoordOverW;\n"
+    "varying float vInvW;\n"
+    "varying float vLight;\n"
+    "varying float vRepMask;\n"
+    "varying float vZ;\n"
+    "varying float vZOverW;\n"
+    "void main() {\n"
+    "    float cx = aPos.x * uScreenScale.x - 1.0;\n"
+    "    float cy = 1.0 - aPos.y * uScreenScale.y;\n"
+    "    gl_Position = vec4(cx, cy, 1.0 - aZ / 65535.0, 1.0);\n"
+    "    float invW = 1.0 / max(aZ, 1.0);\n"
+    "    vTexCoord = aTexCoord;\n"
+    "    vTexCoordOverW = aTexCoord * invW;\n"
+    "    vInvW = invW;\n"
+    "    vLight = aLight;\n"
+    "    vRepMask = aRepMask;\n"
+    "    vZ = aZ;\n"
+    "    vZOverW = aZ * invW;\n"
+    "}\n";
+
+static const char *s_clutFragSrc =
+    GLSL_FRAG_HEADER
+    "uniform sampler2D uAtlas;\n"   /* 256×256 LUMINANCE */
+    "uniform sampler2D uCLUT;\n"    /* 256×256 LUMINANCE (fog table) */
+    "uniform sampler2D uPalette;\n" /* 256×1 BGRA (paletteLUT) */
+    "uniform int uPolyMode;\n"      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth */
+    "uniform float uFlatColor;\n"   /* palette index (mode 1) / CLUT column (mode 3) */
+    "uniform float uCLUTBaseRow;\n" /* CLUT row offset for gouraud table (mode 3) */
+    "uniform float uScaledFogNear;\n" /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
+    "uniform float uFogRowScale;\n"   /* Fill_Fog_Factor / 65536 (fog-smooth distance, mode 5) */
+    "uniform int uAlphaMode;\n"     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
+    "uniform int uBilinear;\n"      /* 0=nearest 1=bilinear CLUT sampling */
+    "uniform int uChromaKey;\n"     /* 0=no chroma key 1=discard index 0 */
+    "uniform int uPerspCorrect;\n"  /* 1=perspective-correct UV/Z (types 16-24) */
+    "varying vec2 vTexCoord;\n"
+    "varying vec2 vTexCoordOverW;\n"
+    "varying float vInvW;\n"
+    "varying float vLight;\n"
+    "varying float vRepMask;\n"
+    "varying float vZ;\n"
+    "varying float vZOverW;\n"
+    /* Look up a palette index through the CLUT, returning the final RGBA
+       color.  `palIdx` is the raw atlas texel (palette index) and
+       `gouraudRow` the CLUT row selected by the gouraud intensity. */
+    "vec4 clutLookup(float palIdx, float gouraudRow) {\n"
+    "    vec2 cuv = vec2((palIdx + 0.5) / 256.0,\n"
+    "                     (gouraudRow + 0.5) / 256.0);\n"
+    "    float lit = texture2D(uCLUT, cuv).r * 255.0;\n"
+    "    return texture2D(uPalette, vec2((lit + 0.5) / 256.0, 0.5));\n"
+    "}\n"
+    /* Bilinear CLUT sampling: sample 4 atlas texels, CLUT each one, then
+       interpolate the resulting RGBA colors.  This avoids the artifact
+       where hardware bilinear on palette indices produces garbage colors. */
+    "vec4 bilinearCLUT(vec2 tc, float widthMask, float heightMask,\n"
+    "                   float gouraudRow) {\n"
+    "    float u = mod(tc.x, widthMask + 1.0);\n"
+    "    float v = mod(tc.y, heightMask + 1.0);\n"
+    "    float iu = floor(u);\n"
+    "    float iv = floor(v);\n"
+    "    float fu = u - iu;\n"
+    "    float fv = v - iv;\n"
+    "    /* Wrap each of the 4 texel positions */\n"
+    "    vec2 p00 = vec2(mod(iu, widthMask + 1.0),\n"
+    "                     mod(iv, heightMask + 1.0));\n"
+    "    vec2 p10 = vec2(mod(iu + 1.0, widthMask + 1.0),\n"
+    "                     mod(iv, heightMask + 1.0));\n"
+    "    vec2 p01 = vec2(mod(iu, widthMask + 1.0),\n"
+    "                     mod(iv + 1.0, heightMask + 1.0));\n"
+    "    vec2 p11 = vec2(mod(iu + 1.0, widthMask + 1.0),\n"
+    "                     mod(iv + 1.0, heightMask + 1.0));\n"
+    "    /* Sample atlas → CLUT → palette for each texel */\n"
+    "    float t00 = texture2D(uAtlas, (p00 + 0.5) / 256.0).r * 255.0;\n"
+    "    float t10 = texture2D(uAtlas, (p10 + 0.5) / 256.0).r * 255.0;\n"
+    "    float t01 = texture2D(uAtlas, (p01 + 0.5) / 256.0).r * 255.0;\n"
+    "    float t11 = texture2D(uAtlas, (p11 + 0.5) / 256.0).r * 255.0;\n"
+    /* Chroma key: discard if nearest texel (p00) is index 0.
+       Matches SW nearest-neighbor behaviour for INCRUST types. */
+    "    if (uChromaKey != 0 && t00 < 0.5) discard;\n"
+    "    vec4 c00 = clutLookup(t00, gouraudRow);\n"
+    "    vec4 c10 = clutLookup(t10, gouraudRow);\n"
+    "    vec4 c01 = clutLookup(t01, gouraudRow);\n"
+    "    vec4 c11 = clutLookup(t11, gouraudRow);\n"
+    "    return mix(mix(c00, c10, fu), mix(c01, c11, fu), fv);\n"
+    "}\n"
+    "void main() {\n"
+    "    vec4 color;\n"
+    "    float alphaOverride = 0.0;\n"
+    /* Select perspective-corrected or affine texture/Z varyings.
+       uPerspCorrect is 1 for Z-textured types (16-24), where the SW
+       rasterizer divides MapU/MapV/ZBuf by W = 1/Z; types 8-15
+       (SW POLYTEXT/POLYGTEX) interpolate affinely. */
+    "    vec2 tc = mix(vTexCoord, vTexCoordOverW / vInvW, float(uPerspCorrect));\n"
+    "    float vZsel = mix(vZ, vZOverW / vInvW, float(uPerspCorrect));\n"
+     "    if (uPolyMode == 0) {\n"
+     /* Textured: atlas → CLUT → palette */
+     "        tc = tc / 256.0;\n"
+     "        float widthMask = mod(vRepMask, 256.0);\n"
+     "        float heightMask = floor(vRepMask / 256.0);\n"
+     /* SW init: Fill_CurGouraudMin = (Pt_Light << 8) + 0x8000.
+        The +128 (0x80) rounding bias shifts the CLUT row by 1 in some
+        cases — same bias applied in polyMode 2. */
+     "        float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;\n"
+    "        if (uBilinear != 0) {\n"
+    "            color = bilinearCLUT(tc, widthMask, heightMask, gouraudRow);\n"
+    "        } else {\n"
+    "            float wrappedU = mod(tc.x, widthMask + 1.0);\n"
+    "            float wrappedV = mod(tc.y, heightMask + 1.0);\n"
+    "            vec2 atlasUV = vec2((floor(wrappedU) + 0.5) / 256.0,\n"
+    "                                (floor(wrappedV) + 0.5) / 256.0);\n"
+    "            float texel = texture2D(uAtlas, atlasUV).r * 255.0;\n"
+    /* Chroma key: atlas texel 0 = transparent (skipped by SW rasterizer
+       at the Log buffer level).  Discard before CLUT so the fog table
+       cannot remap index 0 to an opaque value.
+       Only INCRUST types (12-15, 20-23) have chroma key; non-INCRUST
+       types (8-11, 16-19, 24) write all texels including index 0. */
+    "            if (uChromaKey != 0 && texel < 0.5) discard;\n"
+    "            color = clutLookup(texel, gouraudRow);\n"
+    "        }\n"
+    "    } else if (uPolyMode == 1) {\n"
+    /* Flat solid: single palette color */
+    "        float palIdx = uFlatColor;\n"
+    "        color = texture2D(uPalette,\n"
+    "                 vec2((palIdx + 0.5) / 256.0, 0.5));\n"
+    "    } else if (uPolyMode == 2) {\n"
+    /* Gouraud (types 4/5): palette = (color + (light+128)/256).
+       SW init: Fill_CurGouraudMin = (Pt_Light << 8) + 0x8000 + (color << 16).
+       The +0x8000 rounding bias means the palette index is
+       (color + (Pt_Light + 128) / 256), not (color + Pt_Light / 256). */
+    "        float palIdx = mod(uFlatColor + floor((vLight + 128.0) / 256.0), 256.0);\n"
+    "        color = texture2D(uPalette,\n"
+    "                 vec2((palIdx + 0.5) / 256.0, 0.5));\n"
+    "    } else if (uPolyMode == 4) {\n"
+    /* Texture without CLUT (types 8 and 12):
+       SW Filler_Texture / Filler_TextureChromaKey writes texel as palette
+       index directly (*line = texel).  No CLUT lookup — the atlas texel
+       IS the palette index.  Chroma key controlled by uChromaKey. */
+    "        tc = tc / 256.0;\n"
+    "        float widthMask = mod(vRepMask, 256.0);\n"
+    "        float heightMask = floor(vRepMask / 256.0);\n"
+    "        float wrappedU = mod(tc.x, widthMask + 1.0);\n"
+    "        float wrappedV = mod(tc.y, heightMask + 1.0);\n"
+    "        vec2 atlasUV = vec2((floor(wrappedU) + 0.5) / 256.0,\n"
+    "                            (floor(wrappedV) + 0.5) / 256.0);\n"
+    "        float palIdx = texture2D(uAtlas, atlasUV).r * 255.0;\n"
+    /* Chroma key: atlas texel 0 = transparent.
+       Only INCRUST types have chroma key. */
+    "        if (uChromaKey != 0 && palIdx < 0.5) discard;\n"
+    "        color = texture2D(uPalette,\n"
+    "                 vec2((palIdx + 0.5) / 256.0, 0.5));\n"
+    "    } else if (uPolyMode == 5) {\n"
+    /* Texture Z Fog Smooth (type 24, e.g. sea/sky):
+       SW Filler_TextureZFogSmoothZBuf / ...NZW use a fixed CLUT base
+       (PtrCLUTFog + 12*256) plus a per-pixel distance-based fog row,
+       IGNORING Pt_Light entirely.  Replicating the SW math:
+       zBufVal = interpolated Pt_ZO (the batch aZ)
+       fogDist = max(zBufVal - Fill_ScaledFogNear, 0)
+       fogRow  = (fogDist * Fill_Fog_Factor) >> 8, masked & 0xF000
+       CLUT index = PtrCLUTFog + 12*256 + fogRow + texel
+       As a CLUT row: (12*256 + fogRow)/256 = 12 + fogRow/256, where
+       fogRow/256 = ((fogDist * Fill_Fog_Factor) >> 16) & 0xF0.
+       uFogRowScale = Fill_Fog_Factor / 65536, so
+        floor(zDist * uFogRowScale) = (fogDist * Fill_Fog_Factor) >> 16. */
+     "        tc = tc / 256.0;\n"
+     "        float widthMask = mod(vRepMask, 256.0);\n"
+    "        float heightMask = floor(vRepMask / 256.0);\n"
+    "        float wrappedU = mod(tc.x, widthMask + 1.0);\n"
+    "        float wrappedV = mod(tc.y, heightMask + 1.0);\n"
+    "        vec2 atlasUV = vec2((floor(wrappedU) + 0.5) / 256.0,\n"
+    "                            (floor(wrappedV) + 0.5) / 256.0);\n"
+    "        float texel = texture2D(uAtlas, atlasUV).r * 255.0;\n"
+    /* Chroma key: type 24 is non-INCRUST (bit 2 clear), so index 0 is
+       written unconditionally — no discard here. */
+     "        float fogDist = max(vZsel - uScaledFogNear, 0.0);\n"
+    "        float fogRow16 = floor(fogDist * uFogRowScale);\n"
+    "        float clutRow = 12.0 + floor(mod(fogRow16, 256.0) / 16.0) * 16.0;\n"
+    "        color = clutLookup(texel, clutRow);\n"
+    "    } else {\n"
+    /* Gouraud table (types 6/7): CLUT lookup, color = column.
+       Same +128 rounding bias as polyMode 0. */
+    "        float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;\n"
+    "        vec2 clutUV = vec2((uFlatColor + 0.5) / 256.0,\n"
+    "                           (gouraudRow + 0.5) / 256.0);\n"
+    "        float palIdx = texture2D(uCLUT, clutUV).r * 255.0;\n"
+    "        color = texture2D(uPalette,\n"
+    "                 vec2((palIdx + 0.5) / 256.0, 0.5));\n"
+    "    }\n"
+    /* TRAME stipple: discard every other fragment (50% coverage) */
+    "    if (uAlphaMode == 2) {\n"
+    "        if (mod(floor(gl_FragCoord.x) + floor(gl_FragCoord.y), 2.0) < 1.0)\n"
+    "            discard;\n"
+    "    }\n"
+    "    if (uAlphaMode > 0) {\n"
+    "        color.a = 0.5;\n"
+    "    }\n"
+    "    gl_FragColor = color;\n"
+    "}\n";
 
 /* ── GL state — present shader ──────────────────────────────────────────── */
 
 static GLuint s_program = 0;
 static GLuint s_vbo = 0;
-static GLuint s_fboVbo = 0;    /* non-flipped UV quad for FBO→screen draw */
+static GLuint s_fboVbo = 0; /* non-flipped UV quad for FBO→screen draw */
 static GLuint s_overlayTex = 0; /* present texture (Log buffer ARGB) */
 static GLint s_uTexLoc = -1;
 static GLint s_aPosLoc = -1;
@@ -164,97 +420,6 @@ static GLuint LinkProgram(GLuint vert, GLuint frag) {
     return prog;
 }
 
-/* ── Shared-shader runtime filter (see GL/RENDER_GL.H) ──────────────────── */
-
-S32 GpuShader_FilterGL(const char *src, U32 srcSize, S32 dialect,
-                       char *out, U32 outSize) {
-    const char *target = (dialect == GPU_SHADER_GL_ES) ? "GL_ES" : "GL_CORE";
-    const U32 targetLen = (U32)strlen(target);
-
-    /* Conditional stack. Every ##ifdef pushes; ##else flips the top entry
-       (the classic take-the-else-when-the-ifdef-was-false rule); ##endif
-       pops. Directives are always tracked so a skipped block's inner
-       ##ifdef/##else/##endif balance. */
-    S32 active[16];
-    U32 depth = 0;
-
-    U32 pos = 0;
-    U32 outUsed = 0;
-
-    while (pos < srcSize) {
-        const char *p = src + pos;
-        U32 lineLen = 0;
-        while (pos + lineLen < srcSize && p[lineLen] != '\n') {
-            lineLen++;
-        }
-
-        if (lineLen >= 2 && p[0] == '#' && p[1] == '#') {
-            if (lineLen > 8 && memcmp(p, "##ifdef ", 8) == 0) {
-                const char *marker = p + 8;
-                U32 markerLen = lineLen - 8;
-                active[depth] = (markerLen == targetLen &&
-                                 memcmp(marker, target, targetLen) == 0) ? 1 : 0;
-                depth++;
-            } else if (lineLen == 6 && memcmp(p, "##else", 6) == 0) {
-                if (depth > 0) {
-                    active[depth - 1] = !active[depth - 1];
-                }
-            } else if (lineLen == 7 && memcmp(p, "##endif", 7) == 0) {
-                if (depth > 0) {
-                    depth--;
-                }
-            }
-            /* Other ## lines are treated as content (should not happen in
-               the shared shaders). */
-        }
-
-        if (!(lineLen >= 2 && p[0] == '#' && p[1] == '#')) {
-            S32 emit = 1;
-            for (U32 i = 0; i < depth; i++) {
-                if (!active[i]) {
-                    emit = 0;
-                    break;
-                }
-            }
-            if (emit) {
-                if (outUsed + lineLen + 1 >= outSize) {
-                    return FALSE; /* would truncate the NUL-terminated output */
-                }
-                memcpy(out + outUsed, p, lineLen);
-                outUsed += lineLen;
-                out[outUsed] = '\n';
-                outUsed++;
-            }
-        }
-
-        pos += lineLen;
-        if (pos < srcSize) {
-            pos++; /* consume the newline */
-        }
-    }
-
-    if (outUsed + 1 > outSize) {
-        return FALSE;
-    }
-    out[outUsed] = '\0';
-    return TRUE;
-}
-
-/* Compile one shared shader for the active GL dialect. */
-static GLuint CompileSharedShader(GLenum type, const char *blob, U32 blobSize) {
-#ifdef USE_GLES2
-    const S32 dialect = GPU_SHADER_GL_ES;
-#else
-    const S32 dialect = GPU_SHADER_GL_CORE;
-#endif
-    char src[16384];
-    if (!GpuShader_FilterGL(blob, blobSize, dialect, src, sizeof(src))) {
-        Log_Warn("[GL] shader source too large for filter buffer");
-        return 0;
-    }
-    return CompileShader(type, src);
-}
-
 /* ── FBO helpers (SSAA) ─────────────────────────────────────────────────── */
 
 static void GL_DestroyFBO(void) {
@@ -332,12 +497,8 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     Log_Info("[GL] Initializing renderer (%ux%u)...", resX, resY);
 
     /* ── Compile present shader ── */
-    GLuint vert = CompileSharedShader(GL_VERTEX_SHADER,
-                                      PRESENT_VERT_GLSL,
-                                      (U32)(sizeof(PRESENT_VERT_GLSL) - 1));
-    GLuint frag = CompileSharedShader(GL_FRAGMENT_SHADER,
-                                      PRESENT_FRAG_GLSL,
-                                      (U32)(sizeof(PRESENT_FRAG_GLSL) - 1));
+    GLuint vert = CompileShader(GL_VERTEX_SHADER, s_vertSrc);
+    GLuint frag = CompileShader(GL_FRAGMENT_SHADER, s_fragSrc);
     if (vert == 0 || frag == 0) {
         return FALSE;
     }
@@ -354,12 +515,8 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     s_aTexCoordLoc = glGetAttribLocation(s_program, "aTexCoord");
 
     /* ── Compile CLUT shader ── */
-    GLuint clutVert = CompileSharedShader(GL_VERTEX_SHADER,
-                                          CLUT_VERT_GLSL,
-                                          (U32)(sizeof(CLUT_VERT_GLSL) - 1));
-    GLuint clutFrag = CompileSharedShader(GL_FRAGMENT_SHADER,
-                                          CLUT_FRAG_GLSL,
-                                          (U32)(sizeof(CLUT_FRAG_GLSL) - 1));
+    GLuint clutVert = CompileShader(GL_VERTEX_SHADER, s_clutVertSrc);
+    GLuint clutFrag = CompileShader(GL_FRAGMENT_SHADER, s_clutFragSrc);
     if (clutVert == 0 || clutFrag == 0) {
         return FALSE;
     }
@@ -519,6 +676,8 @@ static void GL_DestroyContext(void) {
         glDeleteProgram(s_clutProgram);
         s_clutProgram = 0;
     }
+
+    GL_DestroyFBO();
 
     Window_DestroyGLContext();
     s_initialized = 0;
@@ -976,3 +1135,5 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_ClearBackbuffer,
     GL_DrawPresentQuad,
 };
+
+#endif /* USE_GPURENDERER */

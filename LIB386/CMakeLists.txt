@@ -26,10 +26,26 @@ add_subdirectory(pol_work)
 add_subdirectory(SVGA)
 add_subdirectory(SYSTEM)
 
+# The GL renderer core. Built unconditionally: when GPURENDERER is on it is
+# the working backend, otherwise RENDER_GL.CPP compiles the stub set that
+# keeps every unconditional caller (WINDOW, SDL, menu, config) linkable.
+add_subdirectory(GL)
+
+# Common GPU renderer code shared by both backends. Built unconditionally for
+# the same reason as GL: its !USE_GPURENDERER half compiles the GpuRenderer_*
+# stubs that keep every unconditional caller (menu, config, RENDER_SWITCH)
+# linkable when the renderer is off. Its backend table is built from the two
+# backend vtables, so both backends must link whenever it does — the
+# SDL3GPU gate below keeps them together.
+add_subdirectory(COMMON)
+
 if(GPURENDERER)
-  add_subdirectory(COMMON)
-  add_subdirectory(GL)
   add_subdirectory(SDL3GPU)
+else()
+  # Link target only: there is no SDL3-GPU code in an OFF build. An interface
+  # library satisfies the engine's unconditional `gs3` in its link line
+  # without needing a stub TU.
+  add_library(gs3 INTERFACE)
 endif()
 
 if(ENABLE_POLY_RECORDING OR LBA2_BUILD_TESTS)

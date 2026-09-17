@@ -13,14 +13,14 @@ extern "C" {
 #endif
 
 // --- Initialization ----------------------------------------------------------
-bool InitGraphics(U32 resX, U32 resY, bool fullscreen) {
+bool InitGraphics(U32 resX, U32 resY, bool fullscreen, bool opengl) {
     if (resY > ADELINE_MAX_Y_RES) {
         return false;
     }
 
     /* Resolution is reported by the boot log's "Render" line (see InitAdeline). */
 
-    if (!CreateWindowSurface(resX, resY, fullscreen)) {
+    if (!CreateWindowSurface(resX, resY, fullscreen, opengl)) {
         return false;
     }
 

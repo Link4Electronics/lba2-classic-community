@@ -18,6 +18,7 @@
 #include <GPU/GPURENDERER.H>
 #include <GPU/GPURENDERER_BACKEND.H>
 #include <POLYGON/POLY.H>
+#include <SVGA/SDL.H> /* SetGpuPresentHooks: the present seam SDL.CPP exposes */
 #include <SYSTEM/LOG.H>
 
 #include <stdlib.h>
@@ -656,6 +657,13 @@ S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
         return FALSE;
     }
 
+    /* Wire the engine seams to this renderer once the backend is live. The
+       present seam (SDL.CPP) and the polygon fill seam (POLY.CPP) stay NULL
+       on the software path, which the ASM equivalence tests link without any
+       GPU dependency — GpuRenderer_Init is what the tests never reach. */
+    SetGpuPresentHooks(GpuRenderer_Present, GpuRenderer_IsActive);
+    Fill_Poly_SetHook(GpuRenderer_RenderTriangleList);
+
     Log_Info("[GPU] renderer active: %s (%ux%u)", be->identifier, resX, resY);
     return TRUE;
 }
@@ -664,6 +672,10 @@ void GpuRenderer_Shutdown(void) {
     if (!s_active) {
         return;
     }
+
+    /* Drop the seams first so a torn-down renderer never drives a frame. */
+    SetGpuPresentHooks(NULL, NULL);
+    Fill_Poly_SetHook(NULL);
 
     s_backend->TargetDestroy();
     s_backend->DestroyContext();

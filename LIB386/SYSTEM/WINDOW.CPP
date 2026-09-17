@@ -3,6 +3,8 @@
 #include <SYSTEM/ANDROID.H>
 #include <SYSTEM/LOG.H>
 #include <SYSTEM/LOGPRINT.H>
+#include <SVGA/SCREEN.H> /* ModeDesiredX/Y for the GPU letterbox remap */
+#include <SVGA/SDL.H>    /* GpuPresentIsActive: which presenter owns the window */
 
 #include <SDL3/SDL.h>
 #include <assert.h>
@@ -48,6 +50,22 @@ static void SetLogicalPresentation(U32 resX, U32 resY) {
                  "\tSDL message: %s",
                  resX, resY, SDL_GetError());
     }
+}
+
+/* The GL 2.1 / GLES 2.0 attribute set the renderer shaders are written for.
+   SDL reads these when a window flagged SDL_WINDOW_OPENGL is created, so they
+   must be set before every such creation (boot and runtime toggle alike). */
+static void SetGLContextAttributes(void) {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
 }
 
 static void PresentCurrentTexture() {
@@ -118,8 +136,10 @@ S32 Window_CreateGLContext(void) {
         return FALSE;
     }
 
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    /* Attributes were set before the window was created (SetGLContextAttributes
+       runs in CreateWindowSurface / Window_RecreateWindowForGL); nothing else
+       to configure on the context itself. */
+
     s_glContext = SDL_GL_CreateContext(sdlWindow);
     if (s_glContext == NULL) {
         Log_Warn("Window_CreateGLContext: SDL_GL_CreateContext failed: %s",
@@ -141,6 +161,14 @@ S32 Window_GLMakeCurrent(void) {
         return FALSE;
     }
     if (SDL_GL_MakeCurrent(sdlWindow, s_glContext) != 0) {
+        /* Some SDL3/EGL stacks return non-zero here with no error message
+           while the context still becomes current (verified with a raw
+           SDL3+GL probe: GetCurrentContext equals ours and rendering works).
+           Judge by the actual current-context state rather than the return
+           code, so a spurious error cannot take down a live context. */
+        if (SDL_GL_GetCurrentContext() == s_glContext) {
+            return TRUE;
+        }
         Log_Warn("Window_GLMakeCurrent: %s", SDL_GetError());
         return FALSE;
     }
@@ -164,6 +192,225 @@ void Window_DestroyGLContext(void) {
     s_glContext = NULL;
 }
 
+/* The Display menu's renderer switch toggles between software and GL at
+   runtime. The two presenters cannot share one window (the software path owns
+   an SDL_Renderer streamed to; the GL path owns a GL context swapped to), so
+   the window is torn down and recreated with or without the OpenGL flag. */
+
+/* CoerceFullscreenForPlatform is defined below with the windowed-mode feature
+   reporting it relies on; declare it here so the window-recreate paths below
+   can call it without reordering the display-mode feature code it sits with. */
+static bool CoerceFullscreenForPlatform(bool fullscreen);
+
+/* Recreate the SDL window flagged SDL_WINDOW_OPENGL (with the GL attributes
+   set before creation) for the GL renderer's present path. */
+bool Window_RecreateWindowForGL(U32 resX, U32 resY, bool fullscreen) {
+    fullscreen = CoerceFullscreenForPlatform(fullscreen);
+
+    if (s_glContext != NULL) {
+        Window_DestroyGLContext();
+    }
+    if (sdlTexture) {
+        SDL_DestroyTexture(sdlTexture);
+        sdlTexture = NULL;
+    }
+    if (sdlRenderer) {
+        SDL_DestroyRenderer(sdlRenderer);
+        sdlRenderer = NULL;
+    }
+    if (sdlWindow) {
+        SDL_DestroyWindow(sdlWindow);
+        sdlWindow = NULL;
+    }
+
+    windowFullscreenEnabled = fullscreen;
+
+    SetGLContextAttributes();
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, windowTitle);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, resX);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, resY);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true);
+#if defined(__ANDROID__)
+    if (IsAndroidTVDevice())
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, true);
+#else
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen);
+#endif
+    sdlWindow = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (sdlWindow == NULL) {
+        Log_Error("Unable to create SDL window for GL.\n"
+                  "\tResolution: %ux%u.\n"
+                  "\tSDL message: %s",
+                  resX, resY, SDL_GetError());
+        return false;
+    }
+
+    windowSurfaceResX = resX;
+    windowSurfaceResY = resY;
+
+    if (windowFullscreenEnabled && !SDL_SetWindowFullscreen(sdlWindow, true)) {
+        Log_Warn("GL window: fullscreen fallback failed.\n"
+                 "\tSDL message: %s",
+                 SDL_GetError());
+        windowFullscreenEnabled = false;
+    }
+
+    ApplyGameWindowHideSystemCursor();
+    return true;
+}
+
+/* Recreate the window without the OpenGL flag and restore the software
+   present path (SDL_Renderer + streaming texture + logical presentation). */
+bool Window_RecreateWindowForSW(U32 resX, U32 resY, bool fullscreen) {
+    fullscreen = CoerceFullscreenForPlatform(fullscreen);
+    Window_DestroyGLContext();
+
+    if (sdlWindow) {
+        SDL_DestroyWindow(sdlWindow);
+        sdlWindow = NULL;
+    }
+
+    windowFullscreenEnabled = fullscreen;
+
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, windowTitle);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, resX);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, resY);
+#if defined(__ANDROID__)
+    if (IsAndroidTVDevice())
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, true);
+#else
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen);
+#endif
+    sdlWindow = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (sdlWindow == NULL) {
+        Log_Error("Unable to recreate SDL window for SW renderer.\n"
+                  "\tResolution: %ux%u.\n"
+                  "\tSDL message: %s",
+                  resX, resY, SDL_GetError());
+        return false;
+    }
+
+    sdlRenderer = SDL_CreateRenderer(sdlWindow, NULL);
+    if (sdlRenderer == NULL) {
+        Log_Error("Unable to recreate SDL renderer.\n"
+                  "\tSDL message: %s",
+                  SDL_GetError());
+        return false;
+    }
+    SDL_SetRenderVSync(sdlRenderer, 1);
+
+    sdlTexture = SDL_CreateTexture(sdlRenderer, SDL_PIXELFORMAT_ARGB8888,
+                                   SDL_TEXTUREACCESS_STREAMING, resX, resY);
+    if (sdlTexture == NULL) {
+        Log_Error("Unable to recreate SDL streaming texture.\n"
+                  "\tSDL message: %s",
+                  SDL_GetError());
+        return false;
+    }
+    SDL_SetTextureScaleMode(sdlTexture, SDL_SCALEMODE_NEAREST);
+
+    windowSurfaceResX = resX;
+    windowSurfaceResY = resY;
+    SetLogicalPresentation(resX, resY);
+
+    if (windowFullscreenEnabled && !SDL_SetWindowFullscreen(sdlWindow, true)) {
+        Log_Warn("SW window: fullscreen fallback failed.\n"
+                 "\tSDL message: %s",
+                 SDL_GetError());
+        windowFullscreenEnabled = false;
+    }
+
+    ApplyGameWindowHideSystemCursor();
+    return true;
+}
+
+/* Recreate the window plain: no OpenGL flag, no SDL_Renderer, no streaming
+   texture. The SDL3 GPU backend claims the window for a GPU device, which
+   refuses a window that already carries a renderer or a GL context, so this
+   is the third shape the renderer switch recreates for. It mirrors the
+   software recreate minus the present path plumbing; the bookkeeping the
+   other two keep (surface size, fullscreen, cursor) is shared. */
+bool Window_RecreateWindowForGPU(U32 resX, U32 resY, bool fullscreen) {
+    fullscreen = CoerceFullscreenForPlatform(fullscreen);
+    Window_DestroyGLContext();
+
+    /* The previous window shape (software) still carried a renderer and a
+       streaming texture. SDL_DestroyWindow frees whatever renderer/texture is
+       attached to it without telling us, so null them first or they dangle
+       into the GPU window's lifetime -- the same teardown order the GL
+       recreate uses. */
+    if (sdlTexture) {
+        SDL_DestroyTexture(sdlTexture);
+        sdlTexture = NULL;
+    }
+    if (sdlRenderer) {
+        SDL_DestroyRenderer(sdlRenderer);
+        sdlRenderer = NULL;
+    }
+    if (sdlWindow) {
+        SDL_DestroyWindow(sdlWindow);
+        sdlWindow = NULL;
+    }
+
+    windowFullscreenEnabled = fullscreen;
+
+    SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, windowTitle);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, resX);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, resY);
+#if defined(__ANDROID__)
+    if (IsAndroidTVDevice())
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, true);
+#else
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen);
+#endif
+    sdlWindow = SDL_CreateWindowWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (sdlWindow == NULL) {
+        Log_Error("Unable to recreate SDL window for the GPU renderer.\n"
+                  "\tResolution: %ux%u.\n"
+                  "\tSDL message: %s",
+                  resX, resY, SDL_GetError());
+        return false;
+    }
+
+    windowSurfaceResX = resX;
+    windowSurfaceResY = resY;
+
+    if (windowFullscreenEnabled && !SDL_SetWindowFullscreen(sdlWindow, true)) {
+        Log_Warn("GPU window: fullscreen fallback failed.\n"
+                 "\tSDL message: %s",
+                 SDL_GetError());
+        windowFullscreenEnabled = false;
+    }
+
+    ApplyGameWindowHideSystemCursor();
+    return true;
+}
+
+/* GL-path window resize. The software path resizes through ResizeWindowSurface;
+   the GL renderer re-creates its own viewport on the new backing size. */
+void Window_SetWindowSize(U32 w, U32 h) {
+    if (sdlWindow != NULL) {
+        SDL_SetWindowSize(sdlWindow, (int)w, (int)h);
+    }
+    windowSurfaceResX = w;
+    windowSurfaceResY = h;
+}
+
 // --- Interface ---------------------------------------------------------------
 /* A platform with no windowed mode has no way back out of a windowed window:
    the Display submenu drops its Fullscreen row (Window_SupportsWindowedMode),
@@ -174,7 +421,7 @@ static bool CoerceFullscreenForPlatform(bool fullscreen) {
     return Window_SupportsWindowedMode() ? fullscreen : true;
 }
 
-bool CreateWindowSurface(U32 resX, U32 resY, bool fullscreen) {
+bool CreateWindowSurface(U32 resX, U32 resY, bool fullscreen, bool opengl) {
     assert(windowSystemInitialized == true);
     assert(sdlWindow == NULL);
 
@@ -192,6 +439,15 @@ bool CreateWindowSurface(U32 resX, U32 resY, bool fullscreen) {
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, resX);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, resY);
+    /* SDL_GL_CreateContext (Window_CreateGLContext) can only attach to a window
+       created with the OpenGL flag; the flag is only requested by the present
+       mode selection when a GL backend is active. The attributes must land
+       before this creation too (SDL picks the context profile at window
+       creation for an OpenGL window). */
+    if (opengl) {
+        SetGLContextAttributes();
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true);
+    }
     /* Resizable allows OS-driven window resizing on desktop. On Android,
      * SDL translates the resizable flag into SCREEN_ORIENTATION_UNSPECIFIED,
      * which permits portrait rotation and triggers a SDL internal
@@ -411,6 +667,45 @@ void WindowToSurfaceCoords(S32 windowX, S32 windowY, S32 *surfaceX, S32 *surface
     assert(surfaceX != NULL);
     assert(surfaceY != NULL);
 
+    /* GPU path: the renderer owns the letterbox (the GL and SDL3 GPU backends
+       compute their own centred viewport because the present goes through their
+       API, not SDL's renderer), so remap through the same centred rectangle for
+       mouse picking. */
+    if (GpuPresentIsActive() && sdlWindow != NULL &&
+        ModeDesiredX > 0 && ModeDesiredY > 0) {
+        int winW = 0, winH = 0;
+        SDL_GetWindowSize(sdlWindow, &winW, &winH);
+        if (winW > 0 && winH > 0) {
+            double windowAspect = (double)winW / (double)winH;
+            double contentAspect = (double)ModeDesiredX / (double)ModeDesiredY;
+            int vpX = 0, vpY = 0, vpW = winW, vpH = winH;
+            if (windowAspect > contentAspect) {
+                vpH = winH;
+                vpW = (int)((double)winH * contentAspect + 0.5);
+                vpW = (vpW + 1) & ~1;
+                if (vpW > winW) vpW = winW;
+                vpX = (winW - vpW) / 2;
+                vpY = 0;
+            } else {
+                vpW = winW;
+                vpH = (int)((double)winW / contentAspect + 0.5);
+                vpH = (vpH + 1) & ~1;
+                if (vpH > winH) vpH = winH;
+                vpX = 0;
+                vpY = (winH - vpH) / 2;
+            }
+            S32 sx = (S32)((double)(windowX - vpX) * (double)ModeDesiredX / (double)vpW);
+            S32 sy = (S32)((double)(windowY - vpY) * (double)ModeDesiredY / (double)vpH);
+            if (sx < 0) sx = 0;
+            else if (sx >= (S32)ModeDesiredX) sx = (S32)ModeDesiredX - 1;
+            if (sy < 0) sy = 0;
+            else if (sy >= (S32)ModeDesiredY) sy = (S32)ModeDesiredY - 1;
+            *surfaceX = sx;
+            *surfaceY = sy;
+            return;
+        }
+    }
+
     if ((sdlRenderer == NULL) || (windowSurfaceResX == 0) || (windowSurfaceResY == 0)) {
         *surfaceX = windowX;
         *surfaceY = windowY;
@@ -501,6 +796,12 @@ bool Window_SupportsWindowedMode(void) {
 }
 
 void Window_SetVSync(int enabled) {
+    /* The GL context and the SDL renderer are mutually exclusive presenters;
+       the swap interval has a GL-specific control. */
+    if (s_glContext != NULL) {
+        SDL_GL_SetSwapInterval(enabled ? 1 : 0);
+        return;
+    }
     if (sdlRenderer != NULL) {
         SDL_SetRenderVSync(sdlRenderer, enabled ? 1 : 0);
     }

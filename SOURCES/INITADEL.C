@@ -4,12 +4,16 @@
 #include "DIRECTORIES.H"
 #include "PERSO.H"      /* BootFatal — fatal exit for init failures */
 #include "RES_SWITCH.H" /* Res_LoadBootDimensions — CLI > cfg > default */
+#include "RENDER_SWITCH.H" /* Renderer_LoadBootChoice — the boot renderer */
 
 #include "AIL/COMMON.H"
 #include "CONSOLE/CONSOLE.H" /* console buffer sink printer adapter */
 #include "CONTROL.H"
 #include "JOYSTICK.H"
+
 #include "RES_DISCOVERY.H"  /* Res_GetDiscoverySource for the Assets banner line */
+#include <GL/RENDER_GL.H>
+#include <GPU/GPURENDERER.H> /* GpuRenderer boot init for the chosen backend */
 #include <SYSTEM/ANDROID.H> /* Android_GetPreviousCrashNote for the banner */
 #include <SYSTEM/LOG.H>
 #include "SVGA/INITMODE.H"
@@ -370,6 +374,24 @@ void InitAdeline(S32 argc, char *argv[]) {
            front; the later ReadConfigFile -> SetWindowFullscreen pass then just
            confirms it instead of flipping a windowed window. */
         const bool reqFullscreen = Res_LoadBootFullscreen();
+#ifdef USE_GPURENDERER
+        /* GPU renderer selection for this boot: the cfg "Renderer" key normally,
+           LBA2_GPU_RENDERER=opengl|sdl3gpu as a one-run dev override.
+           Absent or unrecognised keeps the software rasterizer. When a GPU
+           backend is requested the window must be created with the OpenGL flag
+           already set for the GL backend — an SDL_GL_CreateContext cannot attach
+           to a plain window afterwards — so the choice has to be made before
+           InitGraphics below. */
+        const GpuRendererBackendId bootBackend = Renderer_LoadBootChoice();
+        const bool reqOpengl = (bootBackend == GPU_RENDERER_BACKEND_OPENGL);
+        /* The player's stored GPU render scale, read in the same before-
+           InitGraphics window; it does not shape the window, so it is stashed
+           here and applied to the backend below once it is up. */
+        RenderQuality = Renderer_LoadBootQuality();
+#else
+        /* GPU renderer not built (GPURENDERER=OFF): a plain window. */
+        const bool reqOpengl = false;
+#endif
         /* A window can be refused for a reason that passes: on Android the
            surface belongs to whatever is in front, so the All Files Access
            screen this boot may have opened takes it away, and SDL reports it as
@@ -377,12 +399,12 @@ void InitAdeline(S32 argc, char *argv[]) {
            same call succeeds the moment the player is back. Desktop does not
            have that state and does not wait. */
         U32 waitedMs = 0;
-        bool graphicsUp = InitGraphics(reqResX, reqResY, reqFullscreen);
+        bool graphicsUp = InitGraphics(reqResX, reqResY, reqFullscreen, reqOpengl);
         while (!graphicsUp && Window_CanLoseNativeWindow() &&
                waitedMs < BOOT_WINDOW_WAIT_MS) {
             SDL_Delay(BOOT_WINDOW_POLL_MS);
             waitedMs += BOOT_WINDOW_POLL_MS;
-            graphicsUp = InitGraphics(reqResX, reqResY, reqFullscreen);
+            graphicsUp = InitGraphics(reqResX, reqResY, reqFullscreen, reqOpengl);
         }
         if (!graphicsUp) {
             /* Naming the mode alone sent a player hunting a display problem
@@ -398,6 +420,23 @@ void InitAdeline(S32 argc, char *argv[]) {
         if (waitedMs > 0) {
             Log_Warn("Window   arrived after %ums of waiting", waitedMs);
         }
+#ifdef USE_GPURENDERER
+        if (bootBackend != GPU_RENDERER_BACKEND_NONE) {
+            /* The renderer is opt-in; init failure falls back to software, so a
+               window that cannot host a GL context keeps the game playable. It
+               cannot be retried statically without reopening the window, which
+               the resolution switcher owns — mirroring its fullscreen handling. */
+            if (GpuRenderer_Init(bootBackend, reqResX, reqResY)) {
+                atexit(GpuRenderer_Shutdown);
+                /* The stored render scale applies to whichever backend came up;
+                   a software fallback has no GPU target and ignores it. */
+                GpuRenderer_SetRenderQuality((U32)RenderQuality);
+            } else {
+                Log_Warn("Renderer  requested '%s' unavailable; using software",
+                         GpuRenderer_BackendName(bootBackend));
+            }
+        }
+#endif
         /* The "Display" status line is logged from main() after InitProgram,
            alongside the rest of the post-init summary. */
     }
