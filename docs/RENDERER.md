@@ -82,11 +82,15 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   (`../SOURCES/ANIMTEX.CPP`) whenever animated texture pages are baked in
   place, so the renderer re-uploads the atlas page it mirrored.
 
-Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`)
-and shutdown (`atexit`) are wired; init failure falls back to software with a
+Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
+through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
+shutdown (`atexit`) are wired; init failure falls back to software with a
 warning. Because the SDL window must be created *as* an OpenGL window for a
 GL context to attach (SDL has no add-the-flag-after-creation), the boot
 choice is made before `InitGraphics` and forwarded through `CreateWindowSurface`.
+The SDL3 GPU backend is the mirror case: its device refuses the window the
+software path built (it carries an `SDL_Renderer`), so the boot helper recreates
+that window plain — `Window_RecreateWindowForGPU` — before claiming it.
 A runtime switch (Display menu → Renderer, `../SOURCES/RENDER_SWITCH.CPP`)
 tears down the backend, recreates the window for the target
 (`Window_RecreateWindowForGL` / `...ForSW` / `...ForGPU` in
@@ -106,12 +110,12 @@ software rasterizer, which is still the shipped default.
 
 Remaining work, in order:
 
-1. **Frame boundaries** — `GpuRenderer_ClearFBO` and
-   `GpuRenderer_BeginFrame` are declared and defined but never called, so
-   `s_fboHasTerrain` stays false and NZW animated polys never take the GPU
-   batch. Pin the 3D↔2D pass split in `AfficheScene`
-   (`../SOURCES/OBJECT.CPP`) and `AffGrilleExt`
-   (`../SOURCES/3DEXT/TERRAIN.CPP`) so they run at the right spots.
+1. **Frame boundaries** — `GpuRenderer_BeginFrame` runs at the top of
+   `AffScene` (`../SOURCES/OBJECT.CPP`) and `GpuRenderer_ClearFBO` at the top
+   of `RefreshGrille` (`../SOURCES/INTEXT.CPP`), the terrain pass. A frame that
+   redraws terrain clears the offscreen target; a frame that only redraws
+   objects (`AFF_OBJETS`) keeps the previous 3D colour and depth, matching the
+   software Z-buffer, so an idle scene is not wiped to black.
 2. **Readbacks** — the common layer has no caller for
    `TargetReadDepth` / `TargetReadColor` yet. When one lands, the SDL3 GPU
    backend reports no depth readback (depth textures are not samplable) and

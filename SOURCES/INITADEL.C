@@ -423,17 +423,19 @@ void InitAdeline(S32 argc, char *argv[]) {
 #ifdef USE_GPURENDERER
         if (bootBackend != GPU_RENDERER_BACKEND_NONE) {
             /* The renderer is opt-in; init failure falls back to software, so a
-               window that cannot host a GL context keeps the game playable. It
-               cannot be retried statically without reopening the window, which
-               the resolution switcher owns — mirroring its fullscreen handling. */
-            if (GpuRenderer_Init(bootBackend, reqResX, reqResY)) {
+               window that cannot host the requested backend keeps the game
+               playable. The SDL3 GPU device refuses the window InitGraphics
+               built for the software path (it carries an SDL_Renderer), so that
+               backend reshapes the window before claiming it — the same reshape
+               the Display menu does at runtime, without which a stored
+               "Renderer" of sdl3gpu never came up. GL already got its OpenGL
+               flag from InitGraphics. */
+            if (Renderer_InitBootBackend(bootBackend, reqResX, reqResY,
+                                         reqFullscreen)) {
                 atexit(GpuRenderer_Shutdown);
                 /* The stored render scale applies to whichever backend came up;
                    a software fallback has no GPU target and ignores it. */
                 GpuRenderer_SetRenderQuality((U32)RenderQuality);
-            } else {
-                Log_Warn("Renderer  requested '%s' unavailable; using software",
-                         GpuRenderer_BackendName(bootBackend));
             }
         }
 #endif

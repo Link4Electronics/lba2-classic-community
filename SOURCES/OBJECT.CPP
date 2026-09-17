@@ -2,6 +2,8 @@
 #include "RES_SWITCH.H"
 #include <POLYGON/POLYFILT.H>
 
+#include <GPU/GPURENDERER.H> // GpuRenderer_BeginFrame: per-frame filter latch
+
 #include "DEMO_SEED.H"
 #include "FOLLOWCAM.H" /* FollowCamera: camera zones re-aim the Auto camera */
 #include "RECORD.H"    /* Record_SeedHook: the boot scene load's seed on a replay */
@@ -5367,6 +5369,10 @@ void AffScene(S32 flagflip) {
        this frame draws with, and turning the filter on must not let a frame
        sample tables that were never built. */
     Poly_EnsureBlendLUT();
+
+    /* Frame boundary: latch the texture filter for the batches this frame
+       enqueues (GpuRenderer_ClearFBO is called by RefreshGrille). */
+    GpuRenderer_BeginFrame();
 
     S32 n, c, cmpt;
     S32 dx, dy;

@@ -28,4 +28,13 @@ S32 Renderer_LoadBootQuality(void);
    TRUE when the target is live. */
 S32 Renderer_ApplyChoice(GpuRendererBackendId id);
 
+/* Boot companion to Renderer_ApplyChoice, run once after InitGraphics with the
+   backend Renderer_LoadBootChoice picked. GL inits on the OpenGL-flagged window
+   InitGraphics already built; the SDL3 GPU backend needs the software window
+   reshaped plain first, because its device refuses the SDL_Renderer that window
+   carries — the reshape the runtime switch does. Returns TRUE when the backend is
+   live, FALSE on fallback to the software path (which keeps a usable window). */
+S32 Renderer_InitBootBackend(GpuRendererBackendId id, U32 resX, U32 resY,
+                             bool fullscreen);
+
 #endif // RENDER_SWITCH_H

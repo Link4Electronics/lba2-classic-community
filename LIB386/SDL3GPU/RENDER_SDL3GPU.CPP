@@ -960,6 +960,8 @@ static S32 S3_TargetCreate(U32 width, U32 height) {
 
     s_targetW = width;
     s_targetH = height;
+    /* Fresh textures hold undefined colour and depth; the first pass clears. */
+    s_targetNeedsClear = TRUE;
     return TRUE;
 }
 
@@ -1452,7 +1454,6 @@ static void S3_SubmitFrame(void) {
     s_swapchainW = 0;
     s_swapchainH = 0;
     s_targetPass = NULL;
-    s_targetNeedsClear = TRUE;
     s_drawCount = 0;
     s_frameVertCount = 0;
 }
@@ -1470,7 +1471,6 @@ static void S3_CancelFrame(void) {
     s_swapchainW = 0;
     s_swapchainH = 0;
     s_targetPass = NULL;
-    s_targetNeedsClear = TRUE;
     s_drawCount = 0;
     s_frameVertCount = 0;
 }

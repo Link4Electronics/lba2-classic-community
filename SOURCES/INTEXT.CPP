@@ -14,6 +14,8 @@
 
 #include "C_EXTERN.H"
 
+#include <GPU/GPURENDERER.H> // GpuRenderer_ClearFBO: terrain-pass frame boundary
+
 extern T_OBJET *APtObj; // dans OBJECT.CPP
 
 S32 SaveVueOffsetX, SaveVueOffsetY, SaveVueOffsetZ;
@@ -137,6 +139,12 @@ void DrawRecover3(S32 xw, S32 yw, S32 zw, S32 ymax, S32 zvmax) {
 
 // Affiche la grille complete
 void RefreshGrille() {
+    /* The terrain pass owns the offscreen target's colour and depth: clear it
+       here so a frame that redraws terrain starts clean, while a frame that
+       only redraws objects (AffScene AFF_OBJETS) keeps the previous 3D content
+       and depth, exactly like the software Z-buffer. */
+    GpuRenderer_ClearFBO();
+
 #ifdef LBA_EDITOR
     if (CubeClip)
         RefreshClippedGrille();

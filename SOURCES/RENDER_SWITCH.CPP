@@ -155,3 +155,37 @@ S32 Renderer_ApplyChoice(GpuRendererBackendId id) {
     DisplayRenderer = GPU_RENDERER_BACKEND_NONE;
     return FALSE;
 }
+
+S32 Renderer_InitBootBackend(GpuRendererBackendId id, U32 resX, U32 resY,
+                             bool fullscreen) {
+    if (id == GPU_RENDERER_BACKEND_NONE) {
+        return TRUE;
+    }
+
+    /* The SDL3 GPU device refuses a window that already carries the software
+       path's SDL_Renderer and streaming texture, so that backend needs the same
+       plain window the runtime switch recreates for before it can claim one. GL
+       needs no reshape: InitGraphics was told to create its window with the
+       OpenGL flag from the boot choice (see Renderer_WindowFor). */
+    if (id == GPU_RENDERER_BACKEND_SDL3GPU &&
+        !Window_RecreateWindowForGPU(resX, resY, fullscreen)) {
+        Log_Warn("Renderer  could not prepare a window for '%s'; using software",
+                 GpuRenderer_BackendName(id));
+        return FALSE;
+    }
+
+    if (GpuRenderer_Init(id, resX, resY)) {
+        DisplayRenderer = (S32)id;
+        return TRUE;
+    }
+
+    Log_Warn("Renderer  requested '%s' unavailable; using software",
+             GpuRenderer_BackendName(id));
+    if (id == GPU_RENDERER_BACKEND_SDL3GPU) {
+        /* The software window was torn down for the GPU reshape; put the SW
+           present path back so a failed GPU init keeps the game playable. */
+        Window_RecreateWindowForSW(resX, resY, fullscreen);
+    }
+    DisplayRenderer = GPU_RENDERER_BACKEND_NONE;
+    return FALSE;
+}
