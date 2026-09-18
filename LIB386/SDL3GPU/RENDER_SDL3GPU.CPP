@@ -116,6 +116,7 @@ typedef struct S3GpuParams {
 // Backend state
 //──────────────────────────────────────────────────────────────────────────
 static SDL_Window *s_window = NULL;
+static SDL_GPUPresentMode s_presentMode = SDL_GPU_PRESENTMODE_VSYNC;
 static SDL_GPUDevice *s_device = NULL;
 static SDL_GPUTextureFormat s_swapchainFormat = SDL_GPU_TEXTUREFORMAT_INVALID;
 static SDL_GPUShaderFormat s_shaderFormat = 0;
@@ -156,8 +157,6 @@ static U32 s_stagingBytes = 0;
 
 /* Download transfer buffers for the combined colour+depth readback. It submits
    and waits, so a buffer is never overwritten while still in flight. */
-static SDL_GPUTransferBuffer *s_readbackColorTb = NULL;
-static U32 s_readbackColorTbBytes = 0;
 static SDL_GPUTransferBuffer *s_readbackDepthTb = NULL;
 static U32 s_readbackDepthTbBytes = 0;
 
@@ -772,28 +771,25 @@ static void S3_CopyReadbackPlane(void *dst, const void *mapped, U32 width,
     }
 }
 
-/* Reads the colour and depth targets in a single command-buffer round trip
-   (one submit, one wait): the engine consumes them later in the same host
-   frame, so the round trip cannot be deferred. Colour is always written;
-   returns FALSE when depth is unavailable, leaving the depth buffer alone. */
-static S32 S3_TargetReadColorDepth(void *colorDst, void *depthDst, U32 width,
-                                   U32 height) {
-    U32 colorBytes;
+/* Downloads the depth target and converts it to the GL window-depth
+   convention the common layer inverts. Waits on this submit's fence rather
+   than a full GPU idle so the swapchain's present is not serialised with it.
+   Returns FALSE when depth is unavailable, leaving the engine buffer alone. */
+static S32 S3_TargetReadDepth(void *depthDst, U32 width, U32 height) {
     U32 depthBytes;
     SDL_GPUCopyPass *cp;
     SDL_GPUTextureRegion src;
     SDL_GPUTextureTransferInfo dstInfo;
+    SDL_GPUFence *fence;
     const void *mapped;
     U16 *samples;
     U32 count;
     U32 i;
-    S32 haveDepth;
 
-    if (s_device == NULL || s_targetColor == NULL || colorDst == NULL ||
+    if (s_device == NULL || s_targetDepth == NULL || depthDst == NULL ||
         width == 0 || height == 0) {
         return FALSE;
     }
-    haveDepth = (s_targetDepth != NULL && depthDst != NULL) ? TRUE : FALSE;
 
     /* The target pass must be closed before a copy pass can touch the frame's
        command buffer; rendering the queued terrain also fills the target. */
@@ -811,58 +807,41 @@ static S32 S3_TargetReadColorDepth(void *colorDst, void *depthDst, U32 width,
         s_targetPass = NULL;
     }
 
-    colorBytes = width * height * 4;
-    depthBytes = haveDepth ? width * height * 2 : 0;
-    if (!S3_EnsureReadbackTb(&s_readbackColorTb, &s_readbackColorTbBytes,
-                             colorBytes)) {
-        return FALSE;
-    }
-    if (haveDepth && !S3_EnsureReadbackTb(&s_readbackDepthTb,
-                                          &s_readbackDepthTbBytes,
-                                          depthBytes)) {
+    depthBytes = width * height * 2;
+    if (!S3_EnsureReadbackTb(&s_readbackDepthTb, &s_readbackDepthTbBytes,
+                             depthBytes)) {
         return FALSE;
     }
 
     cp = SDL_BeginGPUCopyPass(s_frameCmd);
     SDL_zero(src);
-    src.texture = s_targetColor;
+    src.texture = s_targetDepth;
     src.w = width;
     src.h = height;
     src.d = 1;
     SDL_zero(dstInfo);
-    dstInfo.transfer_buffer = s_readbackColorTb;
+    dstInfo.transfer_buffer = s_readbackDepthTb;
     dstInfo.offset = 0;
     dstInfo.pixels_per_row = width;
     dstInfo.rows_per_layer = height;
     SDL_DownloadFromGPUTexture(cp, &src, &dstInfo);
-    if (haveDepth) {
-        src.texture = s_targetDepth;
-        dstInfo.transfer_buffer = s_readbackDepthTb;
-        SDL_DownloadFromGPUTexture(cp, &src, &dstInfo);
-    }
     SDL_EndGPUCopyPass(cp);
 
     /* The frame's command buffer ends at the readback and is reacquired for
        whatever still draws this frame. */
-    SDL_SubmitGPUCommandBuffer(s_frameCmd);
+    fence = SDL_SubmitGPUCommandBufferAndAcquireFence(s_frameCmd);
     s_frameCmd = NULL;
     s_targetPass = NULL;
-    if (!SDL_WaitForGPUIdle(s_device)) {
+    if (fence == NULL) {
+        Log_Warn("[SDL3GPU] readback submit failed: %s", SDL_GetError());
+        return FALSE;
+    }
+    if (!SDL_WaitForGPUFences(s_device, true, &fence, 1)) {
         Log_Warn("[SDL3GPU] readback wait failed: %s", SDL_GetError());
+        SDL_ReleaseGPUFence(s_device, fence);
         return FALSE;
     }
-
-    mapped = SDL_MapGPUTransferBuffer(s_device, s_readbackColorTb, false);
-    if (mapped == NULL) {
-        Log_Warn("[SDL3GPU] readback map failed: %s", SDL_GetError());
-        return FALSE;
-    }
-    S3_CopyReadbackPlane(colorDst, mapped, width, height, 4);
-    SDL_UnmapGPUTransferBuffer(s_device, s_readbackColorTb);
-
-    if (!haveDepth) {
-        return FALSE;
-    }
+    SDL_ReleaseGPUFence(s_device, fence);
 
     mapped = SDL_MapGPUTransferBuffer(s_device, s_readbackDepthTb, false);
     if (mapped == NULL) {
@@ -964,7 +943,7 @@ static S32 S3_CreateContext(U32 resX, U32 resY) {
     s_swapchainFormat = SDL_GetGPUSwapchainTextureFormat(s_device, s_window);
     SDL_SetGPUSwapchainParameters(s_device, s_window,
                                   SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
-                                  SDL_GPU_PRESENTMODE_VSYNC);
+                                  s_presentMode);
 
     s_shaderFormat = S3_SelectShaderFormat();
     if (s_shaderFormat == 0) {
@@ -982,6 +961,19 @@ static S32 S3_CreateContext(U32 resX, U32 resY) {
     Log_Debug("[SDL3GPU] context ready (%ux%u, swapchain 0x%X)",
               (unsigned)resX, (unsigned)resY, (unsigned)s_swapchainFormat);
     return TRUE;
+}
+
+/* Present pacing. IMMEDIATE uncaps the frame rate; VSYNC blocks the acquire
+   on the display. Recorded even before the device exists so Init can apply
+   the mode the config asked for. */
+static void S3_SetVSync(S32 enabled) {
+    s_presentMode = enabled ? SDL_GPU_PRESENTMODE_VSYNC
+                            : SDL_GPU_PRESENTMODE_IMMEDIATE;
+    if (s_device != NULL && s_window != NULL) {
+        SDL_SetGPUSwapchainParameters(s_device, s_window,
+                                      SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+                                      s_presentMode);
+    }
 }
 
 static void S3_DestroyContext(void) {
@@ -1058,11 +1050,6 @@ static void S3_DestroyContext(void) {
         s_staging = NULL;
     }
     s_stagingBytes = 0;
-    if (s_readbackColorTb != NULL) {
-        SDL_ReleaseGPUTransferBuffer(s_device, s_readbackColorTb);
-        s_readbackColorTb = NULL;
-    }
-    s_readbackColorTbBytes = 0;
     if (s_readbackDepthTb != NULL) {
         SDL_ReleaseGPUTransferBuffer(s_device, s_readbackDepthTb);
         s_readbackDepthTb = NULL;
@@ -1104,8 +1091,8 @@ static S32 S3_TargetCreate(U32 width, U32 height) {
 
     SDL_zero(ci);
     ci.type = SDL_GPU_TEXTURETYPE_2D;
-    /* B8G8R8A8 keeps the readback words in the shared 0xAARRGGBB order the
-       palette table uses, so Common_ARGBToIndex maps them without a swizzle. */
+    /* B8G8R8A8 matches the CLUT pipeline's colour target and the palette and
+       overlay textures, so every sampled and stored channel order agrees. */
     ci.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     ci.width = width;
     ci.height = height;
@@ -1773,7 +1760,8 @@ const GpuRendererBackend GpuRendererBackendSDL3GPU = {
     S3_TargetBindClear,
     S3_TargetWidth,
     S3_TargetHeight,
-    S3_TargetReadColorDepth,
+    S3_TargetReadDepth,
+    S3_SetVSync,
     S3_TexUpdatePresent,
     S3_TexUpdateAtlas,
     S3_TexUpdateCLUT,

@@ -5476,12 +5476,13 @@ startaffscene:
         CopyScreen(Log, Screen);
 
         /* The GPU backend draws the exterior terrain into its own target, so
-           the software buffers the object pass reads are refilled from it:
-           Screen for ZBufBoxOverWrite2's terrain restore and PtrZBuffer for the
-           depth test inside it. Interior cubes keep PtrZBuffer's backing store
-           for BufCube/BufferBrick and draw through DrawOverBrick instead. */
+           its depth is read back for the object pass's ZBufBoxOverWrite2 test;
+           hidden pixels become colour 0, which the present composite blends
+           transparent over the same target's terrain. Interior cubes keep
+           PtrZBuffer's backing store for BufCube/BufferBrick and draw through
+           DrawOverBrick instead. */
         if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
-            GpuRenderer_ReadbackSceneBuffers();
+            GpuRenderer_ReadbackDepthBuffer();
         }
 
         if (flagflip == AFF_ALL_FLIP

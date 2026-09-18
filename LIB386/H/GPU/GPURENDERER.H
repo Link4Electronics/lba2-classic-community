@@ -56,12 +56,16 @@ S32  GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
                                     S32 nbPoints, Struc_Point *ptrPoints);
 void GpuRenderer_SetRenderQuality(U32 quality);
 
-// Readback. Called after the exterior terrain pass to refill the software
-// buffers the object pass reads: writes Screen (terrain colour) and PtrZBuffer
-// (depth) from the offscreen target in one backend round trip. A no-op when no
-// GPU backend is active; a backend without depth readback leaves PtrZBuffer
-// untouched.
-void GpuRenderer_ReadbackSceneBuffers(void);
+// Depth readback. Called after the exterior terrain pass so the object pass's
+// ZBufBoxOverWrite2 tests against the terrain the GPU drew: fills PtrZBuffer
+// from the offscreen depth target. A no-op when no GPU backend is active or
+// the backend cannot read depth (the software Z-buffer then stays).
+void GpuRenderer_ReadbackDepthBuffer(void);
+
+// Present pacing. Records the wanted state and applies it to the active
+// backend; called before a backend exists it is remembered and applied at
+// Init, so a config value loaded early still reaches the device.
+void GpuRenderer_SetVSync(S32 enabled);
 
 #ifdef __cplusplus
 }

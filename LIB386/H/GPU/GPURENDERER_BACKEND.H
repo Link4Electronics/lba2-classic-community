@@ -16,13 +16,12 @@
 //   - DrawTriangles receives clip-space vertex data derived from engine
 //     (XE, YE) pixel pairs plus per-vertex texture/light/depth words; it
 //     maps them with the screenScale pair in GpuDrawParams (2/resX, 2/resY).
-//   - TargetReadColorDepth returns buffers in bottom-up row order,
+//   - TargetReadDepth returns the depth buffer in bottom-up row order,
 //     normalised from whatever the native API produces (GL reads bottom-up,
-//     SDL3 GPU top-down). The common layer performs the Y-flip, the SSAA
-//     downscale and the aZ inverse centrally; depth is 16-bit unsigned in
-//     the GL window-depth convention, colour 32-bit ARGB (0xAARRGGBB). A
-//     backend that cannot read depth reports FALSE and the common layer
-//     leaves the software Z-buffer.
+//     SDL3 GPU top-down). It is 16-bit unsigned in the GL window-depth
+//     convention; the common layer performs the Y-flip, the SSAA downscale
+//     and the aZ inverse centrally. A backend that cannot read depth reports
+//     FALSE and the common layer leaves the software Z-buffer.
 //──────────────────────────────────────────────────────────────────────────
 #ifndef LIB_GPURENDERER_BACKEND
 #define LIB_GPURENDERER_BACKEND
@@ -92,10 +91,13 @@ typedef struct GpuRendererBackend {
     void (*TargetBindClear)(void);
     U32  (*TargetWidth)(void);
     U32  (*TargetHeight)(void);
-    // Combined readback (bottom-up): colour is always written, depth is
-    // 16-bit. Returns FALSE when depth is unreadable, leaving depthDst alone.
-    S32  (*TargetReadColorDepth)(void *colorDst, void *depthDst, U32 width,
-                                 U32 height);
+    // Depth readback (bottom-up, GL window-depth): 16-bit, or FALSE if
+    // unreadable.
+    S32  (*TargetReadDepth)(void *dst, U32 width, U32 height);
+
+    // Present pacing. Called whenever the wanted vsync state changes; a
+    // backend that has no pacing control may ignore it.
+    void (*SetVSync)(S32 enabled);
 
     // Fixed-role textures owned by the backend.
     // Present: 32-bit ARGB staging surface (0xAARRGGBB), pitch in bytes.

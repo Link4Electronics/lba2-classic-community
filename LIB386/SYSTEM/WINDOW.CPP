@@ -796,6 +796,10 @@ bool Window_SupportsWindowedMode(void) {
 }
 
 void Window_SetVSync(int enabled) {
+    /* Record for the GPU backend first: it may not exist yet (config load
+       precedes renderer init) and the seam replays the value on registration. */
+    GpuPresentSetVSync(enabled ? 1 : 0);
+
     /* The GL context and the SDL renderer are mutually exclusive presenters;
        the swap interval has a GL-specific control. */
     if (s_glContext != NULL) {

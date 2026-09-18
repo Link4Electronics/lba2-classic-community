@@ -52,6 +52,26 @@ void SetGpuPresentHooks(GpuPresentFn present, GpuIsActiveFn isActive) {
 S32 GpuPresentIsActive(void) {
     return (s_gpuIsActive != NULL) ? s_gpuIsActive() : 0;
 }
+
+/* Present pacing seam, same indirection rationale as the present hooks. The
+   wanted value is held here so a choice made before the renderer initialized
+   is replayed the moment its setter registers. */
+static GpuVSyncFn s_gpuVSync = NULL;
+static S32 s_gpuVSyncWanted = 1;
+
+void SetGpuVSyncHook(GpuVSyncFn setVSync) {
+    s_gpuVSync = setVSync;
+    if (s_gpuVSync != NULL) {
+        s_gpuVSync(s_gpuVSyncWanted);
+    }
+}
+
+void GpuPresentSetVSync(S32 enabled) {
+    s_gpuVSyncWanted = enabled ? 1 : 0;
+    if (s_gpuVSync != NULL) {
+        s_gpuVSync(s_gpuVSyncWanted);
+    }
+}
 #if defined(__ANDROID__)
 /* Persistent staging buffer for the Android present path (see
  * AcquirePresentTarget): reused across frames, resized on demand, freed in

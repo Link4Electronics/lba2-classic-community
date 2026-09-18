@@ -75,6 +75,7 @@ static const GpuRendererBackend *Common_TableLookup(GpuRendererBackendId id) {
 static const GpuRendererBackend *s_backend = NULL;
 static GpuRendererBackendId s_backendId = GPU_RENDERER_BACKEND_NONE;
 static S32 s_active = 0;
+static S32 s_vsyncWanted = 1; /* present pacing, default on */
 static U32 s_resX = 0;  /* present surface size (engine pixel space) */
 static U32 s_resY = 0;
 static U32 s_renderQuality = 1; /* 1 = native, 2 = 2x, 4 = 4x */
@@ -416,80 +417,16 @@ void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
     s_backend->DrawPresentQuad(1, filterLinear);
 }
 
+// Refills PtrZBuffer from the GPU depth target (converted to the engine's aZ
+// space) so the object pass's ZBufBoxOverWrite2 tests against the terrain the
+// GPU drew. A backend without depth readback leaves the software Z-buffer.
 //──────────────────────────────────────────────────────────────────────────
-static S32 Common_ARGBToIndex(const U32 *lut, U32 argb, U8 *bestIdxOut) {
-    struct RevEntry {
-        U32 argb;
-        U8 idx;
-    };
-
-    /* paletteLUT has 256 unique entries; sort by ARGB once per readback. */
-    static RevEntry s_revLut[256];
-    static RevEntry s_sortedLut[256];
-    static U8 s_sortedReady = 0;
-    if (!s_sortedReady) {
-        for (U32 i = 0; i < 256; i++) {
-            s_revLut[i].argb = lut[i];
-            s_revLut[i].idx = (U8)i;
-        }
-        memcpy(s_sortedLut, s_revLut, sizeof s_revLut);
-        for (U32 i = 1; i < 256; i++) {
-            RevEntry key = s_sortedLut[i];
-            S32 j = (S32)i - 1;
-            while (j >= 0 && s_sortedLut[j].argb > key.argb) {
-                s_sortedLut[j + 1] = s_sortedLut[j];
-                j--;
-            }
-            s_sortedLut[j + 1] = key;
-        }
-        s_sortedReady = 1;
-    }
-
-    S32 lo = 0, hi = 255;
-    while (lo <= hi) {
-        S32 mid = (lo + hi) >> 1;
-        U32 midArgb = s_sortedLut[mid].argb;
-        if (midArgb == argb) {
-            *bestIdxOut = s_sortedLut[mid].idx;
-            return 1;
-        } else if (midArgb < argb) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    /* No exact match — nearest by Euclidean distance over the full table. */
-    {
-        U32 bestDist = 0xFFFFFFFF;
-        U8 bestIdx = 0;
-        for (U32 j = 0; j < 256; j++) {
-            U32 c = lut[j];
-            S32 dr = (S32)((c >> 16) & 0xFF) - (S32)((argb >> 16) & 0xFF);
-            S32 dg = (S32)((c >> 8) & 0xFF) - (S32)((argb >> 8) & 0xFF);
-            S32 db = (S32)(c & 0xFF) - (S32)(argb & 0xFF);
-            U32 dist = (U32)(dr * dr + dg * dg + db * db);
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestIdx = (U8)j;
-            }
-        }
-        *bestIdxOut = bestIdx;
-    }
-    return 0;
-}
-
-// Refills the software buffers the object pass reads from the GPU target:
-// Screen (terrain colour, converted from ARGB to palette indices) and
-// PtrZBuffer (depth, converted to the engine's aZ space). One backend round
-// trip fills both; a backend without depth readback leaves PtrZBuffer alone.
-//──────────────────────────────────────────────────────────────────────────
-void GpuRenderer_ReadbackSceneBuffers(void) {
-    if (!s_active || Screen == NULL) {
+void GpuRenderer_ReadbackDepthBuffer(void) {
+    if (!s_active || PtrZBuffer == NULL) {
         return;
     }
 
-    /* Flush pending geometry so the target holds the latest colour/depth. */
+    /* Flush pending geometry so the target holds the latest depth. */
     GpuRenderer_FlushBatch();
 
     const U32 fboW = s_backend->TargetWidth();
@@ -499,69 +436,23 @@ void GpuRenderer_ReadbackSceneBuffers(void) {
     }
 
     const U32 totalPixels = fboW * fboH;
-    static U32 *s_colorBuf = NULL;
-    static U32 s_colorBufSize = 0;
-    if (s_colorBufSize < totalPixels) {
-        free(s_colorBuf);
-        s_colorBuf = (U32 *)malloc(totalPixels * sizeof(U32));
-        s_colorBufSize = s_colorBuf ? totalPixels : 0;
+    static U16 *s_depthBuf = NULL;
+    static U32 s_depthBufSize = 0;
+    if (s_depthBufSize < totalPixels) {
+        free(s_depthBuf);
+        s_depthBuf = (U16 *)malloc(totalPixels * sizeof(U16));
+        s_depthBufSize = s_depthBuf ? totalPixels : 0;
     }
-    if (s_colorBuf == NULL) {
+    if (s_depthBuf == NULL) {
         return;
     }
 
-    const S32 wantDepth = (PtrZBuffer != NULL) ? 1 : 0;
-    static U16 *s_depthBuf = NULL;
-    static U32 s_depthBufSize = 0;
-    if (wantDepth) {
-        if (s_depthBufSize < totalPixels) {
-            free(s_depthBuf);
-            s_depthBuf = (U16 *)malloc(totalPixels * sizeof(U16));
-            s_depthBufSize = s_depthBuf ? totalPixels : 0;
-        }
-        if (s_depthBuf == NULL) {
-            return;
-        }
+    if (!s_backend->TargetReadDepth(s_depthBuf, fboW, fboH)) {
+        return; /* backend without depth readback: software Z-buffer stays */
     }
-
-    const S32 haveDepth = s_backend->TargetReadColorDepth(
-        s_colorBuf, wantDepth ? s_depthBuf : NULL, fboW, fboH);
 
     const U32 scrW = s_resX;
     const U32 scrH = s_resY;
-
-    /* Convert ARGB pixels to palette indices, Y-flipping (target rows are
-       bottom-up, Screen top-down). */
-    const U32 *lut = GL_GetPaletteLUT();
-    if (lut != NULL) {
-        U8 *dst = (U8 *)Screen;
-        if (fboW == scrW && fboH == scrH) {
-            for (U32 sy = 0; sy < scrH; sy++) {
-                U8 *dstRow = dst + sy * scrW;
-                const U32 *srcRow = s_colorBuf + (fboH - 1 - sy) * fboW;
-                for (U32 sx = 0; sx < scrW; sx++) {
-                    Common_ARGBToIndex(lut, srcRow[sx], &dstRow[sx]);
-                }
-            }
-        } else {
-            /* SSAA: pick the center pixel of each screen-pixel block. */
-            const U32 scaleX = fboW / scrW;
-            const U32 scaleY = fboH / scrH;
-            for (U32 sy = 0; sy < scrH; sy++) {
-                U8 *dstRow = dst + sy * scrW;
-                for (U32 sx = 0; sx < scrW; sx++) {
-                    U32 fx = sx * scaleX + scaleX / 2;
-                    U32 fy = (fboH - 1 - sy * scaleY - scaleY / 2);
-                    Common_ARGBToIndex(lut, s_colorBuf[fy * fboW + fx],
-                                       &dstRow[sx]);
-                }
-            }
-        }
-    }
-
-    if (!haveDepth) {
-        return; /* backend without depth readback: software Z-buffer stays */
-    }
 
     /* The GL vertex shader outputs Z = 1.0 - aZ/65535; the viewport
        transform stores depth = (2.0 - aZ/65535)/2. As DEPTH_COMPONENT16:
@@ -651,6 +542,10 @@ S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
     SetGpuPresentHooks(GpuRenderer_Present, GpuRenderer_IsActive);
     Fill_Poly_SetHook(GpuRenderer_RenderTriangleList);
 
+    /* Registers the pacing setter and replays the value chosen before init
+       (the config reaches Window_SetVSync before the renderer exists). */
+    SetGpuVSyncHook(GpuRenderer_SetVSync);
+
     Log_Info("[GPU] renderer active: %s (%ux%u)", be->identifier, resX, resY);
     return TRUE;
 }
@@ -662,6 +557,7 @@ void GpuRenderer_Shutdown(void) {
 
     /* Drop the seams first so a torn-down renderer never drives a frame. */
     SetGpuPresentHooks(NULL, NULL);
+    SetGpuVSyncHook(NULL);
     Fill_Poly_SetHook(NULL);
 
     s_backend->TargetDestroy();
@@ -728,6 +624,13 @@ void GpuRenderer_SetRenderQuality(U32 quality) {
     }
 }
 
+void GpuRenderer_SetVSync(S32 enabled) {
+    s_vsyncWanted = enabled ? 1 : 0;
+    if (s_active) {
+        s_backend->SetVSync(s_vsyncWanted);
+    }
+}
+
 //──────────────────────────────────────────────────────────────────────────
 // Queries
 //──────────────────────────────────────────────────────────────────────────
@@ -784,6 +687,7 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     return 0;
 }
 void GpuRenderer_SetRenderQuality(U32 quality) { (void)quality; }
-void GpuRenderer_ReadbackSceneBuffers(void) {}
+void GpuRenderer_ReadbackDepthBuffer(void) {}
+void GpuRenderer_SetVSync(S32 enabled) { (void)enabled; }
 
 #endif /* USE_GPURENDERER */

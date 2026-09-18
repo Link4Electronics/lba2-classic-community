@@ -81,19 +81,20 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
 - **Atlas signal** — `AtlasTextureDirty` is raised by `DoTextureAnimation`
   (`../SOURCES/ANIMTEX.CPP`) whenever animated texture pages are baked in
   place, so the renderer re-uploads the atlas page it mirrored.
-- **Software-buffer readback** — `AffScene` (`../SOURCES/OBJECT.CPP`, `AFF_ALL`)
-  calls `GpuRenderer_ReadbackSceneBuffers` after the exterior terrain pass to
-  refill `Screen` (terrain colour) and `PtrZBuffer` (depth) from the offscreen
-  target in one backend round trip. The object pass draws bodies into the
+- **Depth readback** — `AffScene` (`../SOURCES/OBJECT.CPP`, `AFF_ALL`) calls
+  `GpuRenderer_ReadbackDepthBuffer` after the exterior terrain pass to refill
+  `PtrZBuffer` from the offscreen target. The object pass draws bodies into the
   software `Log` and re-applies terrain occlusion with `ZBufBoxOverWrite2`
-  (`../SOURCES/3DEXT/BOXZBUF.CPP`), which reads those two buffers; without the
-  readback they hold nothing from the GPU-drawn terrain. The call is gated on
-  `CubeMode == CUBE_EXTERIEUR`: interior cubes reuse `PtrZBuffer`'s backing
-  store for `BufCube`/`BufferBrick` and draw through `DrawOverBrick`. OpenGL
-  reads colour and depth directly; SDL3 GPU downloads its colour and
-  `D16_UNORM` depth textures, reverses their top-down rows to the bottom-up
-  order the common layer expects, and converts the depth to the GL
-  window-depth convention the common aZ inverse expects.
+  (`../SOURCES/3DEXT/BOXZBUF.CPP`), which reads that depth; without the readback
+  it holds nothing from the GPU-drawn terrain. Where terrain is in front,
+  `ZBufBoxOverWrite2` writes colour 0, which the present composite blends
+  transparent over the same target's terrain, so no colour readback is needed.
+  The call is gated on `CubeMode == CUBE_EXTERIEUR`: interior cubes reuse
+  `PtrZBuffer`'s backing store for `BufCube`/`BufferBrick` and draw through
+  `DrawOverBrick`. OpenGL reads depth directly; SDL3 GPU downloads its
+  `D16_UNORM` depth texture, reverses its top-down rows to the bottom-up order
+  the common layer expects, and converts the depth to the GL window-depth
+  convention the common aZ inverse expects.
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
