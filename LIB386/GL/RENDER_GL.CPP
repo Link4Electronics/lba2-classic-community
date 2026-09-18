@@ -733,33 +733,28 @@ static U32 GL_TargetHeight(void) {
     return s_fboHeight;
 }
 
-/* Raw readbacks. Rows come back bottom-up; the common layer flips them and
-   applies the aZ inverse / ARGB→palette-index conversion. */
-static S32 GL_TargetReadDepth(void *dst, U32 width, U32 height) {
-    if (!s_initialized || !s_fbo || dst == NULL) {
+/* Raw readback. Rows come back bottom-up; the common layer flips them and
+   applies the aZ inverse / ARGB→palette-index conversion. Colour is always
+   written; depth is readable whenever the FBO has one, so the result is
+   FALSE only when there is no depth buffer to read. */
+static S32 GL_TargetReadColorDepth(void *colorDst, void *depthDst, U32 width,
+                                   U32 height) {
+    if (!s_initialized || !s_fbo || colorDst == NULL) {
         return FALSE;
     }
     if (!Window_GLMakeCurrent()) {
         return FALSE;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
-    glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_DEPTH_COMPONENT,
-                 GL_UNSIGNED_SHORT, dst);
-    return TRUE;
-}
-
-static void GL_TargetReadColor(void *dst, U32 width, U32 height) {
-    if (!s_initialized || !s_fbo || dst == NULL) {
-        return;
+    if (depthDst != NULL) {
+        glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_DEPTH_COMPONENT,
+                     GL_UNSIGNED_SHORT, depthDst);
     }
-    if (!Window_GLMakeCurrent()) {
-        return;
-    }
-    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
     /* Read as BGRA: paletteLUT is 0xAARRGGBB = [B,G,R,A] in LE memory,
        and GL_BGRA reads bytes in B,G,R,A order → U32 = ARGB. */
     glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, FMT_BGRA,
-                 GL_UNSIGNED_BYTE, dst);
+                 GL_UNSIGNED_BYTE, colorDst);
+    return depthDst != NULL;
 }
 
 /* ── Fixed-role texture uploads ────────────────────────────────────────────
@@ -1125,8 +1120,7 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_TargetBindClear,
     GL_TargetWidth,
     GL_TargetHeight,
-    GL_TargetReadDepth,
-    GL_TargetReadColor,
+    GL_TargetReadColorDepth,
     GL_TexUpdatePresent,
     GL_TexUpdateAtlas,
     GL_TexUpdateCLUT,

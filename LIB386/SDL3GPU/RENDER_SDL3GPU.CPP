@@ -154,6 +154,13 @@ static SDL_GPUBuffer *s_quadVbo = NULL;
 static SDL_GPUTransferBuffer *s_staging = NULL;
 static U32 s_stagingBytes = 0;
 
+/* Download transfer buffers for the combined colour+depth readback. It submits
+   and waits, so a buffer is never overwritten while still in flight. */
+static SDL_GPUTransferBuffer *s_readbackColorTb = NULL;
+static U32 s_readbackColorTbBytes = 0;
+static SDL_GPUTransferBuffer *s_readbackDepthTb = NULL;
+static U32 s_readbackDepthTbBytes = 0;
+
 /* Pipelines. */
 static SDL_GPUGraphicsPipeline *s_clutPipelines[S3_CLUT_PIPELINE_COUNT];
 static SDL_GPUGraphicsPipeline *s_presentOpaque = NULL;
@@ -356,7 +363,7 @@ static SDL_GPUGraphicsPipeline *S3_CreateClutPipeline(SDL_GPUShader *vs,
     S3_FillBlendState(&blendState, blend);
 
     SDL_zero(ctd);
-    ctd.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    ctd.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     ctd.blend_state = blendState;
 
     SDL_zero(ds);
@@ -725,6 +732,159 @@ static S32 S3_UploadBufferOnce(SDL_GPUBuffer *dst, const void *data,
     return TRUE;
 }
 
+/* Grows a download transfer buffer to at least `bytes`. */
+static S32 S3_EnsureReadbackTb(SDL_GPUTransferBuffer **tb, U32 *capacity,
+                               U32 bytes) {
+    SDL_GPUTransferBufferCreateInfo tci;
+
+    if (*capacity >= bytes) {
+        return TRUE;
+    }
+    if (*tb != NULL) {
+        SDL_ReleaseGPUTransferBuffer(s_device, *tb);
+        *tb = NULL;
+        *capacity = 0;
+    }
+    SDL_zero(tci);
+    tci.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    tci.size = bytes;
+    *tb = SDL_CreateGPUTransferBuffer(s_device, &tci);
+    if (*tb == NULL) {
+        Log_Warn("[SDL3GPU] readback transfer buffer create failed: %s",
+                 SDL_GetError());
+        return FALSE;
+    }
+    *capacity = bytes;
+    return TRUE;
+}
+
+/* Copies one row-flipped (bottom-up) plane out of a mapped readback buffer.
+   SDL3 GPU rows are top-down (negative-height viewport); the common readback
+   flips them assuming GL's bottom-up glReadPixels order, so reverse here. */
+static void S3_CopyReadbackPlane(void *dst, const void *mapped, U32 width,
+                                 U32 height, U32 bpp) {
+    const U32 stride = width * bpp;
+    U32 y;
+
+    for (y = 0; y < height; y++) {
+        memcpy((U8 *)dst + y * stride,
+               (const U8 *)mapped + (height - 1 - y) * stride, stride);
+    }
+}
+
+/* Reads the colour and depth targets in a single command-buffer round trip
+   (one submit, one wait): the engine consumes them later in the same host
+   frame, so the round trip cannot be deferred. Colour is always written;
+   returns FALSE when depth is unavailable, leaving the depth buffer alone. */
+static S32 S3_TargetReadColorDepth(void *colorDst, void *depthDst, U32 width,
+                                   U32 height) {
+    U32 colorBytes;
+    U32 depthBytes;
+    SDL_GPUCopyPass *cp;
+    SDL_GPUTextureRegion src;
+    SDL_GPUTextureTransferInfo dstInfo;
+    const void *mapped;
+    U16 *samples;
+    U32 count;
+    U32 i;
+    S32 haveDepth;
+
+    if (s_device == NULL || s_targetColor == NULL || colorDst == NULL ||
+        width == 0 || height == 0) {
+        return FALSE;
+    }
+    haveDepth = (s_targetDepth != NULL && depthDst != NULL) ? TRUE : FALSE;
+
+    /* The target pass must be closed before a copy pass can touch the frame's
+       command buffer; rendering the queued terrain also fills the target. */
+    S3_FlushDraws();
+    if (s_frameCmd == NULL) {
+        s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
+        if (s_frameCmd == NULL) {
+            Log_Warn("[SDL3GPU] command buffer acquire failed: %s",
+                     SDL_GetError());
+            return FALSE;
+        }
+    }
+    if (s_targetPass != NULL) {
+        SDL_EndGPURenderPass(s_targetPass);
+        s_targetPass = NULL;
+    }
+
+    colorBytes = width * height * 4;
+    depthBytes = haveDepth ? width * height * 2 : 0;
+    if (!S3_EnsureReadbackTb(&s_readbackColorTb, &s_readbackColorTbBytes,
+                             colorBytes)) {
+        return FALSE;
+    }
+    if (haveDepth && !S3_EnsureReadbackTb(&s_readbackDepthTb,
+                                          &s_readbackDepthTbBytes,
+                                          depthBytes)) {
+        return FALSE;
+    }
+
+    cp = SDL_BeginGPUCopyPass(s_frameCmd);
+    SDL_zero(src);
+    src.texture = s_targetColor;
+    src.w = width;
+    src.h = height;
+    src.d = 1;
+    SDL_zero(dstInfo);
+    dstInfo.transfer_buffer = s_readbackColorTb;
+    dstInfo.offset = 0;
+    dstInfo.pixels_per_row = width;
+    dstInfo.rows_per_layer = height;
+    SDL_DownloadFromGPUTexture(cp, &src, &dstInfo);
+    if (haveDepth) {
+        src.texture = s_targetDepth;
+        dstInfo.transfer_buffer = s_readbackDepthTb;
+        SDL_DownloadFromGPUTexture(cp, &src, &dstInfo);
+    }
+    SDL_EndGPUCopyPass(cp);
+
+    /* The frame's command buffer ends at the readback and is reacquired for
+       whatever still draws this frame. */
+    SDL_SubmitGPUCommandBuffer(s_frameCmd);
+    s_frameCmd = NULL;
+    s_targetPass = NULL;
+    if (!SDL_WaitForGPUIdle(s_device)) {
+        Log_Warn("[SDL3GPU] readback wait failed: %s", SDL_GetError());
+        return FALSE;
+    }
+
+    mapped = SDL_MapGPUTransferBuffer(s_device, s_readbackColorTb, false);
+    if (mapped == NULL) {
+        Log_Warn("[SDL3GPU] readback map failed: %s", SDL_GetError());
+        return FALSE;
+    }
+    S3_CopyReadbackPlane(colorDst, mapped, width, height, 4);
+    SDL_UnmapGPUTransferBuffer(s_device, s_readbackColorTb);
+
+    if (!haveDepth) {
+        return FALSE;
+    }
+
+    mapped = SDL_MapGPUTransferBuffer(s_device, s_readbackDepthTb, false);
+    if (mapped == NULL) {
+        Log_Warn("[SDL3GPU] depth readback map failed: %s", SDL_GetError());
+        return FALSE;
+    }
+    samples = (U16 *)depthDst;
+    S3_CopyReadbackPlane(samples, mapped, width, height, 2);
+    SDL_UnmapGPUTransferBuffer(s_device, s_readbackDepthTb);
+
+    /* Raw D16 is the clip-space depth the shader wrote, 1 - aZ/65535, so
+       sample = 65535 - aZ. The common layer applies the GL aZ inverse
+       (aZ = 131070 - 2*glDepth) to whatever this returns; convert to that
+       GL window-depth convention here (glDepth = 65535 - aZ/2) so one inverse
+       serves both backends. */
+    count = width * height;
+    for (i = 0; i < count; i++) {
+        samples[i] = (U16)((samples[i] + 65535u) >> 1);
+    }
+    return TRUE;
+}
+
 static S32 S3_CreateBuffers(void) {
     SDL_GPUBufferCreateInfo ci;
 
@@ -898,6 +1058,16 @@ static void S3_DestroyContext(void) {
         s_staging = NULL;
     }
     s_stagingBytes = 0;
+    if (s_readbackColorTb != NULL) {
+        SDL_ReleaseGPUTransferBuffer(s_device, s_readbackColorTb);
+        s_readbackColorTb = NULL;
+    }
+    s_readbackColorTbBytes = 0;
+    if (s_readbackDepthTb != NULL) {
+        SDL_ReleaseGPUTransferBuffer(s_device, s_readbackDepthTb);
+        s_readbackDepthTb = NULL;
+    }
+    s_readbackDepthTbBytes = 0;
     if (s_frameVerts != NULL) {
         free(s_frameVerts);
         s_frameVerts = NULL;
@@ -934,7 +1104,9 @@ static S32 S3_TargetCreate(U32 width, U32 height) {
 
     SDL_zero(ci);
     ci.type = SDL_GPU_TEXTURETYPE_2D;
-    ci.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    /* B8G8R8A8 keeps the readback words in the shared 0xAARRGGBB order the
+       palette table uses, so Common_ARGBToIndex maps them without a swizzle. */
+    ci.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
     ci.width = width;
     ci.height = height;
     ci.layer_count_or_depth = 1;
@@ -1005,21 +1177,6 @@ static U32 S3_TargetWidth(void) {
 
 static U32 S3_TargetHeight(void) {
     return s_targetH;
-}
-
-static S32 S3_TargetReadDepth(void *dst, U32 width, U32 height) {
-    (void)dst; (void)width; (void)height;
-    /* SDL3 GPU depth textures cannot be read back (they are not samplable
-       and the API exposes no download for them). The GL backend is the
-       reference readback path; the common layer falls back when FALSE. */
-    return FALSE;
-}
-
-static void S3_TargetReadColor(void *dst, U32 width, U32 height) {
-    (void)dst; (void)width; (void)height;
-    /* No color readback: the common layer leaves the caller's buffer
-       untouched when nothing is written (see GPURENDERER_COMMON.CPP), and
-       the readback post-process is not exercised by this backend. */
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -1616,8 +1773,7 @@ const GpuRendererBackend GpuRendererBackendSDL3GPU = {
     S3_TargetBindClear,
     S3_TargetWidth,
     S3_TargetHeight,
-    S3_TargetReadDepth,
-    S3_TargetReadColor,
+    S3_TargetReadColorDepth,
     S3_TexUpdatePresent,
     S3_TexUpdateAtlas,
     S3_TexUpdateCLUT,

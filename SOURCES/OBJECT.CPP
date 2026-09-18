@@ -5475,6 +5475,15 @@ startaffscene:
 
         CopyScreen(Log, Screen);
 
+        /* The GPU backend draws the exterior terrain into its own target, so
+           the software buffers the object pass reads are refilled from it:
+           Screen for ZBufBoxOverWrite2's terrain restore and PtrZBuffer for the
+           depth test inside it. Interior cubes keep PtrZBuffer's backing store
+           for BufCube/BufferBrick and draw through DrawOverBrick instead. */
+        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+            GpuRenderer_ReadbackSceneBuffers();
+        }
+
         if (flagflip == AFF_ALL_FLIP
                                 AND !CinemaMode AND MemoClipWindowYMin > 0) {
             RestoreClipWindow();

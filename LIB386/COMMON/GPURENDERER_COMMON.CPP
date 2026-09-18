@@ -417,84 +417,6 @@ void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
 }
 
 //──────────────────────────────────────────────────────────────────────────
-// Readbacks. Depth arrives raw (bottom-up, 16-bit, driver Z range) and is
-// converted here to the engine's aZ space; colour arrives as ARGB and is
-// converted to palette indices for the Log buffer.
-//──────────────────────────────────────────────────────────────────────────
-void GpuRenderer_ReadbackDepthBuffer(void) {
-    if (!s_active || PtrZBuffer == NULL) {
-        return;
-    }
-
-    /* Flush pending geometry so the target holds the latest depth. */
-    GpuRenderer_FlushBatch();
-
-    const U32 fboW = s_backend->TargetWidth();
-    const U32 fboH = s_backend->TargetHeight();
-    if (fboW == 0 || fboH == 0) {
-        return;
-    }
-
-    static U16 *s_depthBuf = NULL;
-    static U32 s_depthBufSize = 0;
-    const U32 totalPixels = fboW * fboH;
-    if (s_depthBufSize < totalPixels) {
-        free(s_depthBuf);
-        s_depthBuf = (U16 *)malloc(totalPixels * sizeof(U16));
-        s_depthBufSize = s_depthBuf ? totalPixels : 0;
-    }
-    if (s_depthBuf == NULL) {
-        return;
-    }
-
-    if (!s_backend->TargetReadDepth(s_depthBuf, fboW, fboH)) {
-        return; /* unreadable backend (SDL3 GPU): software path keeps Z */
-    }
-
-    const U32 scrW = s_resX;
-    const U32 scrH = s_resY;
-
-    /* The GL vertex shader outputs Z = 1.0 - aZ/65535; the viewport
-       transform stores depth = (2.0 - aZ/65535)/2. As DEPTH_COMPONENT16:
-       gl_depth_16 = (131070 - aZ)/2. Inverse: aZ = 131070 - 2*gl_depth_16.
-       Cleared depth 0 maps to aZ 131070, larger than any valid value, so
-       ZBufBoxOverWrite2 always keeps shadows there. */
-    if (fboW == scrW && fboH == scrH) {
-        for (U32 sy = 0; sy < scrH; sy++) {
-            const U16 *srcRow = s_depthBuf + (scrH - 1 - sy) * scrW;
-            U16 *dstRow = PtrZBuffer + sy * scrW;
-            for (U32 sx = 0; sx < scrW; sx++) {
-                U32 glDepth = srcRow[sx];
-                dstRow[sx] = (U16)(131070u - 2u * glDepth);
-            }
-        }
-    } else {
-        /* SSAA: downsample, keeping the closest (minimum aZ) sample per
-           screen-pixel block. */
-        const U32 scaleX = fboW / scrW;
-        const U32 scaleY = fboH / scrH;
-        for (U32 sy = 0; sy < scrH; sy++) {
-            U16 *dstRow = PtrZBuffer + sy * scrW;
-            for (U32 sx = 0; sx < scrW; sx++) {
-                U16 minAZ = 0x7FFF;
-                const U32 fx0 = sx * scaleX;
-                const U32 fy0 = (fboH - 1 - sy * scaleY) - scaleY + 1;
-                for (U32 fy = fy0; fy < fy0 + scaleY; fy++) {
-                    const U16 *srcRow = s_depthBuf + fy * fboW;
-                    for (U32 fx = fx0; fx < fx0 + scaleX; fx++) {
-                        U32 glDepth = srcRow[fx];
-                        U16 az = (U16)(131070u - 2u * glDepth);
-                        if (az < minAZ) {
-                            minAZ = az;
-                        }
-                    }
-                }
-                dstRow[sx] = minAZ;
-            }
-        }
-    }
-}
-
 static S32 Common_ARGBToIndex(const U32 *lut, U32 argb, U8 *bestIdxOut) {
     struct RevEntry {
         U32 argb;
@@ -557,19 +479,22 @@ static S32 Common_ARGBToIndex(const U32 *lut, U32 argb, U8 *bestIdxOut) {
     return 0;
 }
 
-void GpuRenderer_ReadbackColorBuffer(void) {
+// Refills the software buffers the object pass reads from the GPU target:
+// Screen (terrain colour, converted from ARGB to palette indices) and
+// PtrZBuffer (depth, converted to the engine's aZ space). One backend round
+// trip fills both; a backend without depth readback leaves PtrZBuffer alone.
+//──────────────────────────────────────────────────────────────────────────
+void GpuRenderer_ReadbackSceneBuffers(void) {
     if (!s_active || Screen == NULL) {
         return;
     }
 
+    /* Flush pending geometry so the target holds the latest colour/depth. */
+    GpuRenderer_FlushBatch();
+
     const U32 fboW = s_backend->TargetWidth();
     const U32 fboH = s_backend->TargetHeight();
     if (fboW == 0 || fboH == 0) {
-        return;
-    }
-
-    const U32 *lut = GL_GetPaletteLUT();
-    if (lut == NULL) {
         return;
     }
 
@@ -585,33 +510,95 @@ void GpuRenderer_ReadbackColorBuffer(void) {
         return;
     }
 
-    s_backend->TargetReadColor(s_colorBuf, fboW, fboH);
+    const S32 wantDepth = (PtrZBuffer != NULL) ? 1 : 0;
+    static U16 *s_depthBuf = NULL;
+    static U32 s_depthBufSize = 0;
+    if (wantDepth) {
+        if (s_depthBufSize < totalPixels) {
+            free(s_depthBuf);
+            s_depthBuf = (U16 *)malloc(totalPixels * sizeof(U16));
+            s_depthBufSize = s_depthBuf ? totalPixels : 0;
+        }
+        if (s_depthBuf == NULL) {
+            return;
+        }
+    }
+
+    const S32 haveDepth = s_backend->TargetReadColorDepth(
+        s_colorBuf, wantDepth ? s_depthBuf : NULL, fboW, fboH);
 
     const U32 scrW = s_resX;
     const U32 scrH = s_resY;
-    U8 *dst = (U8 *)Screen;
 
     /* Convert ARGB pixels to palette indices, Y-flipping (target rows are
        bottom-up, Screen top-down). */
+    const U32 *lut = GL_GetPaletteLUT();
+    if (lut != NULL) {
+        U8 *dst = (U8 *)Screen;
+        if (fboW == scrW && fboH == scrH) {
+            for (U32 sy = 0; sy < scrH; sy++) {
+                U8 *dstRow = dst + sy * scrW;
+                const U32 *srcRow = s_colorBuf + (fboH - 1 - sy) * fboW;
+                for (U32 sx = 0; sx < scrW; sx++) {
+                    Common_ARGBToIndex(lut, srcRow[sx], &dstRow[sx]);
+                }
+            }
+        } else {
+            /* SSAA: pick the center pixel of each screen-pixel block. */
+            const U32 scaleX = fboW / scrW;
+            const U32 scaleY = fboH / scrH;
+            for (U32 sy = 0; sy < scrH; sy++) {
+                U8 *dstRow = dst + sy * scrW;
+                for (U32 sx = 0; sx < scrW; sx++) {
+                    U32 fx = sx * scaleX + scaleX / 2;
+                    U32 fy = (fboH - 1 - sy * scaleY - scaleY / 2);
+                    Common_ARGBToIndex(lut, s_colorBuf[fy * fboW + fx],
+                                       &dstRow[sx]);
+                }
+            }
+        }
+    }
+
+    if (!haveDepth) {
+        return; /* backend without depth readback: software Z-buffer stays */
+    }
+
+    /* The GL vertex shader outputs Z = 1.0 - aZ/65535; the viewport
+       transform stores depth = (2.0 - aZ/65535)/2. As DEPTH_COMPONENT16:
+       gl_depth_16 = (131070 - aZ)/2. Inverse: aZ = 131070 - 2*gl_depth_16.
+       Cleared depth 0 maps to aZ 131070, larger than any valid value, so
+       ZBufBoxOverWrite2 always keeps shadows there. */
     if (fboW == scrW && fboH == scrH) {
         for (U32 sy = 0; sy < scrH; sy++) {
-            U8 *dstRow = dst + sy * scrW;
-            const U32 *srcRow = s_colorBuf + (fboH - 1 - sy) * fboW;
+            const U16 *srcRow = s_depthBuf + (scrH - 1 - sy) * scrW;
+            U16 *dstRow = PtrZBuffer + sy * scrW;
             for (U32 sx = 0; sx < scrW; sx++) {
-                Common_ARGBToIndex(lut, srcRow[sx], &dstRow[sx]);
+                U32 glDepth = srcRow[sx];
+                dstRow[sx] = (U16)(131070u - 2u * glDepth);
             }
         }
     } else {
-        /* SSAA: pick the center pixel of each screen-pixel block. */
+        /* SSAA: downsample, keeping the closest (minimum aZ) sample per
+           screen-pixel block. */
         const U32 scaleX = fboW / scrW;
         const U32 scaleY = fboH / scrH;
         for (U32 sy = 0; sy < scrH; sy++) {
-            U8 *dstRow = dst + sy * scrW;
+            U16 *dstRow = PtrZBuffer + sy * scrW;
             for (U32 sx = 0; sx < scrW; sx++) {
-                U32 fx = sx * scaleX + scaleX / 2;
-                U32 fy = (fboH - 1 - sy * scaleY - scaleY / 2);
-                Common_ARGBToIndex(lut, s_colorBuf[fy * fboW + fx],
-                                   &dstRow[sx]);
+                U16 minAZ = 0x7FFF;
+                const U32 fx0 = sx * scaleX;
+                const U32 fy0 = (fboH - 1 - sy * scaleY) - scaleY + 1;
+                for (U32 fy = fy0; fy < fy0 + scaleY; fy++) {
+                    const U16 *srcRow = s_depthBuf + fy * fboW;
+                    for (U32 fx = fx0; fx < fx0 + scaleX; fx++) {
+                        U32 glDepth = srcRow[fx];
+                        U16 az = (U16)(131070u - 2u * glDepth);
+                        if (az < minAZ) {
+                            minAZ = az;
+                        }
+                    }
+                }
+                dstRow[sx] = minAZ;
             }
         }
     }
@@ -797,7 +784,6 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     return 0;
 }
 void GpuRenderer_SetRenderQuality(U32 quality) { (void)quality; }
-void GpuRenderer_ReadbackDepthBuffer(void) {}
-void GpuRenderer_ReadbackColorBuffer(void) {}
+void GpuRenderer_ReadbackSceneBuffers(void) {}
 
 #endif /* USE_GPURENDERER */

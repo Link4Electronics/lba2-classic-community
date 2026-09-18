@@ -56,10 +56,12 @@ S32  GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
                                     S32 nbPoints, Struc_Point *ptrPoints);
 void GpuRenderer_SetRenderQuality(U32 quality);
 
-// Readbacks. Filled only in the map editor path (engine::EVENT readback) —
-// buffers are owned by the caller.
-void GpuRenderer_ReadbackDepthBuffer(void);
-void GpuRenderer_ReadbackColorBuffer(void);
+// Readback. Called after the exterior terrain pass to refill the software
+// buffers the object pass reads: writes Screen (terrain colour) and PtrZBuffer
+// (depth) from the offscreen target in one backend round trip. A no-op when no
+// GPU backend is active; a backend without depth readback leaves PtrZBuffer
+// untouched.
+void GpuRenderer_ReadbackSceneBuffers(void);
 
 #ifdef __cplusplus
 }

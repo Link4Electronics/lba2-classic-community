@@ -81,6 +81,19 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
 - **Atlas signal** — `AtlasTextureDirty` is raised by `DoTextureAnimation`
   (`../SOURCES/ANIMTEX.CPP`) whenever animated texture pages are baked in
   place, so the renderer re-uploads the atlas page it mirrored.
+- **Software-buffer readback** — `AffScene` (`../SOURCES/OBJECT.CPP`, `AFF_ALL`)
+  calls `GpuRenderer_ReadbackSceneBuffers` after the exterior terrain pass to
+  refill `Screen` (terrain colour) and `PtrZBuffer` (depth) from the offscreen
+  target in one backend round trip. The object pass draws bodies into the
+  software `Log` and re-applies terrain occlusion with `ZBufBoxOverWrite2`
+  (`../SOURCES/3DEXT/BOXZBUF.CPP`), which reads those two buffers; without the
+  readback they hold nothing from the GPU-drawn terrain. The call is gated on
+  `CubeMode == CUBE_EXTERIEUR`: interior cubes reuse `PtrZBuffer`'s backing
+  store for `BufCube`/`BufferBrick` and draw through `DrawOverBrick`. OpenGL
+  reads colour and depth directly; SDL3 GPU downloads its colour and
+  `D16_UNORM` depth textures, reverses their top-down rows to the bottom-up
+  order the common layer expects, and converts the depth to the GL
+  window-depth convention the common aZ inverse expects.
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
@@ -108,22 +121,21 @@ menu → Renderer (Software / OpenGL / SDL3 GPU), persisted to the lba2.cfg
 env is kept as a one-run dev override. Absent or unknown values keep the
 software rasterizer, which is still the shipped default.
 
+The frame boundary is owned by the renderer: `GpuRenderer_BeginFrame` runs at
+the top of `AffScene` (`../SOURCES/OBJECT.CPP`) and `GpuRenderer_ClearFBO` at
+the top of `RefreshGrille` (`../SOURCES/INTEXT.CPP`). A frame that redraws
+terrain clears the offscreen target; a frame that only redraws objects
+(`AFF_OBJETS`) keeps the previous 3D colour and depth, matching the software
+Z-buffer, so an idle scene is not wiped to black. After the terrain pass the
+software `Screen`/`PtrZBuffer` buffers are refilled from the target (see the
+readback seam above) so object occlusion works under a GPU backend.
+
 Remaining work, in order:
 
-1. **Frame boundaries** — `GpuRenderer_BeginFrame` runs at the top of
-   `AffScene` (`../SOURCES/OBJECT.CPP`) and `GpuRenderer_ClearFBO` at the top
-   of `RefreshGrille` (`../SOURCES/INTEXT.CPP`), the terrain pass. A frame that
-   redraws terrain clears the offscreen target; a frame that only redraws
-   objects (`AFF_OBJETS`) keeps the previous 3D colour and depth, matching the
-   software Z-buffer, so an idle scene is not wiped to black.
-2. **Readbacks** — the common layer has no caller for
-   `TargetReadDepth` / `TargetReadColor` yet. When one lands, the SDL3 GPU
-   backend reports no depth readback (depth textures are not samplable) and
-   the common layer falls back to software.
-3. **Render-quality scaling** — the Display-menu tier list and
+1. **Render-quality scaling** — the Display-menu tier list and
    `GpuRenderer_SetRenderQuality` (1–4×); the `Renderer` config key and the
    Display-menu toggle the original's "change quality" slot maps onto already
    landed.
-4. **Resolution changes** — a runtime resolution switch while a backend is
+2. **Resolution changes** — a runtime resolution switch while a backend is
    active is not handled yet; a switch should `GpuRenderer_Shutdown`/re-init
    cleanly.
