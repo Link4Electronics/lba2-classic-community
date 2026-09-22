@@ -133,6 +133,16 @@ static SDL_GPUTexture *s_targetDepth = NULL;
 static U32 s_targetW = 0;
 static U32 s_targetH = 0;
 
+/* Persistent terrain target (see GpuRenderer_SnapshotTerrain/RestoreTerrain):
+   colour + depth textures sized like the offscreen target. Filled by texture
+   copies at the end of the exterior terrain pass; the colour copy is replayed
+   over the offscreen target at the head of each AFF_OBJETS exterior frame so a
+   static camera scrubs the previous frame's shadow/animated-poly paint. The
+   depth copy stores a faithful post-terrain-pass state even though restore
+   never reads it back (the target's own depth is unwritten between the two). */
+static SDL_GPUTexture *s_terrainColor = NULL;
+static SDL_GPUTexture *s_terrainDepth = NULL;
+
 /* Fixed-role textures. */
 static SDL_GPUTexture *s_atlasTex = NULL;
 static SDL_GPUTexture *s_clutTex = NULL;
@@ -864,6 +874,84 @@ static S32 S3_TargetReadDepth(void *depthDst, U32 width, U32 height) {
     return TRUE;
 }
 
+/* Copies the offscreen target (colour + depth) into the persistent terrain
+   target. Texture-to-texture copies of the same format, recorded in one copy
+   pass after whatever the target still holds has been rendered. */
+static S32 S3_TargetSnapshotTerrain(void) {
+    SDL_GPUCopyPass *cp;
+    SDL_GPUTextureLocation src;
+    SDL_GPUTextureLocation dst;
+
+    if (s_device == NULL || s_targetColor == NULL || s_targetDepth == NULL ||
+        s_terrainColor == NULL || s_terrainDepth == NULL) {
+        return FALSE;
+    }
+
+    /* Render the terrain tiles queued so far so the target holds the complete
+       pass before it is copied. */
+    S3_FlushDraws();
+
+    if (s_frameCmd == NULL) {
+        s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
+        if (s_frameCmd == NULL) {
+            Log_Warn("[SDL3GPU] command buffer acquire failed (terrain "
+                     "snapshot): %s", SDL_GetError());
+            return FALSE;
+        }
+    }
+    if (s_targetPass != NULL) {
+        SDL_EndGPURenderPass(s_targetPass);
+        s_targetPass = NULL;
+    }
+
+    cp = SDL_BeginGPUCopyPass(s_frameCmd);
+    SDL_zero(src);
+    src.texture = s_targetColor;
+    SDL_zero(dst);
+    dst.texture = s_terrainColor;
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, s_targetW, s_targetH, 1, false);
+    src.texture = s_targetDepth;
+    dst.texture = s_terrainDepth;
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, s_targetW, s_targetH, 1, false);
+    SDL_EndGPUCopyPass(cp);
+    return TRUE;
+}
+
+/* Copies the stored terrain colour back over the offscreen target. This runs
+   at the head of each AFF_OBJETS exterior frame, *before* the frame's queued
+   draws (animated polys, shadows) are replayed by the next S3_FlushDraws, so
+   they paint over the scrubbed terrain instead of being wiped by it. */
+static void S3_TargetRestoreTerrain(void) {
+    SDL_GPUCopyPass *cp;
+    SDL_GPUTextureLocation src;
+    SDL_GPUTextureLocation dst;
+
+    if (s_device == NULL || s_targetColor == NULL || s_terrainColor == NULL) {
+        return;
+    }
+
+    if (s_frameCmd == NULL) {
+        s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
+        if (s_frameCmd == NULL) {
+            Log_Warn("[SDL3GPU] command buffer acquire failed (terrain "
+                     "restore): %s", SDL_GetError());
+            return;
+        }
+    }
+    if (s_targetPass != NULL) {
+        SDL_EndGPURenderPass(s_targetPass);
+        s_targetPass = NULL;
+    }
+
+    cp = SDL_BeginGPUCopyPass(s_frameCmd);
+    SDL_zero(src);
+    src.texture = s_terrainColor;
+    SDL_zero(dst);
+    dst.texture = s_targetColor;
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, s_targetW, s_targetH, 1, false);
+    SDL_EndGPUCopyPass(cp);
+}
+
 static S32 S3_CreateBuffers(void) {
     SDL_GPUBufferCreateInfo ci;
 
@@ -1117,6 +1205,36 @@ static S32 S3_TargetCreate(U32 width, U32 height) {
         return FALSE;
     }
 
+    /* Terrain snapshot textures at the same size and with the same formats, so
+       the texture-to-texture copies (colour→colour, depth→depth) are legal. */
+    ci.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    s_terrainColor = SDL_CreateGPUTexture(s_device, &ci);
+    if (s_terrainColor == NULL) {
+        Log_Warn("[SDL3GPU] terrain color target create failed: %s",
+                 SDL_GetError());
+        SDL_ReleaseGPUTexture(s_device, s_targetColor);
+        SDL_ReleaseGPUTexture(s_device, s_targetDepth);
+        s_targetColor = NULL;
+        s_targetDepth = NULL;
+        return FALSE;
+    }
+
+    ci.format = SDL_GPU_TEXTUREFORMAT_D16_UNORM;
+    ci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
+    s_terrainDepth = SDL_CreateGPUTexture(s_device, &ci);
+    if (s_terrainDepth == NULL) {
+        Log_Warn("[SDL3GPU] terrain depth target create failed: %s",
+                 SDL_GetError());
+        SDL_ReleaseGPUTexture(s_device, s_terrainColor);
+        SDL_ReleaseGPUTexture(s_device, s_targetColor);
+        SDL_ReleaseGPUTexture(s_device, s_targetDepth);
+        s_terrainColor = NULL;
+        s_targetColor = NULL;
+        s_targetDepth = NULL;
+        return FALSE;
+    }
+
     s_targetW = width;
     s_targetH = height;
     /* Fresh textures hold undefined colour and depth; the first pass clears. */
@@ -1143,6 +1261,14 @@ static void S3_TargetDestroy(void) {
     if (s_targetDepth != NULL) {
         SDL_ReleaseGPUTexture(s_device, s_targetDepth);
         s_targetDepth = NULL;
+    }
+    if (s_terrainColor != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_terrainColor);
+        s_terrainColor = NULL;
+    }
+    if (s_terrainDepth != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_terrainDepth);
+        s_terrainDepth = NULL;
     }
     s_targetW = 0;
     s_targetH = 0;
@@ -1761,6 +1887,8 @@ const GpuRendererBackend GpuRendererBackendSDL3GPU = {
     S3_TargetWidth,
     S3_TargetHeight,
     S3_TargetReadDepth,
+    S3_TargetSnapshotTerrain,
+    S3_TargetRestoreTerrain,
     S3_SetVSync,
     S3_TexUpdatePresent,
     S3_TexUpdateAtlas,

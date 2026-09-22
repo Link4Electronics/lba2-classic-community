@@ -5445,8 +5445,18 @@ startaffscene:
         BoxClean(); // ATTENTION: rajouté le 30/05/97
         if (!FlagAnimWhoSpeak) {
             RestoreCinemaMode(); // Scrolle les bandes noires
-            if (CubeMode == CUBE_EXTERIEUR)
+            if (CubeMode == CUBE_EXTERIEUR) {
+                /* Scrub the offscreen target back to the terrain captured at
+                   the end of the terrain pass before the flagged-body pass
+                   draws, erasing the previous frame's shadow spans the paused
+                   target kept (BoxClean only restores Log). This runs before
+                   DrawAnimatedPolys so that frame's NZW polys paint over the
+                   restored terrain, exactly as the software BoxClean +
+                   DrawAnimatedPolys sequence does on Log. */
+                if (GpuRenderer_IsActive())
+                    GpuRenderer_RestoreTerrain();
                 DrawAnimatedPolys();
+            }
         }
         break;
 
@@ -5483,6 +5493,12 @@ startaffscene:
            DrawOverBrick instead. */
         if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
             GpuRenderer_ReadbackDepthBuffer();
+            /* Static-camera frames (AFF_OBJETS) redraw the flagged objects but
+               never the terrain, so the offscreen target would keep each
+               frame's shadows and washed animated polys and smear them into
+               trails. Pin the clean terrain here; the AFF_OBJETS head restores
+               it before the flagged-body pass. */
+            GpuRenderer_SnapshotTerrain();
         }
 
         if (flagflip == AFF_ALL_FLIP

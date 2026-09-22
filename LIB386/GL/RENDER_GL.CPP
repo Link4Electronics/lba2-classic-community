@@ -134,7 +134,7 @@ static const char *s_clutFragSrc =
     "uniform sampler2D uAtlas;\n"   /* 256×256 LUMINANCE */
     "uniform sampler2D uCLUT;\n"    /* 256×256 LUMINANCE (fog table) */
     "uniform sampler2D uPalette;\n" /* 256×1 BGRA (paletteLUT) */
-    "uniform int uPolyMode;\n"      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth */
+    "uniform int uPolyMode;\n"      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow */
     "uniform float uFlatColor;\n"   /* palette index (mode 1) / CLUT column (mode 3) */
     "uniform float uCLUTBaseRow;\n" /* CLUT row offset for gouraud table (mode 3) */
     "uniform float uScaledFogNear;\n" /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
@@ -285,6 +285,11 @@ static const char *s_clutFragSrc =
     "        float fogRow16 = floor(fogDist * uFogRowScale);\n"
     "        float clutRow = 12.0 + floor(mod(fogRow16, 256.0) / 16.0) * 16.0;\n"
     "        color = clutLookup(texel, clutRow);\n"
+    "    } else if (uPolyMode == 6) {\n"
+    /* Scene shadow span: flat black alpha-blended at uFlatColor alpha. The
+       alpha is the CLUT row's average luminance loss (see Common_ShadowAlpha),
+       so blending shadow * (1 - alpha) matches the ShadeBoxBlk darkening. */
+    "        color = vec4(0.0, 0.0, 0.0, uFlatColor);\n"
     "    } else {\n"
     /* Gouraud table (types 6/7): CLUT lookup, color = column.
        Same +128 rounding bias as polyMode 0. */
@@ -359,6 +364,15 @@ static GLuint s_fboDepthRbo = 0;
 static U32 s_fboWidth = 0;
 static U32 s_fboHeight = 0;
 
+/* Terrain snapshot (see GpuRenderer_SnapshotTerrain/RestoreTerrain): colour +
+   depth textures the size of the FBO. The colour is copied back over the FBO
+   at the head of each AFF_OBJETS exterior frame so the static camera scrubs
+   the previous frame's shadow/animated-poly paint; the depth texture keeps the
+   stored copy a faithful post-terrain-pass state, even though restore never
+   reads it back (the FBO's own depth is unwritten between the two calls). */
+static GLuint s_terrainColorTex = 0;
+static GLuint s_terrainDepthTex = 0;
+
 /* ── Fullscreen quad: position (x,y) + texcoord (u,v) ───────────────────── */
 
 /* 2D overlay quad — V is flipped because glTexSubImage2D uploads row 0
@@ -423,6 +437,14 @@ static GLuint LinkProgram(GLuint vert, GLuint frag) {
 /* ── FBO helpers (SSAA) ─────────────────────────────────────────────────── */
 
 static void GL_DestroyFBO(void) {
+    if (s_terrainColorTex) {
+        glDeleteTextures(1, &s_terrainColorTex);
+        s_terrainColorTex = 0;
+    }
+    if (s_terrainDepthTex) {
+        glDeleteTextures(1, &s_terrainDepthTex);
+        s_terrainDepthTex = 0;
+    }
     if (s_fbo) {
         glDeleteFramebuffers(1, &s_fbo);
         s_fbo = 0;
@@ -478,6 +500,30 @@ static void GL_CreateFBO(U32 width, U32 height) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     s_fboWidth = width;
     s_fboHeight = height;
+
+    /* Terrain snapshot textures at the FBO size. The depth texture needs
+       depth-texture support (GL 2.0 core on desktop, GL_OES_depth_texture on
+       GLES — universal on Android); a device without it fails the depth copy
+       only, which costs the stored depth, never the colour restore. */
+    glGenTextures(1, &s_terrainColorTex);
+    glBindTexture(GL_TEXTURE_2D, s_terrainColorTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width, (GLsizei)height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glGenTextures(1, &s_terrainDepthTex);
+    glBindTexture(GL_TEXTURE_2D, s_terrainDepthTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, (GLsizei)width,
+                 (GLsizei)height, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 /* ── Context lifecycle ──────────────────────────────────────────────────── */
@@ -747,6 +793,76 @@ static S32 GL_TargetReadDepth(void *depthDst, U32 width, U32 height) {
     glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_DEPTH_COMPONENT,
                  GL_UNSIGNED_SHORT, depthDst);
     return TRUE;
+}
+
+/* Copies the offscreen target into the persistent terrain target. Both are
+   glCopyTexSubImage2D reads from the bound main FBO, so no intermediate quad
+   or second framebuffer is needed. */
+static S32 GL_TargetSnapshotTerrain(void) {
+    if (!s_initialized || !s_fbo || !s_terrainColorTex) {
+        return FALSE;
+    }
+    if (!Window_GLMakeCurrent()) {
+        return FALSE;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+    /* 16-bit depth rows need a 1-byte unpack alignment (and colour is 4 bytes
+       anyway); restore the default after the pair of copies. */
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glBindTexture(GL_TEXTURE_2D, s_terrainColorTex);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                        (GLsizei)s_fboWidth, (GLsizei)s_fboHeight);
+    glBindTexture(GL_TEXTURE_2D, s_terrainDepthTex);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                        (GLsizei)s_fboWidth, (GLsizei)s_fboHeight);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return TRUE;
+}
+
+/* Repaints the stored terrain colour over the whole offscreen target with the
+   pass-through present program. Depth stays the FBO's own — nothing writes it
+   between the snapshot and this call — so the coming shadow spans still
+   depth-test against the terrain. */
+static void GL_TargetRestoreTerrain(void) {
+    if (!s_initialized || !s_fbo || !s_terrainColorTex) {
+        return;
+    }
+    if (!Window_GLMakeCurrent()) {
+        return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+    glViewport(0, 0, (GLsizei)s_fboWidth, (GLsizei)s_fboHeight);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+
+    /* Same non-flipped FBO quad the composite uses, so the stored rows land
+       exactly where the terrain drew them. */
+    glUseProgram(s_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_terrainColorTex);
+    glUniform1i(s_uTexLoc, 0);
+
+    glBindBuffer(GL_ARRAY_BUFFER, s_fboVbo);
+    glEnableVertexAttribArray(s_aPosLoc);
+    glVertexAttribPointer(s_aPosLoc, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(GLfloat), (const void *)0);
+    glEnableVertexAttribArray(s_aTexCoordLoc);
+    glVertexAttribPointer(s_aTexCoordLoc, 2, GL_FLOAT, GL_FALSE,
+                          4 * sizeof(GLfloat),
+                          (const void *)(2 * sizeof(GLfloat)));
+
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    glDisableVertexAttribArray(s_aPosLoc);
+    glDisableVertexAttribArray(s_aTexCoordLoc);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glDepthMask(GL_TRUE);
 }
 
 /* Present pacing for the GL swapchain (the backend shares SDL's window, so
@@ -1121,6 +1237,8 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_TargetWidth,
     GL_TargetHeight,
     GL_TargetReadDepth,
+    GL_TargetSnapshotTerrain,
+    GL_TargetRestoreTerrain,
     GL_SetVSync,
     GL_TexUpdatePresent,
     GL_TexUpdateAtlas,

@@ -13,6 +13,8 @@
 
 #include "C_EXTERN.H"
 
+#include <GPU/GPURENDERER.H> // GpuRenderer_Shadow*: exterior shadow spans
+
 // One entry per screen scanline: sizes the shadow-fill span tables below and
 // bounds the fill loop. Must cover the active ModeResY, so it tracks the
 // max supported height (ADELINE_MAX_Y_RES) exactly like TabOffLine[]. Pinning
@@ -27,6 +29,30 @@ S32 TabNbPoint[MAX_SCAN_LINES];
 S32 MinYTabPoint, MaxYTabPoint;
 
 S32 XS0, YS0, XS1, YS1, XS2, YS2, XS3, YS3;
+
+// True while DrawShadow feeds its spans to the GPU. The exterior terrain
+// lives in the offscreen target, not Log, so ShadeBoxBlk has nothing to
+// darken there; the spans become alpha-black quads over the target instead.
+// Interior and menu paths keep the software fill.
+static S32 UseGpuShadow = FALSE;
+
+// Average of the four footprint-corner clip-Zs (GET_ZO space), gathered in
+// ProjectShadowExt and given to the GPU as the shadow's ground plane.
+// Depth-testing the spans against terrain deeper than this culls the shadow
+// at the nearer ridges a wall between camera and object would raise, which is
+// the occlusion ShadeBoxBlk cannot do on the offscreen target. The nearest
+// corner alone would keep the shadow painted right up to the object's near
+// base (the flower-pot shadow bleeding over the pot); the average lets the
+// terrain closer than the footprint centre cull it instead.
+static S32 ShadowPlaneAZ = 0;
+
+static void ShadeSpan(S32 x0, S32 y, S32 x1) {
+    if (UseGpuShadow) {
+        GpuRenderer_ShadowSpan(x0, y, x1);
+    } else {
+        ShadeBoxBlk(x0, y, x1, y, ShadowLevel);
+    }
+}
 
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void CalculeLigneOmbre(S32 x1, S32 y1, S32 x2, S32 y2) {
@@ -214,9 +240,9 @@ void DrawLineShade(S32 x0, S32 z0, S32 x1, S32 z1, S32 x2, S32 z2, S32 x3, S32 z
         case 2: //----------------------------------------------------
 
             if (TabCoorPoint[y][0] < TabCoorPoint[y][1])
-                ShadeBoxBlk(TabCoorPoint[y][0], y, TabCoorPoint[y][1], y, ShadowLevel);
+                ShadeSpan(TabCoorPoint[y][0], y, TabCoorPoint[y][1]);
             else
-                ShadeBoxBlk(TabCoorPoint[y][1], y, TabCoorPoint[y][0], y, ShadowLevel);
+                ShadeSpan(TabCoorPoint[y][1], y, TabCoorPoint[y][0]);
             break;
 
         case 4: //----------------------------------------------------
@@ -231,14 +257,14 @@ void DrawLineShade(S32 x0, S32 z0, S32 x1, S32 z1, S32 x2, S32 z2, S32 x3, S32 z
             }
 
             if (TabCoorPoint[y][0] < TabCoorPoint[y][1])
-                ShadeBoxBlk(TabCoorPoint[y][0], y, TabCoorPoint[y][1], y, ShadowLevel);
+                ShadeSpan(TabCoorPoint[y][0], y, TabCoorPoint[y][1]);
             else
-                ShadeBoxBlk(TabCoorPoint[y][1], y, TabCoorPoint[y][0], y, ShadowLevel);
+                ShadeSpan(TabCoorPoint[y][1], y, TabCoorPoint[y][0]);
 
             if (TabCoorPoint[y][2] < TabCoorPoint[y][3])
-                ShadeBoxBlk(TabCoorPoint[y][2], y, TabCoorPoint[y][3], y, ShadowLevel);
+                ShadeSpan(TabCoorPoint[y][2], y, TabCoorPoint[y][3]);
             else
-                ShadeBoxBlk(TabCoorPoint[y][3], y, TabCoorPoint[y][2], y, ShadowLevel);
+                ShadeSpan(TabCoorPoint[y][3], y, TabCoorPoint[y][2]);
             break;
         }
 
@@ -348,8 +374,13 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
     S32 cy;
     S32 altitude_ref;
     S32 dx2, dz2;
+    S32 shadowPlaneCount = 0;
 
     ClearScreenMinMax();
+
+    // reset the running plane sum across object changes; the corner count
+    // normalises it to the average on the way out
+    ShadowPlaneAZ = 0;
 
     xw = ptrs->Xw;
     yw = ptrs->Yw;
@@ -387,8 +418,13 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    if (!LongProjectPoint(X0, Y0, Z0))
+    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowPlaneCount++;
+    if (!LongProjectPoint(X0, Y0, Z0)) {
+        if (shadowPlaneCount > 0)
+            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
+    }
     XS0 = Xp;
     YS0 = Yp;
     AdjustScreenMinMax();
@@ -408,8 +444,13 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    if (!LongProjectPoint(X0, Y0, Z0))
+    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowPlaneCount++;
+    if (!LongProjectPoint(X0, Y0, Z0)) {
+        if (shadowPlaneCount > 0)
+            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
+    }
     XS1 = Xp;
     YS1 = Yp;
     AdjustScreenMinMax();
@@ -429,8 +470,13 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    if (!LongProjectPoint(X0, Y0, Z0))
+    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowPlaneCount++;
+    if (!LongProjectPoint(X0, Y0, Z0)) {
+        if (shadowPlaneCount > 0)
+            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
+    }
     XS2 = Xp;
     YS2 = Yp;
     AdjustScreenMinMax();
@@ -450,11 +496,19 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    if (!LongProjectPoint(X0, Y0, Z0))
+    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowPlaneCount++;
+    if (!LongProjectPoint(X0, Y0, Z0)) {
+        if (shadowPlaneCount > 0)
+            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
+    }
     XS3 = Xp;
     YS3 = Yp;
     AdjustScreenMinMax();
+
+    if (shadowPlaneCount > 0)
+        ShadowPlaneAZ /= shadowPlaneCount;
 
     //	UnsetClip() ;
     SetClip(ScreenXMin, ScreenYMin, ScreenXMax, ScreenYMax);
@@ -464,7 +518,18 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
 
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void DrawShadow() {
+    UseGpuShadow = FALSE;
+    if (CubeMode == CUBE_EXTERIEUR AND GpuRenderer_IsActive()) {
+        GpuRenderer_ShadowBegin((S32)ShadowLevel, ShadowPlaneAZ);
+        UseGpuShadow = TRUE;
+    }
+
     DrawLineShade(XS0, YS0, XS1, YS1, XS2, YS2, XS3, YS3);
+
+    if (UseGpuShadow) {
+        GpuRenderer_ShadowEnd();
+        UseGpuShadow = FALSE;
+    }
 
     //	BoxMovingAdd( ClipXMin, ClipYMin, ClipXMax, ClipYMax ) ;
 

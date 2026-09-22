@@ -7,6 +7,7 @@
 #include "UI_LAYOUT.H" /* UI_VCENTER_OFS */
 
 #include <FILEIO/SAVEPNG.H>
+#include <GPU/GPURENDERER.H> /* GpuRenderer_SetOverlayOpaqueRect: modal UI region */
 #include <SVGA/SCREEN.H>
 #include <SVGA/VIDEO.H>
 #include <SYSTEM/KEYBOARD.H>
@@ -1136,6 +1137,16 @@ void MenuInventory(U32 tempo) {
         }
     }
 
+    /* The inventory is a full-2D modal: on a GPU backend the present
+       composite would leave Log's palette index 0 transparent and the 3D
+       island would show through the slot squares the original draws as
+       opaque black (the software present always mapped index 0 black). Pin
+       the wheel rectangle as an opaque-overlay region now, so every present
+       from the open animation through the modal loop looks like the software
+       frame; outside the wheel the frozen 3D scene still shows. */
+    GpuRenderer_SetOverlayOpaqueRect(INV_START_X + 1, INV_START_Y + 1,
+                                     INV_END_X - 1, INV_END_Y - 1);
+
     OpenInventory(); // draw all
 
     InitDial(2); // game divers txt
@@ -1399,6 +1410,10 @@ void MenuInventory(U32 tempo) {
 
     InitWaitNoInput(I_INVENTORY | I_RETURN | I_MENUS); // fait dans la boucle du jeu
     InitWaitNoKey();
+
+    /* Back to the gameplay frame: index 0 is a transparent window onto the
+       3D target again once the modal owns nothing. */
+    GpuRenderer_SetOverlayOpaqueRect(0, 0, 0, 0);
 }
 
 /*══════════════════════════════════════════════════════════════════════════*

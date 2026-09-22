@@ -62,10 +62,59 @@ void GpuRenderer_SetRenderQuality(U32 quality);
 // the backend cannot read depth (the software Z-buffer then stays).
 void GpuRenderer_ReadbackDepthBuffer(void);
 
+// 3D scene shadows. In the exterior pass the terrain lives in the offscreen
+// target, not Log, so the software ShadeBoxBlk has no terrain pixels to
+// darken and produces opaque black over the models. The engine instead hands
+// the same per-scanline spans here; they are replayed as flat black quads
+// alpha-blended over the target at shadow time, before the model, so painter's
+// order keeps the shadow over the terrain and under the model. The alpha is
+// the average luminance loss of the same CLUT row ShadeBoxBlk would use
+// ((15 - level)*256 of the current gouraud block), not a fixed level/15, so
+// both fill paths agree per palette and per fog level. The spans additionally
+// depth-test (GEQUAL) against the FBO the terrain pass left behind, with each
+// span quad at the shadow's ground-plane clip-Z: terrain nearer than the plane
+// (a risen ridge or wall between camera and object) culls the shadow, mirroring
+// the software DrawRecover occlusion. zPlane is that ground clip-Z in GET_ZO
+// space, produced by ProjectShadowExt as the average of the shadow footprint's
+// four corners. The engine keeps ShadeBoxBlk for paths that draw terrain into Log
+// (interior, menus). Begin flushes the pending batch so the shadow lands on
+// what precedes it.
+void GpuRenderer_ShadowBegin(S32 level, S32 zPlane);
+void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1);
+void GpuRenderer_ShadowEnd(void);
+
+// Terrain persistence for static-camera (AFF_OBJETS) frames. A camera cut
+// redraws only the flagged bodies, never the terrain; the offscreen target
+// keeps the previous frame's 3D colour and depth so the scene does not wipe
+// to black (its ClearFBO runs at the terrain pass only). But that also keeps
+// each previous frame's shadow spans and NZW animated polys, which the object
+// pass re-stamps over the same pixels until they smear into trails — BoxClean
+// restores only the Log buffer, not the FBO. SnapshotTerrain copies the whole
+// target at the end of the terrain pass into a persistent terrain target;
+// RestoreTerrain repaints it at the head of each AFF_OBJETS exterior frame,
+// before the flagged-body pass, so shadows and animated polys start over clean
+// terrain. Depth stays the target's own across the gap — the NZW/shadow paths
+// never write it — so the restore repaints colour only and the ground-plane
+// tests keep working. The engine calls both gated on the backend being active
+// and CubeMode == CUBE_EXTERIEUR; RestoreTerrain is a no-op until a snapshot
+// was taken.
+void GpuRenderer_SnapshotTerrain(void);
+void GpuRenderer_RestoreTerrain(void);
+
 // Present pacing. Records the wanted state and applies it to the active
 // backend; called before a backend exists it is remembered and applied at
 // Init, so a config value loaded early still reaches the device.
 void GpuRenderer_SetVSync(S32 enabled);
+
+// Full-2D overlay regions (modal UI, e.g. the inventory opened mid-game).
+// During gameplay the present composite leaves Log's palette index 0
+// transparent so the offscreen 3D target shows through the overlay's holes.
+// A modal UI that paints index-0 backgrounds (its slot squares, the software
+// present's opaque black) pins x0<=x1 / y0<=y1 to the modal's rectangle: the
+// composite then treats index 0 inside it as opaque black, while outside it
+// the frozen 3D scene still shows through. Pin (0,0,0,0) to restore the
+// transparent rule when the modal exits.
+void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1);
 
 #ifdef __cplusplus
 }

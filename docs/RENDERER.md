@@ -19,7 +19,7 @@ palette-index). The GL backend below appended exactly this work to its draw
 loop; here it is explicit and testable.
 
 A backend is a thin wire: `GpuRendererBackendGL` and
-`GpuRendererBackendSDL3GPU` (17 operations each) implement the vtable in
+`GpuRendererBackendSDL3GPU` (19 operations each) implement the vtable in
 `../LIB386/H/GPU/GPURENDERER_BACKEND.H`. A backend binds its target, uploads
 the batch, sets the uniforms from the already-resolved `GpuDrawParams`, draws,
 and composites the two framebuffers onto the window. It decides nothing.
@@ -95,6 +95,44 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   `D16_UNORM` depth texture, reverses its top-down rows to the bottom-up order
   the common layer expects, and converts the depth to the GL window-depth
   convention the common aZ inverse expects.
+- **Terrain snapshot/restore** — a camera cut (`AFF_OBJETS` in `AffScene`,
+  `../SOURCES/OBJECT.CPP`) redraws only the flagged bodies and never the
+  terrain; the offscreen target keeps the previous frame's colour and depth so
+  the scene does not wipe to black, but that also keeps the previous frame's
+  shadow spans and NZW animated polys, which re-stamp the same pixels into
+  trails — `BoxClean` restores only the `Log` buffer. At the end of the
+  exterior terrain pass `GpuRenderer_SnapshotTerrain` copies the whole target
+  into a persistent terrain target; at the head of each `AFF_OBJETS` exterior
+  frame `GpuRenderer_RestoreTerrain` repaints it, before `DrawAnimatedPolys`
+  (so that frame's animated polys land over the scrubbed terrain, mirroring
+  software `BoxClean` + `DrawAnimatedPolys`), erasing the trails before the
+  flagged-body pass draws. Depth is never written between the two calls — the
+  NZW and shadow paths have depth-write off — so the restore repaints colour
+  only and the `GEQUAL` depth tests keep working. Both are gated on the backend
+  being active and `CubeMode == CUBE_EXTERIEUR`. GL stores the copy with
+  `glCopyTexSubImage2D` (colour + depth textures); SDL3 GPU replays it with
+  texture-to-texture copies in one copy pass (`SDL_CopyGPUTextureToTexture`).
+- **Scene shadows** — the software path darkens `Log` through `ShadeBoxBlk`
+  (`../SOURCES/FLOW_A.ASM`), but the exterior terrain is in the offscreen
+  target, not `Log`, so there is nothing under the shadow to darken: index-0
+  pixels would map to an opaque colour and the shadow would paint over the
+  model. `DrawShadow` (`../SOURCES/BEZIER.CPP`) therefore hands its
+  per-scanline spans to `GpuRenderer_ShadowBegin` / `_ShadowSpan` / `_ShadowEnd`
+  when a backend is active and `CubeMode == CUBE_EXTERIEUR`; the common layer
+  replays them as flat-black quads alpha-blended over the target, drawn at
+  shadow time before the model, so painter's order keeps the shadow over the
+  terrain and under the model. The alpha is the average luminance loss of the
+  same CLUT row `ShadeBoxBlk` would use (`(15 - level)*256` of the current
+  gouraud block, matched through the palette LUT) rather than a fixed
+  `level/15`, so the two paths agree per palette and per fog level. Each span
+  quad carries the shadow's ground-plane clip-Z, taken by `ProjectShadowExt`
+  as the average of the four footprint corners (in the same `GET_ZO` space the
+  terrain tiles carry), and depth-tests `GEQUAL/GREATER_OR_EQUAL` against the
+  `D16` target the terrain pass left behind: terrain nearer than the plane — a
+  risen ridge or wall between camera and object — culls the shadow, mirroring
+  the software `DrawRecover` occlusion; depth-write stays off so later blends
+  survive. Interior cubes and menus keep `ShadeBoxBlk`, since their terrain is
+  drawn into `Log`.
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
@@ -127,9 +165,28 @@ the top of `AffScene` (`../SOURCES/OBJECT.CPP`) and `GpuRenderer_ClearFBO` at
 the top of `RefreshGrille` (`../SOURCES/INTEXT.CPP`). A frame that redraws
 terrain clears the offscreen target; a frame that only redraws objects
 (`AFF_OBJETS`) keeps the previous 3D colour and depth, matching the software
-Z-buffer, so an idle scene is not wiped to black. After the terrain pass the
+Z-buffer, so an idle scene is not wiped to black. That paused colour would
+otherwise keep each static-camera frame's shadow and animated-poly paint as an
+accumulating smear, so the object pass restores the terrain snapshot from the
+end of the terrain pass (see the seam above). After the terrain pass the
 software `Screen`/`PtrZBuffer` buffers are refilled from the target (see the
 readback seam above) so object occlusion works under a GPU backend.
+
+Two composite rules keep the GPU output matching the software present, whose
+only overlay mapping is `palette index 0 = opaque black`:
+
+- **NZW depth test.** Batches under a `Fill_Flag_NZW` filler depth-test
+  `GEQUAL` with no depth write, the mirror of the software fillers' per-pixel
+  `PtrZBuffer[offset] >= zInt` test. An exterior body flagged
+  `OBJ_ZBUFFER`/`OBJ_IN_WATER` (e.g. a crab or dragonfly, drawn to the target)
+  is therefore culled where terrain is nearer than it instead of overpainted
+  over walls; heavier occlusion still writes depth, and coplanar NZW polys
+  cannot fight one another because the batch never writes depth.
+- **Opaque overlay regions.** A modal UI that paints index-0 black (the
+  inventory slots) pins its rectangle with `GpuRenderer_SetOverlayOpaqueRect`
+  (`../SOURCES/INVENT.CPP`, set at `MenuInventory` entry and cleared at exit);
+  inside it the composite maps index 0 to opaque black, outside it the frozen
+  3D scene still shows through the overlay's holes.
 
 Remaining work, in order:
 

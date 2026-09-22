@@ -18,7 +18,7 @@ layout(set = 2, binding = 0) uniform sampler2D uAtlas;   /* 256×256 LUMINANCE *
 layout(set = 2, binding = 1) uniform sampler2D uCLUT;    /* 256×256 LUMINANCE (fog table) */
 layout(set = 2, binding = 2) uniform sampler2D uPalette; /* 256×1 ARGB (paletteLUT) */
 layout(std140, set = 3, binding = 0) uniform GpuParams {
-    int   uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth */
+    int   uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow */
     int   uAlphaMode;     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
     float uFlatColor;     /* palette index (mode 1) / CLUT column (mode 3) */
     int   uBilinear;      /* 0=nearest 1=bilinear CLUT sampling */
@@ -172,6 +172,11 @@ void main() {
         float fogRow16 = floor(fogDist * uFogRowScale);
         float clutRow = 12.0 + floor(mod(fogRow16, 256.0) / 16.0) * 16.0;
         color = clutLookup(texel, clutRow);
+    } else if (uPolyMode == 6) {
+        /* Scene shadow span: flat black at uFlatColor alpha. The SW path
+           darkens Log through PtrCLUGouraud to (15 - level)/15; alpha =
+           level/15 under the alpha blend reproduces that as dst*(1-alpha). */
+        color = vec4(0.0, 0.0, 0.0, uFlatColor);
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
            Same +128 rounding bias as polyMode 0. */
@@ -203,7 +208,7 @@ void main() {
 uniform sampler2D uAtlas;   /* 256×256 LUMINANCE */
 uniform sampler2D uCLUT;    /* 256×256 LUMINANCE (fog table) */
 uniform sampler2D uPalette; /* 256×1 BGRA (paletteLUT) */
-uniform int uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth */
+uniform int uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow */
 uniform float uFlatColor;   /* palette index (mode 1) / CLUT column (mode 3) */
 uniform float uCLUTBaseRow; /* CLUT row offset for gouraud table (mode 3) */
 uniform float uScaledFogNear; /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
@@ -354,6 +359,11 @@ void main() {
         float fogRow16 = floor(fogDist * uFogRowScale);
         float clutRow = 12.0 + floor(mod(fogRow16, 256.0) / 16.0) * 16.0;
         color = clutLookup(texel, clutRow);
+    } else if (uPolyMode == 6) {
+        /* Scene shadow span: flat black at uFlatColor alpha. The SW path
+           darkens Log through PtrCLUGouraud to (15 - level)/15; alpha =
+           level/15 under the alpha blend reproduces that as dst*(1-alpha). */
+        color = vec4(0.0, 0.0, 0.0, uFlatColor);
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
            Same +128 rounding bias as polyMode 0. */

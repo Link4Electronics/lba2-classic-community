@@ -38,9 +38,9 @@ extern "C" {
 // One polygon batch's render state, resolved from the polygon type by the
 // common layer and consumed by the backend's draw program.
 typedef struct GpuDrawParams {
-    S32  polyMode;      ///< 0=textured(CLUT) 1=flat 2=gouraud 3=gouraud-table 4=texel-is-index 5=fog-smooth
+    S32  polyMode;      ///< 0=textured(CLUT) 1=flat 2=gouraud 3=gouraud-table 4=texel-is-index 5=fog-smooth 6=scene-shadow
     S32  alphaMode;     ///< 0=opaque 1=TRANS(semi) 2=TRAME(stipple)
-    float flatColor;     ///< palette index (modes 1/2/4) or CLUT column (mode 3)
+    float flatColor;     ///< palette index (modes 1/2/4), CLUT column (mode 3) or shadow alpha (mode 6)
     S32  bilinear;      ///< 1=smooth CLUT sampling (3D textured types)
     S32  perspCorrect;  ///< 1=perspective-correct UV/Z (types 16-24)
     S32  chromaKey;     ///< 1=discard palette index 0 (INCRUST types)
@@ -48,7 +48,7 @@ typedef struct GpuDrawParams {
     float scaledFogNear; ///< Fill_ScaledFogNear (fog-smooth, mode 5)
     float fogRowScale;   ///< Fill_Fog_Factor / 65536 (fog-smooth, mode 5)
     S32  blend;         ///< 1=alpha blending (TRANS/TRAME)
-    S32  depthTest;     ///< 0=off 1=GEQUAL 2=ALWAYS (NZW coplanar polys)
+    S32  depthTest;     ///< 0=off 1=GEQUAL (mirror of SW PtrZBuffer >= test)
     S32  depthWrite;    ///< 1=write the offscreen depth target
     float screenScale[2]; ///< [2/resX, 2/resY] pixel -> clip
 } GpuDrawParams;
@@ -94,6 +94,19 @@ typedef struct GpuRendererBackend {
     // Depth readback (bottom-up, GL window-depth): 16-bit, or FALSE if
     // unreadable.
     S32  (*TargetReadDepth)(void *dst, U32 width, U32 height);
+
+    // Terrain persistence (see GpuRenderer_SnapshotTerrain/RestoreTerrain).
+    // The backend keeps a persistent "terrain target" (colour + depth) sized
+    // like the offscreen target. Snapshot copies the offscreen target into it
+    // (called at the end of the exterior terrain pass) and reports whether a
+    // valid copy now exists; Restore copies the stored colour back over the
+    // offscreen target (called at the head of each AFF_OBJETS exterior frame)
+    // so the flagged-body pass starts from clean terrain instead of the
+    // previous frame's shadow and NZW animated-poly paint. Restore never
+    // touches the target's depth: nothing writes it between the two calls, so
+    // it already is the terrain's.
+    S32  (*TargetSnapshotTerrain)(void);
+    void (*TargetRestoreTerrain)(void);
 
     // Present pacing. Called whenever the wanted vsync state changes; a
     // backend that has no pacing control may ignore it.

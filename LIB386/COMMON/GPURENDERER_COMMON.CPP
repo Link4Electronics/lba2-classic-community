@@ -83,6 +83,22 @@ static U32 s_renderQuality = 1; /* 1 = native, 2 = 2x, 4 = 4x */
 /* Persistent FBO-has-terrain flag (see ClearFBO/BeginFrame). */
 static S32 s_fboHasTerrain = 0;
 
+/* The persistent terrain target holds a post-terrain-pass copy of the FBO
+   (see SnapshotTerrain/RestoreTerrain). Valid only once a snapshot landed,
+   and the restore is a no-op before that so the first AFF_OBJETS frame of a
+   scene cannot composite stale geometry. */
+static S32 s_terrainValid = 0;
+
+/* Modal full-2D UI frames (inventory when opened mid-game): within the
+   modal's region the Log overlay owns the frame, so palette index 0 there
+   presents as the software path's opaque black instead of a window onto the
+   offscreen 3D target. Outside the region the normal transparent rule holds,
+   so the frozen 3D scene still shows around the modal. */
+static S32 s_overlayOpaqueX0 = 0;
+static S32 s_overlayOpaqueY0 = 0;
+static S32 s_overlayOpaqueX1 = 0;
+static S32 s_overlayOpaqueY1 = 0;
+
 /* ── Batch buffer ──────────────────────────────────────────────────────── */
 
 static const U32 BATCH_MAX_VERTS = 4096;
@@ -103,6 +119,24 @@ static U8 s_batchZBuffer = 0;
 static U8 s_batchNZW = 0;
 
 static S32 s_bilinearCLUT = 0; /* bilinear CLUT sampling flag for 3D */
+
+/* ── Scene-shadow span buffer ───────────────────────────────────────────── */
+/* Shadows are flat black quads, one 2-triangle strip per scanline span. The
+   level is the engine's ShadowLevel (0..15): the SW ShadeBoxBlk darkens a
+   pixel through the CLUT row (15 - level)*256 of the current gouraud block,
+   so the equivalent alpha is that same row averaged against the palette,
+   falling back to level/15 when the table is unavailable. Spans depth-test
+   against the FBO the terrain left behind (ground aZ is at-or-farther than
+   the shadow's own plane; nearer terrain — a risen ridge between camera and
+   object — culls it). Kept apart from the polygon batch so a shadow can be
+   drawn mid-frame without disturbing the batch's captured CLUT/type state. */
+#define SHADOW_MAX_VERTS 4096
+#define SHADOW_LEVEL_DIVISOR 15.0f
+static GpuVertex s_shadowVerts[SHADOW_MAX_VERTS];
+static U32 s_shadowVertCount = 0;
+static float s_shadowAlpha = 0.0f;
+static S32 s_shadowPlaneAZ = 32768; /* clip-Z of the shadow's ground plane */
+static S32 s_shadowActive = 0;
 
 /* Uploaded-pointer tracking. */
 static const void *s_uploadedAtlas = NULL;
@@ -215,15 +249,18 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
     out->bilinear = s_bilinearCLUT;
 
     /* Depth rules (see the reference driver's flush for the reasoning):
-       - types 0-24 depth-test; NZW batches at ALWAYS (coplanar animated
-         polys would z-fight at GEQUAL on 16-bit depth), others GEQUAL so
-         bodies/sprites are occluded by closer terrain.
+       - types 0-24 depth-test GEQUAL, the mirror of the SW fillers'
+         per-pixel `PtrZBuffer[offset] >= zInt` test: a batch occluded by
+         closer geometry is skipped, so NZW body polys do not overpaint
+         terrain nearer to the camera (and show through walls).
        - Z-write: types 16-24 always, types 0-15 only when the batch ran
          under a Z-buffered filler (terrain); suppressed for NZW and for
          blended (TRANS/TRAME) batches; types 0-15 without a Z-buffered
-         filler Z-test only (matches SW ZBufBoxOverWrite2). */
+         filler Z-test only (matches SW ZBufBoxOverWrite2). NZW never
+         writes depth, so coplanar polys compare only against the stored
+         terrain depth and cannot fight one another. */
     if (s_currentTypePoly <= POLY_TEXTURE_Z_FOG) {
-        out->depthTest = s_batchNZW ? 2 : 1; /* ALWAYS : GEQUAL */
+        out->depthTest = 1; /* GEQUAL */
         if (s_batchZBuffer || s_currentTypePoly >= POLY_TEXTURE_Z) {
             out->depthWrite = (!s_batchNZW && !out->blend) ? 1 : 0;
         } else {
@@ -253,6 +290,154 @@ void GpuRenderer_FlushBatch(void) {
 
     s_batchVertCount = 0;
     s_batchTriCount = 0;
+}
+
+//──────────────────────────────────────────────────────────────────────────
+// Scene-shadow spans (see GpuRenderer_ShadowBegin in GPU/GPURENDERER.H).
+//──────────────────────────────────────────────────────────────────────────
+/* Shadow alpha derived from the exact CLUT row ShadeBoxBlk uses, so both fill
+   paths agree per palette and per fog level. Pairs the row's target index to
+   its source colour through the present LUT and averages the luminance loss:
+   a row that dims a colour to 85% yields alpha 0.15. Falls back to the
+   linear level/15 model when the table chain is unavailable. */
+static float Common_ShadowAlpha(S32 level) {
+    const U32 *lut;
+    const U8 *row;
+    S32 c;
+    U32 count = 0;
+    double ratioSum = 0.0;
+
+    if (PtrCLUTGouraud == NULL) {
+        return (float)level / SHADOW_LEVEL_DIVISOR;
+    }
+    lut = GL_GetPaletteLUT();
+    if (lut == NULL) {
+        return (float)level / SHADOW_LEVEL_DIVISOR;
+    }
+    level = (level < 0) ? 0 : ((level > SHADOW_LEVEL_DIVISOR) ? 15 : level);
+    row = PtrCLUTGouraud + (S32)((SHADOW_LEVEL_DIVISOR - (float)level) * 256.0f);
+    for (c = 0; c < 256; c++) {
+        U32 src = lut[c];
+        U32 dst = lut[row[c]];
+        double lumSrc = (double)(src >> 16 & 0xFF) * 0.299 +
+                        (double)(src >> 8 & 0xFF) * 0.587 +
+                        (double)(src & 0xFF) * 0.114;
+        if (lumSrc < 0.5) {
+            continue; /* index 0 / transparent: no ratio to take */
+        }
+        ratioSum += 1.0 - ((double)(dst >> 16 & 0xFF) * 0.299 +
+                           (double)(dst >> 8 & 0xFF) * 0.587 +
+                           (double)(dst & 0xFF) * 0.114) / lumSrc;
+        count++;
+    }
+    if (count == 0) {
+        return (float)level / SHADOW_LEVEL_DIVISOR;
+    }
+    ratioSum /= (double)count;
+    if (ratioSum < 0.0) {
+        ratioSum = 0.0;
+    } else if (ratioSum > 1.0) {
+        ratioSum = 1.0;
+    }
+    return (float)ratioSum;
+}
+
+static void Common_ShadowVertex(GpuVertex *v, S32 x, S32 y) {
+    v->XE = (S16)x;
+    v->YE = (S16)y;
+    v->MapU = 0;
+    v->MapV = 0;
+    v->Light = 0;
+    /* Ground-plane clip-Z, in the same GET_ZO space the terrain tiles carry:
+       spans pass the GEQUAL depth test where the stored surface is at-or-
+       farther, and are culled where nearer terrain already owns the pixel. */
+    v->ZO = (U16)s_shadowPlaneAZ;
+    v->RepMask = 0;
+}
+
+/* Draws the accumulated spans and resets the buffer. One flat-black quad per
+   span: vertex pairs at x0 and x1+1 so the rasterizer covers pixel columns
+   x0..x1 inclusive. Depth-tests (GEQUAL) against the FBO the terrain left
+   behind so a risen ridge or wall in front of the shadow culls it, mirroring
+   the SW DrawRecover occlusion; depth-write stays off so later blends are not
+   consumed. */
+static void Common_FlushShadowSpans(void) {
+    GpuDrawParams params;
+
+    if (!s_active || s_shadowVertCount == 0) {
+        s_shadowVertCount = 0;
+        return;
+    }
+
+    memset(&params, 0, sizeof params);
+    params.polyMode = 6;
+    params.alphaMode = 0;
+    params.flatColor = s_shadowAlpha;
+    params.blend = 1;
+    params.depthTest = 1;
+    params.depthWrite = 0;
+    params.screenScale[0] = s_screenScale[0];
+    params.screenScale[1] = s_screenScale[1];
+
+    s_backend->DrawTriangles((const GpuVertex *)s_shadowVerts,
+                             s_shadowVertCount, &params);
+    s_shadowVertCount = 0;
+}
+
+void GpuRenderer_ShadowBegin(S32 level, S32 zPlane) {
+    if (!s_active) {
+        return;
+    }
+    /* Land the pending polygons first so the shadow composites over them. */
+    GpuRenderer_FlushBatch();
+    s_shadowVertCount = 0;
+    s_shadowAlpha = Common_ShadowAlpha(level);
+    s_shadowPlaneAZ = zPlane;
+    s_shadowActive = 1;
+}
+
+void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1) {
+    GpuVertex *v;
+    S32 x0c;
+    S32 x1c;
+
+    if (!s_shadowActive) {
+        return;
+    }
+    if (y < 0 || y >= (S32)s_resY) {
+        return;
+    }
+    if (x0 > x1) {
+        S32 t = x0;
+        x0 = x1;
+        x1 = t;
+    }
+    x0c = (x0 < 0) ? 0 : x0;
+    x1c = (x1 >= (S32)s_resX) ? (S32)s_resX - 1 : x1;
+    if (x0c > x1c) {
+        return;
+    }
+
+    if (s_shadowVertCount + 6 > SHADOW_MAX_VERTS) {
+        Common_FlushShadowSpans();
+    }
+
+    v = &s_shadowVerts[s_shadowVertCount];
+    Common_ShadowVertex(&v[0], x0c, y);
+    Common_ShadowVertex(&v[1], x1c + 1, y);
+    Common_ShadowVertex(&v[2], x1c + 1, y + 1);
+    Common_ShadowVertex(&v[3], x0c, y);
+    Common_ShadowVertex(&v[4], x1c + 1, y + 1);
+    Common_ShadowVertex(&v[5], x0c, y + 1);
+    s_shadowVertCount += 6;
+}
+
+void GpuRenderer_ShadowEnd(void) {
+    if (!s_shadowActive) {
+        return;
+    }
+    s_shadowActive = 0;
+    Common_FlushShadowSpans();
 }
 
 static void Common_PackVertex(GpuVertex *dst, const Struc_Point *src,
@@ -395,6 +580,13 @@ void GpuRenderer_ClearFBO(void) {
     s_fboHasTerrain = 1;
 }
 
+void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
+    s_overlayOpaqueX0 = x0;
+    s_overlayOpaqueY0 = y0;
+    s_overlayOpaqueX1 = x1;
+    s_overlayOpaqueY1 = y1;
+}
+
 void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
                          U32 height, S32 filterLinear) {
     if (!s_active || argbPixels == NULL) {
@@ -404,6 +596,29 @@ void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
     /* Flush any 3D geometry batched during the frame into the offscreen
        target before the composite reads it. */
     GpuRenderer_FlushBatch();
+
+    if (s_overlayOpaqueX1 > s_overlayOpaqueX0 &&
+        s_overlayOpaqueY1 > s_overlayOpaqueY0) {
+        /* Modal full-2D UI region: Log's palette index 0 (alpha 0) there
+           presents as opaque black like the software present. Texture
+           uploads copy immediately, so patch before the upload. */
+        U32 xEnd = (U32)s_overlayOpaqueX1;
+        U32 yEnd = (U32)s_overlayOpaqueY1;
+        if (xEnd > width) {
+            xEnd = width;
+        }
+        if (yEnd > height) {
+            yEnd = height;
+        }
+        for (U32 y = (U32)s_overlayOpaqueY0; y < yEnd; y++) {
+            U32 *px = (U32 *)((U8 *)argbPixels + (size_t)y * pitch);
+            for (U32 x = (U32)s_overlayOpaqueX0; x < xEnd; x++) {
+                if ((px[x] & 0xFF000000u) == 0) {
+                    px[x] = 0xFF000000u;
+                }
+            }
+        }
+    }
 
     /* The 2D overlay (Log buffer as ARGB) is the topmost layer. */
     s_backend->TexUpdatePresent(argbPixels, pitch, width, height, filterLinear);
@@ -496,6 +711,36 @@ void GpuRenderer_ReadbackDepthBuffer(void) {
 }
 
 //──────────────────────────────────────────────────────────────────────────
+// Terrain snapshot/restore (see GpuRenderer_SnapshotTerrain in
+// GPU/GPURENDERER.H). End of the exterior terrain pass: the common layer pins
+// a copy of the target it just drew so a later AFF_OBJETS frame can scrub the
+// shadow/body paint the paused target would otherwise smear. Restore repaints
+// that terrain before the batch queued ahead of it, so this frame's animated
+// polys land on top of the scrubbed terrain exactly as BoxClean +
+// DrawAnimatedPolys do on Log.
+//──────────────────────────────────────────────────────────────────────────
+void GpuRenderer_SnapshotTerrain(void) {
+    if (!s_active) {
+        return;
+    }
+    /* Land the terrain tiles still in the batch so the target holds the whole
+       pass before it is copied. */
+    GpuRenderer_FlushBatch();
+    s_terrainValid = s_backend->TargetSnapshotTerrain() ? 1 : 0;
+}
+
+void GpuRenderer_RestoreTerrain(void) {
+    if (!s_active || !s_terrainValid) {
+        return;
+    }
+    /* Composite the stored terrain first, then land whatever the AFF_OBJETS
+       head already queued (that frame's animated polys): the FLUSH comes after
+       so those polys draw over the scrubbed terrain, not under it. */
+    s_backend->TargetRestoreTerrain();
+    GpuRenderer_FlushBatch();
+}
+
+//──────────────────────────────────────────────────────────────────────────
 // Lifecycle
 //──────────────────────────────────────────────────────────────────────────
 S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
@@ -566,6 +811,7 @@ void GpuRenderer_Shutdown(void) {
     s_backendId = GPU_RENDERER_BACKEND_NONE;
     s_active = 0;
     s_fboHasTerrain = 0;
+    s_terrainValid = 0;
     s_batchVertCount = 0;
     s_batchTriCount = 0;
     s_batchCLUTBaseRow = 0.0f;
@@ -589,8 +835,9 @@ void GpuRenderer_Resize(U32 resX, U32 resY) {
     Common_UpdateScreenScale();
 
     /* A different present size invalidates whatever terrain depth the target
-       held. */
+       held, and the terrain target is recreated alongside. */
     s_fboHasTerrain = 0;
+    s_terrainValid = 0;
 
     s_backend->TargetDestroy();
     if (!s_backend->TargetCreate(resX * s_renderQuality,
@@ -617,6 +864,7 @@ void GpuRenderer_SetRenderQuality(U32 quality) {
 
     /* A new render scale rebuilds the target; terrain depth is lost. */
     s_fboHasTerrain = 0;
+    s_terrainValid = 0;
     s_backend->TargetDestroy();
     if (!s_backend->TargetCreate(s_resX * s_renderQuality,
                                  s_resY * s_renderQuality)) {
@@ -689,5 +937,17 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
 void GpuRenderer_SetRenderQuality(U32 quality) { (void)quality; }
 void GpuRenderer_ReadbackDepthBuffer(void) {}
 void GpuRenderer_SetVSync(S32 enabled) { (void)enabled; }
+void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
+    (void)x0; (void)y0; (void)x1; (void)y1;
+}
+void GpuRenderer_ShadowBegin(S32 level, S32 zPlane) {
+    (void)level; (void)zPlane;
+}
+void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1) {
+    (void)x0; (void)y; (void)x1;
+}
+void GpuRenderer_ShadowEnd(void) {}
+void GpuRenderer_SnapshotTerrain(void) {}
+void GpuRenderer_RestoreTerrain(void) {}
 
 #endif /* USE_GPURENDERER */
