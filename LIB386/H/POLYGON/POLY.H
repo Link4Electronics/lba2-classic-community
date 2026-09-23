@@ -165,6 +165,7 @@ extern U8 Fill_ClipFlag;     ///< Flag telling us what to clip
 extern U8 Fill_Flag_Fog;     ///< True if FOG is active
 extern U8 Fill_Flag_ZBuffer; ///< True if ZBUFFER is active
 extern U8 Fill_Flag_NZW;     ///< True if NZW is active
+extern U8 Fill_Flag_3DPass;  ///< True while the engine's 3D pass is open
 
 extern S32 Fill_Trame_Parity; ///< Parity for trame polygons
 
@@ -187,6 +188,14 @@ S32 Fill_Poly(S32 Type_Poly, S32 Color_Poly, S32 Nb_Points,
 typedef S32 (*FillPolyHookFn)(S32 Type_Poly, S32 Color_Poly, S32 Nb_Points,
                               Struc_Point *Ptr_Points);
 void Fill_Poly_SetHook(FillPolyHookFn hook);
+
+/* Opens/closes the engine's 3D pass (see GPU/GPURENDERER.H
+   GpuRenderer_Begin3DPass). While open, non-Z-buffered body polys are offered
+   to the fill hook for depth-tested drawing into the offscreen target, and
+   GetZO3/GetZO4 fill body clip-Z for that test. Set only by the GPU renderer;
+   it stays 0 wherever the hook is NULL, which is the state the ASM
+   equivalence tests see. */
+void Fill_Poly_Set3DPass(S32 open);
 
 extern void Fill_Sphere(S32 Type_Sphere, S32 Color_Sphere, S32 Centre_X,
                         S32 Centre_Y, S32 Rayon, S32 zBufferValue); ///< Do Not call from C

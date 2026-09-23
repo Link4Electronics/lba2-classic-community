@@ -4,13 +4,15 @@ Variables and locations that can be changed or exposed as options to improve gra
 
 ## Shipped options
 
-All three are off by default, so a stock run renders exactly as before. None of them has a menu entry yet; set them from the console or the config file.
+The dithered-shading and interior-scaling options are off by default, so a stock run renders exactly as before. The two GPU entries below match their original defaults (GPU bilinear is on; quality is native 1×, which is the no-op tier) and expose what the stock GL backend already does. The software filter options get their menu entry from the Display submenu's Bilinear row, which drives whichever renderer is live; GPU-only options are the GPU rows of the same submenu.
 
-| Option | Console | lba2.cfg | Environment | Values |
-|--------|---------|----------|-------------|--------|
-| Texture filtering | `gfx_texfilter` | `TextureFilter` | `LBA2_TEXFILTER` | 0 off, 1 horizontal 2-tap, 2 bilinear 4-tap |
-| Dithered shading | `gfx_dither` | `DitherShading` | (none) | 0 off, 1 on |
-| Interior render scaling | (none) | (none) | `LBA2_ISO_DIV` | 1 off, 2 to 4 |
+| Option | Console | lba2.cfg | Environment | Values | Menu |
+|--------|---------|----------|-------------|--------|------|
+| Texture filtering | `gfx_texfilter` | `TextureFilter` | `LBA2_TEXFILTER` | 0 off, 1 horizontal 2-tap, 2 bilinear 4-tap | Bilinear (software renderer) |
+| Dithered shading | `gfx_dither` | `DitherShading` | (none) | 0 off, 1 on | (none) |
+| Interior render scaling | (none) | (none) | `LBA2_ISO_DIV` | 1 off, 2 to 4 | (none) |
+| GPU bilinear sampling | `gpu_texfilter` | `GpuTexFilter` | (none) | 0 nearest, 1 bilinear | Bilinear (GPU renderer) |
+| GPU render quality | `quality` | `RenderQuality` | (none) | 1 native, 2 2×, 4 4× | Quality (GPU renderer) |
 
 **Texture filtering** smooths magnified texels on terrain, sea, and sky. The rasterizer works in palette indices, where averaging two entries is meaningless, so the blend is a precomputed table of the nearest palette index to each 25/50/75% RGB mix. Costs roughly 7% of frame time on terrain and 4% on a sea-heavy view at 1728x1080 with the 4-tap setting.
 

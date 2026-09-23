@@ -13,6 +13,7 @@
 // pol_work / svga data globals the primitives read or update.
 U8 Fill_Flag_ZBuffer = 0;
 U8 Fill_Flag_NZW = 0;
+U8 Fill_Flag_3DPass = 0;
 U32 Fill_ZBuffer_Factor = 0;
 S32 ScreenXMin, ScreenXMax, ScreenYMin, ScreenYMax;
 S32 ClipXMin, ClipXMax, ClipYMin, ClipYMax;
@@ -58,6 +59,7 @@ void spy_reset() {
     ScreenXMin = ScreenYMin = 0x7FFFFFFF;
     ScreenXMax = ScreenYMax = (S32)0x80000000;
     Fill_Flag_ZBuffer = 0;
+    Fill_Flag_3DPass = 0;
 }
 
 void check(const char *what, S32 got, S32 want) {

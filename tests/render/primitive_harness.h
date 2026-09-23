@@ -85,6 +85,7 @@ extern S32 LFactorX;
 
 // ── pol_work globals the primitives read (defined in primitive_harness.cpp) ──
 extern U8 Fill_Flag_ZBuffer;
+extern U8 Fill_Flag_3DPass;
 extern U32 Fill_ZBuffer_Factor;
 
 // ── Captured draw calls (populated by the spies in primitive_harness.cpp) ────

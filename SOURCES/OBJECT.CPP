@@ -4934,7 +4934,16 @@ S32 AffOneObject(T_SORT *pt) {
             SetClip(0, 0, ModeDesiredX - 1, FlagWater);
         }
 
+        /* Exterior bodies open the 3D pass so they batch into the offscreen
+           target at render-scaled resolution; menu/holomap/credits callers of
+           ObjectDisplay never open it and keep the software Log path. */
+        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+            GpuRenderer_Begin3DPass();
+        }
         aff = ObjectDisplay(&ptrobj->Obj);
+        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+            GpuRenderer_End3DPass();
+        }
 
         if (aff) /* objet pas tout clippé */
         {
@@ -5307,9 +5316,15 @@ S32 AffOneObject(T_SORT *pt) {
     case TYPE_DART:
         ptrd = &ListDart[numobj];
 
+        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+            GpuRenderer_Begin3DPass();
+        }
         aff = BodyDisplay_AlphaBeta(ptrd->PosX, ptrd->PosY, ptrd->PosZ,
                                     ptrd->Alpha, ptrd->Beta, 0,
                                     (U8 *)GivePtrObjFix(ptrd->Body));
+        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+            GpuRenderer_End3DPass();
+        }
 
         if (aff) {
             SetClip(ScreenXMin, ScreenYMin, ScreenXMax, ScreenYMax);

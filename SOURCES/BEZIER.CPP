@@ -36,14 +36,16 @@ S32 XS0, YS0, XS1, YS1, XS2, YS2, XS3, YS3;
 // Interior and menu paths keep the software fill.
 static S32 UseGpuShadow = FALSE;
 
-// Average of the four footprint-corner clip-Zs (GET_ZO space), gathered in
-// ProjectShadowExt and given to the GPU as the shadow's ground plane.
-// Depth-testing the spans against terrain deeper than this culls the shadow
-// at the nearer ridges a wall between camera and object would raise, which is
-// the occlusion ShadeBoxBlk cannot do on the offscreen target. The nearest
-// corner alone would keep the shadow painted right up to the object's near
-// base (the flower-pot shadow bleeding over the pot); the average lets the
-// terrain closer than the footprint centre cull it instead.
+// Nearest of the four footprint-corner clip-Zs (GET_ZO space), gathered in
+// ProjectShadowExt and given to the GPU as the shadow's ground plane. A span
+// passes the GEQUAL depth test when the stored surface is at-or-farther than
+// the plane, so the plane must sit at-or-nearer than every ground point the
+// footprint covers: the nearest corner (the minimum — smaller GET_ZO is
+// nearer) guarantees the footprint's own terrain always passes and the shadow
+// paints whole, while anything nearer than that corner — a ridge or wall
+// between camera and object — still culls it. An average sits the plane at
+// the footprint centre and lets the near half of its own ground cull it,
+// cutting every shadow in half.
 static S32 ShadowPlaneAZ = 0;
 
 static void ShadeSpan(S32 x0, S32 y, S32 x1) {
@@ -375,11 +377,12 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
     S32 altitude_ref;
     S32 dx2, dz2;
     S32 shadowPlaneCount = 0;
+    S32 shadowCornerAZ;
 
     ClearScreenMinMax();
 
-    // reset the running plane sum across object changes; the corner count
-    // normalises it to the average on the way out
+    // reset across object changes; the first corner seeds it and later
+    // corners narrow it to the nearest (see the note at ShadowPlaneAZ)
     ShadowPlaneAZ = 0;
 
     xw = ptrs->Xw;
@@ -418,11 +421,11 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowCornerAZ = (S32)GET_ZO(CameraZr - Z0);
+    if (shadowPlaneCount == 0 || shadowCornerAZ < ShadowPlaneAZ)
+        ShadowPlaneAZ = shadowCornerAZ;
     shadowPlaneCount++;
     if (!LongProjectPoint(X0, Y0, Z0)) {
-        if (shadowPlaneCount > 0)
-            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
     }
     XS0 = Xp;
@@ -444,11 +447,11 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowCornerAZ = (S32)GET_ZO(CameraZr - Z0);
+    if (shadowPlaneCount == 0 || shadowCornerAZ < ShadowPlaneAZ)
+        ShadowPlaneAZ = shadowCornerAZ;
     shadowPlaneCount++;
     if (!LongProjectPoint(X0, Y0, Z0)) {
-        if (shadowPlaneCount > 0)
-            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
     }
     XS1 = Xp;
@@ -470,11 +473,11 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowCornerAZ = (S32)GET_ZO(CameraZr - Z0);
+    if (shadowPlaneCount == 0 || shadowCornerAZ < ShadowPlaneAZ)
+        ShadowPlaneAZ = shadowCornerAZ;
     shadowPlaneCount++;
     if (!LongProjectPoint(X0, Y0, Z0)) {
-        if (shadowPlaneCount > 0)
-            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
     }
     XS2 = Xp;
@@ -496,19 +499,16 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
         cy = altitude_ref + ALTITUDE_MAX;
 
     LongWorldRotatePoint(X0, cy, Z0);
-    ShadowPlaneAZ += (S32)GET_ZO(CameraZr - Z0);
+    shadowCornerAZ = (S32)GET_ZO(CameraZr - Z0);
+    if (shadowPlaneCount == 0 || shadowCornerAZ < ShadowPlaneAZ)
+        ShadowPlaneAZ = shadowCornerAZ;
     shadowPlaneCount++;
     if (!LongProjectPoint(X0, Y0, Z0)) {
-        if (shadowPlaneCount > 0)
-            ShadowPlaneAZ /= shadowPlaneCount;
         return FALSE;
     }
     XS3 = Xp;
     YS3 = Yp;
     AdjustScreenMinMax();
-
-    if (shadowPlaneCount > 0)
-        ShadowPlaneAZ /= shadowPlaneCount;
 
     //	UnsetClip() ;
     SetClip(ScreenXMin, ScreenYMin, ScreenXMax, ScreenYMax);

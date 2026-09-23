@@ -9,8 +9,8 @@
 //
 // The logic mirrors LIB386/GL/RENDER_GL.CPP, the reference driver. Semantics
 // that are behaviour-visible in the game must not drift: poly-mode mapping,
-// depth-test rules, and the SW fallbacks (body polys when Fill_Flag_ZBuffer is
-// clear, NZW polys before the first terrain pass, menu plasma type-8 with
+// depth-test rules, and the SW fallbacks (body polys outside the engine's 3D
+// pass, NZW polys before the first terrain pass, menu plasma type-8 with
 // RepMask 0x3F3F).
 //──────────────────────────────────────────────────────────────────────────
 #ifdef USE_GPURENDERER
@@ -36,6 +36,7 @@ extern PTR_U8 PtrMap;          /* current 256×256 atlas page                */
 extern S32 RepMask;            /* texture repeat mask (per polygon)         */
 extern U8 Fill_Flag_ZBuffer;   /* Z-buffered fill active (terrain passes)   */
 extern U8 Fill_Flag_NZW;       /* "no Z write" path (animated polys)        */
+extern U8 Fill_Flag_3DPass;    /* engine 3D pass open (body draw in AffScene) */
 extern U32 Fill_Fog_Factor;    /* fog-smooth scale (POLY_TEXTURE_Z_FOG)     */
 extern U32 Fill_ScaledFogNear; /* fog-smooth near plane (type 24)           */
 extern S32 AtlasTextureDirty;  /* in-place atlas mutation (same pointer)    */
@@ -117,6 +118,7 @@ static float s_batchFogRowScale = 0.0f;
 static const void *s_batchCLUTGouraud = NULL;
 static U8 s_batchZBuffer = 0;
 static U8 s_batchNZW = 0;
+static U8 s_batch3DPass = 0;
 
 static S32 s_bilinearCLUT = 0; /* bilinear CLUT sampling flag for 3D */
 
@@ -258,11 +260,16 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
          blended (TRANS/TRAME) batches; types 0-15 without a Z-buffered
          filler Z-test only (matches SW ZBufBoxOverWrite2). NZW never
          writes depth, so coplanar polys compare only against the stored
-         terrain depth and cannot fight one another. */
+         terrain depth and cannot fight one another. 3D-pass batches
+         (bodies) test only: the software filler they run under writes no
+         Z, and depth must stay terrain-owned or a shadow span's
+         ground-plane GEQUAL culls against body depth that outlives the
+         frame that wrote it. */
     if (s_currentTypePoly <= POLY_TEXTURE_Z_FOG) {
         out->depthTest = 1; /* GEQUAL */
         if (s_batchZBuffer || s_currentTypePoly >= POLY_TEXTURE_Z) {
-            out->depthWrite = (!s_batchNZW && !out->blend) ? 1 : 0;
+            out->depthWrite =
+                (!s_batchNZW && !out->blend && !s_batch3DPass) ? 1 : 0;
         } else {
             out->depthWrite = 0;
         }
@@ -290,6 +297,23 @@ void GpuRenderer_FlushBatch(void) {
 
     s_batchVertCount = 0;
     s_batchTriCount = 0;
+}
+
+//──────────────────────────────────────────────────────────────────────────
+// The engine's 3D pass (see GpuRenderer_Begin3DPass in GPU/GPURENDERER.H).
+//──────────────────────────────────────────────────────────────────────────
+void GpuRenderer_Begin3DPass(void) {
+    if (!s_active) {
+        return;
+    }
+    Fill_Poly_Set3DPass(1);
+}
+
+void GpuRenderer_End3DPass(void) {
+    if (!s_active) {
+        return;
+    }
+    Fill_Poly_Set3DPass(0);
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -466,14 +490,18 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
         return 0;
     }
 
-    /* Body polygons (non-Z-buffered) rasterize into the Log buffer, not the
-       FBO: the FBO holds only what ClearFBO started — terrain depth. Bodies
-       drawn to it outside a terrain pass (menus' spinning models) would
-       ghost across frames. Log keeps them in the same compositing layer as
-       shadows and the 2D overlay, so ShadeBoxBlk has real pixels to
-       darken. */
+    /* Non-Z-buffered body polys join the FBO only while the engine holds the
+       3D pass open around AffScene's object display (GpuRenderer_Begin3DPass):
+       there they carry the GEQUAL depth-test and no depth-write that types
+       0-15 already resolve to, at the target's render-scaled resolution.
+       Outside the pass — menus' spinning models, holomap, credits — they
+       rasterize into the Log, which the present composites over the target,
+       and ShadeBoxBlk keeps real pixels to darken there. Without terrain in
+       the target the Log path stays authoritative, mirroring the NZW rule. */
     if (!Fill_Flag_ZBuffer) {
-        return 0;
+        if (!Fill_Flag_3DPass || !s_fboHasTerrain) {
+            return 0;
+        }
     }
 
     /* NZW animated polys (flowers, water) take the GPU batch only once the
@@ -495,9 +523,10 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     }
 
     /* Flush on any change that alters the draw state: type, colour, atlas
-       page, CLUT fog row, or Z-buffer mode. SetCLUT runs per terrain tile
-       with a different fog distance, so a tile boundary must flush or
-       neighbouring tiles would render at the wrong brightness. */
+       page, CLUT fog row, Z-buffer mode, or 3D-pass mode. SetCLUT runs
+       per terrain tile with a different fog distance, so a tile boundary
+       must flush or neighbouring tiles would render at the wrong
+       brightness. */
     if (s_batchVertCount > 0) {
         if (s_currentTypePoly != (U32)typePoly ||
             s_currentColorPoly != (U32)colorPoly ||
@@ -505,7 +534,8 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
              s_batchAtlas != (const void *)PtrMap) ||
             s_batchCLUTGouraud != (const void *)PtrCLUTGouraud ||
             s_batchZBuffer != Fill_Flag_ZBuffer ||
-            s_batchNZW != Fill_Flag_NZW) {
+            s_batchNZW != Fill_Flag_NZW ||
+            s_batch3DPass != Fill_Flag_3DPass) {
             GpuRenderer_FlushBatch();
         }
     }
@@ -519,6 +549,7 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     s_batchCLUTGouraud = (const void *)PtrCLUTGouraud;
     s_batchZBuffer = Fill_Flag_ZBuffer;
     s_batchNZW = Fill_Flag_NZW;
+    s_batch3DPass = Fill_Flag_3DPass;
 
     /* CLUT base row: SetCLUT(fog) per terrain tile sets PtrCLUTGouraud
        within PtrCLUTFog; the batch captured on a CLUT change keeps the row
@@ -573,6 +604,10 @@ void GpuRenderer_ClearFBO(void) {
     if (!s_active) {
         return;
     }
+    /* Land anything batched since the last present (a camera-cut restart
+       re-enters here mid-frame) so the clear wipes it: flushing after the
+       clear would draw that stale batch over the fresh target. */
+    GpuRenderer_FlushBatch();
     s_backend->TargetBindClear();
     /* The FBO now holds valid terrain depth for the rest of the frame (and
        stays valid across frames on no-terrain frames — ClearFBO runs at the
@@ -592,6 +627,13 @@ void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
     if (!s_active || argbPixels == NULL) {
         return;
     }
+
+    /* The overlay sampler filter is the player's Bilinear toggle, the same
+       DisplayTexFilter the CLUT sampling reads at BeginFrame — not the seam's
+       filterLinear argument, whose only caller passes FALSE (the svg layer
+       must not reference renderer-owned state). Bilinear here smooths the Log
+       layer — bodies, sprites, HUD — wherever the present scales it. */
+    filterLinear = DisplayTexFilter;
 
     /* Flush any 3D geometry batched during the frame into the offscreen
        target before the composite reads it. */
@@ -786,6 +828,7 @@ S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
        GPU dependency — GpuRenderer_Init is what the tests never reach. */
     SetGpuPresentHooks(GpuRenderer_Present, GpuRenderer_IsActive);
     Fill_Poly_SetHook(GpuRenderer_RenderTriangleList);
+    Fill_Poly_Set3DPass(0);
 
     /* Registers the pacing setter and replays the value chosen before init
        (the config reaches Window_SetVSync before the renderer exists). */
@@ -804,6 +847,7 @@ void GpuRenderer_Shutdown(void) {
     SetGpuPresentHooks(NULL, NULL);
     SetGpuVSyncHook(NULL);
     Fill_Poly_SetHook(NULL);
+    Fill_Poly_Set3DPass(0);
 
     s_backend->TargetDestroy();
     s_backend->DestroyContext();
@@ -820,6 +864,7 @@ void GpuRenderer_Shutdown(void) {
     s_batchCLUTGouraud = NULL;
     s_batchZBuffer = 0;
     s_batchNZW = 0;
+    s_batch3DPass = 0;
     s_uploadedAtlas = NULL;
     s_resX = 0;
     s_resY = 0;
@@ -857,6 +902,8 @@ void GpuRenderer_SetRenderQuality(U32 quality) {
     if (s_renderQuality == quality) {
         return;
     }
+    Log_Info("[GPU] render quality %u -> %u (target %ux%u)", s_renderQuality,
+             quality, s_resX * quality, s_resY * quality);
     s_renderQuality = quality;
     if (!s_active) {
         return;
@@ -949,5 +996,7 @@ void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1) {
 void GpuRenderer_ShadowEnd(void) {}
 void GpuRenderer_SnapshotTerrain(void) {}
 void GpuRenderer_RestoreTerrain(void) {}
+void GpuRenderer_Begin3DPass(void) {}
+void GpuRenderer_End3DPass(void) {}
 
 #endif /* USE_GPURENDERER */

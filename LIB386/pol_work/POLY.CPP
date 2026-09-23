@@ -111,6 +111,7 @@ U8 Fill_ClipFlag = FALSE;     ///< Flag telling us what to clip
 U8 Fill_Flag_Fog = FALSE;     // True if FOG active
 U8 Fill_Flag_ZBuffer = FALSE; // True if ZBUFFER is active
 U8 Fill_Flag_NZW = FALSE;     // True if NZW active
+U8 Fill_Flag_3DPass = FALSE;  // True while the engine's 3D pass is open
 
 S32 Fill_Trame_Parity = 0; ///< Parity for trame polygons
 
@@ -151,6 +152,10 @@ static FillPolyHookFn s_fillPolyHook = NULL;
 
 void Fill_Poly_SetHook(FillPolyHookFn hook) {
     s_fillPolyHook = hook;
+}
+
+void Fill_Poly_Set3DPass(S32 open) {
+    Fill_Flag_3DPass = open ? 1 : 0;
 }
 
 S32 Fill_Poly(S32 Type_Poly, S32 Color_Poly, S32 Nb_Points,

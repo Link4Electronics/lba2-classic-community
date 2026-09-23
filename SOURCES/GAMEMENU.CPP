@@ -28,6 +28,8 @@
 #include <SYSTEM/WINDOW.H>
 #include <SYSTEM/MOUSE.H>
 #include <GPU/GPURENDERER.H> /* GpuRenderer_ActiveBackend (Display menu row) */
+#include <GL/RENDER_GL.H>    /* DisplayTexFilter / RenderQuality (Display menu rows) */
+#include <POLYGON/POLYFILT.H> /* PolyTexFilter (software bilinear, Display menu row) */
 
 #include "GAMEMENU_MOUSE.H"
 #include "CONFIG_FILE.H" /* ConfigFile_MarkVSyncSetThisRun */
@@ -96,6 +98,8 @@ S32 FlagShowEndDemo = FALSE;
 #define MENU_ID_RESOLUTION 2115
 #define MENU_ID_DISPLAY_VSYNC 2116
 #define MENU_ID_RENDERER 2117
+#define MENU_ID_DISPLAY_BILINEAR 2118
+#define MENU_ID_DISPLAY_QUALITY 2119
 
 // Resolution sub-page rows occupy a reserved id range: row i carries id
 // MENU_ID_RESOLUTION_BASE + i, which BuildCustomMenuText and GereResolutionMenu
@@ -154,30 +158,13 @@ U16 GameOptionMenu[] = {
     MENU_ID_CONTROLLER,
 };
 
-// Display submenu: a "Resolution: <current>" row that opens the resolution
-// sub-page (GereResolutionMenu), a "Renderer: <backend>" row that opens the
-// renderer sub-page (GereRendererMenu), plus a "Vsync" toggle and the
-// "Fullscreen" toggle (moved here from Advanced options because it belongs
-// with the other display settings). Plain "Back" returns to Options.
-// Fullscreen stays the last entry so the always-fullscreen-device path in
-// GereDisplayMenu can drop it by count. See GereDisplayMenu + GereResolutionMenu.
-U16 DisplayMenu[] = {
-    0,   // selected
-    5,   // nb entries
-    260, // y center
-    0,   // .dia num
-
-    0,
-    26, // menu precedent
-    0,
-    MENU_ID_RESOLUTION,
-    0,
-    MENU_ID_RENDERER,
-    0,
-    MENU_ID_DISPLAY_VSYNC,
-    0,
-    MENU_ID_DISPLAY_FULLSCREEN,
-};
+// Display submenu. Built at entry by BuildDisplayMenu because two rows are
+// conditional on runtime state: the Quality tier only exists while a GPU
+// backend is live (software has nothing to scale) and Fullscreen only where
+// windowed mode exists. Max rows: Back + Resolution + Renderer + Bilinear +
+// Quality + Vsync + Fullscreen. See GereDisplayMenu + BuildDisplayMenu.
+#define DISPLAY_MENU_MAX_ROWS 7
+U16 DisplayMenu[4 + DISPLAY_MENU_MAX_ROWS * 2];
 
 // Resolution sub-page, opened from the Display submenu's Resolution row.
 // Built at runtime from the shared catalog (like GameAskChoice builds
@@ -213,6 +200,33 @@ static MenuLocalizedLabel RendererChoiceLabel(GpuRendererBackendId id) {
     default:
         return MENU_LABEL_RENDERER_SOFTWARE;
     }
+}
+
+// The menu label naming a render-quality tier (1/2/4x SSAA) — the value in the
+// Display submenu's Quality row. See Renderer_LoadBootQuality: the cfg value 3
+// is folded into 4 before boot applies it, so the tiers are 1x, 2x and 4x and
+// a bare 3 (a hand-edited cfg the boot read already folds) still reads as 4x.
+static MenuLocalizedLabel QualityLabel(S32 quality) {
+    switch (quality) {
+    case 2:
+        return MENU_LABEL_QUALITY_2X;
+    case 3:
+    case 4:
+        return MENU_LABEL_QUALITY_4X;
+    default:
+        return MENU_LABEL_QUALITY_1X;
+    }
+}
+
+// Next render-quality tier in the Display submenu's cycle, 1x -> 2x -> 4x. A
+// cfg/cvar could hold 3 (the settings row allows it); the cycle treats it as
+// the 4x tier, the same fold the boot-time read applies.
+static S32 NextRenderQuality(S32 quality) {
+    if (quality < 2)
+        return 2;
+    if (quality < 4)
+        return 4;
+    return 1;
 }
 
 // Menu row index DrawGameMenu paints with the green "active value" plasma
@@ -526,6 +540,24 @@ static void BuildCustomMenuText(S32 num, char *string) {
     case MENU_ID_DISPLAY_VSYNC:
         CopyUtf8ToCp850(string, 256, GetLocalizedMenuLabel(DisplayVSync ? MENU_LABEL_VSYNC_ON : MENU_LABEL_VSYNC_OFF));
         break;
+
+    case MENU_ID_DISPLAY_BILINEAR: {
+        // The active renderer's smoothing flag: DisplayTexFilter on a GPU
+        // backend, the software fillers' PolyTexFilter otherwise.
+        const S32 on = (GpuRenderer_ActiveBackend() != GPU_RENDERER_BACKEND_NONE)
+                           ? DisplayTexFilter
+                           : (PolyTexFilter != POLY_TEX_FILTER_OFF);
+        CopyUtf8ToCp850(string, 256,
+                        GetLocalizedMenuLabel(on ? MENU_LABEL_BILINEAR_ON : MENU_LABEL_BILINEAR_OFF));
+        break;
+    }
+
+    case MENU_ID_DISPLAY_QUALITY: {
+        char value[64];
+        CopyUtf8ToCp850(value, sizeof value, GetLocalizedMenuLabel(QualityLabel(RenderQuality)));
+        FormatUtf8ToCp850(string, 256, GetLocalizedMenuLabel(MENU_LABEL_QUALITY), value);
+        break;
+    }
 
     case MENU_ID_FOLLOW_CAMERA:
         CopyUtf8ToCp850(string, 256, GetLocalizedMenuLabel(FollowCamera ? MENU_LABEL_AUTO_CAMERA : MENU_LABEL_CLASSIC_CAMERA));
@@ -3217,6 +3249,7 @@ S32 GereLanguageMenu(void) {
 
 static void BuildResolutionMenu(void); /* defined below, near GereResolutionMenu */
 static void BuildRendererMenu(void);   /* defined below, near GereRendererMenu */
+static void BuildDisplayMenu(void);    /* defined below, near GereDisplayMenu */
 
 // Harness one-shot capture of the Display submenu. Mirrors
 // Menu_MainCapture's pattern: do the minimal setup the regular
@@ -3225,7 +3258,8 @@ static void BuildRendererMenu(void);   /* defined below, near GereRendererMenu *
 // directly on DisplayMenu so the capture site inside DoGameMenu fires
 // and returns 1000. Background pixels come from whatever the caller
 // (cmd_ui) put in Log/Screen — for `ui --black-bg display` that's a
-// solid clear; otherwise the live scene.
+// solid clear; otherwise the live scene. The rows are assembled first
+// because GereDisplayMenu no longer holds them statically.
 void Display_MainCapture(const char *path) {
     HQ_StopSample();
     InitPlasmaMenu();
@@ -3236,6 +3270,7 @@ void Display_MainCapture(const char *path) {
     PaletteSync(PtrPalNormal);
     InitDial(0);
 
+    BuildDisplayMenu();
     Menu_RequestCapture(path);
     DoGameMenu(DisplayMenu);
     Menu_RequestCapture(NULL); /* disarm if DoGameMenu somehow exited otherwise */
@@ -3387,6 +3422,33 @@ static void BuildRendererMenu(void) {
     s_menuMarkRow = 1 + cur;
 }
 
+// Assemble the Display submenu rows for the current state: Back, Resolution,
+// Renderer, Bilinear, then Quality (only while a GPU backend is live — the
+// software rasterizer has no scale to tier), then Vsync and Fullscreen (only
+// where windowed mode exists). Two rows are conditional, so the array cannot
+// stay static; a fixed order with the two trailing makes the count only ever
+// drop the wrong tail when both conditions flip at once.
+static void BuildDisplayMenu(void) {
+    S32 row = 0;
+    DisplayMenu[2] = 260;
+    DisplayMenu[3] = 0;
+
+    MenuSetEntry(DisplayMenu, row++, 0, 26); /* Back */
+    MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_RESOLUTION);
+    MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_RENDERER);
+    MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_DISPLAY_BILINEAR);
+    if (GpuRenderer_ActiveBackend() != GPU_RENDERER_BACKEND_NONE)
+        MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_DISPLAY_QUALITY);
+    MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_DISPLAY_VSYNC);
+    if (Window_SupportsWindowedMode())
+        MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_DISPLAY_FULLSCREEN);
+    DisplayMenu[1] = (U16)row;
+    /* Keep the cursor where the player left it, clamped when a conditional row
+       disappeared (the backend fell back to software mid-session). */
+    if (DisplayMenu[0] >= (U16)row)
+        DisplayMenu[0] = (U16)(row - 1);
+}
+
 // Renderer sub-page, opened from the Display submenu's Renderer row. Picking a
 // row switches the live present path immediately (ApplyRendererChoice: the
 // software fallback on a failed start keeps a path rendering), keeps the list
@@ -3435,16 +3497,14 @@ static S32 GereRendererMenu(void) {
 }
 // Display submenu: a self-contained submenu of OptionsMenu. The "Resolution:
 // <current>" row opens GereResolutionMenu, the "Renderer: <backend>" row opens
-// GereRendererMenu; Vsync and Fullscreen are toggles.
+// GereRendererMenu; Bilinear and Vsync and Fullscreen are toggles/cycles. Rows
+// are assembled at entry (BuildDisplayMenu) because Quality only exists while
+// a GPU backend is live and Fullscreen only where windowed mode exists.
 S32 GereDisplayMenu(void) {
     S32 select;
     S32 flag = 0;
 
-    /* The Fullscreen toggle is the last entry; drop it on always-fullscreen
-       devices (Android phones/TVs) where windowed mode does not exist, leaving
-       Back + Resolution + Renderer + Vsync. nb_entries 5 = full menu, 4 = hide
-       Fullscreen. */
-    DisplayMenu[1] = Window_SupportsWindowedMode() ? 5 : 4;
+    BuildDisplayMenu();
 
     CopyScreen(Screen, Log);
     BoxStaticAdd(0, 0, ModeDesiredX - 1, ModeDesiredY - 1);
@@ -3470,6 +3530,30 @@ S32 GereDisplayMenu(void) {
         case MENU_ID_RENDERER:
             // Open the render backend sub-page.
             GereRendererMenu();
+            /* The backend may have changed (or fallen back to software), so the
+               Quality row's existence and every row's value have to follow. */
+            BuildDisplayMenu();
+            break;
+
+        case MENU_ID_DISPLAY_BILINEAR:
+            // The row drives the active renderer's smoothing flag: the GPU
+            // CLUT/overlay sampling on the GL/SDL3 GPU paths, the software
+            // fillers' bilinear 4-tap (the 2-tap intermediate stays reachable
+            // through the gfx_texfilter console verb) otherwise.
+            if (GpuRenderer_ActiveBackend() != GPU_RENDERER_BACKEND_NONE) {
+                DisplayTexFilter ^= 1;
+            } else {
+                PolyTexFilter = (PolyTexFilter == POLY_TEX_FILTER_OFF)
+                                    ? POLY_TEX_FILTER_BILINEAR
+                                    : POLY_TEX_FILTER_OFF;
+            }
+            WriteConfigFile();
+            break;
+
+        case MENU_ID_DISPLAY_QUALITY:
+            RenderQuality = NextRenderQuality(RenderQuality);
+            GpuRenderer_SetRenderQuality((U32)RenderQuality);
+            WriteConfigFile();
             break;
 
         case MENU_ID_DISPLAY_FULLSCREEN:

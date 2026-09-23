@@ -6,13 +6,12 @@ echo "Installing package dependencies..."
 echo "---------------------------------------------------------------"
 pacman -Syu --noconfirm \
     cmake    \
-    libdecor \
     patchelf \
     sdl3
 
 echo "Installing debloated packages..."
 echo "---------------------------------------------------------------"
-get-debloated-pkgs --add-common --prefer-nano
+get-debloated-pkgs --add-common --prefer-nano libdecor-mini
 
 echo "Making lba2 classic community..."
 echo "---------------------------------------------------------------"
@@ -65,6 +64,7 @@ export UPINFO="gh-releases-zsync|${GITHUB_REPOSITORY%/*}|${GITHUB_REPOSITORY#*/}
 # the CMake-configured packaging/lba2cc.desktop.in — separate code path.
 export APPNAME="${LBA2_EXECUTABLE_NAME}"
 export DEPLOY_OPENGL=1
+export DEPLOY_VULKAN=1
 # Keep the engine's symbol table. A crash block reports frames as module+offset,
 # and the symbol table is what turns an offset into a function name; stripped, the
 # AppImage's frames cannot be named. The bundled libraries are still stripped.

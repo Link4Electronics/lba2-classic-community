@@ -14,6 +14,7 @@
 #include <SYSTEM/FILES.H>    /* ExistsFileOrDir */
 #include <SYSTEM/LOG.H>
 #include <SYSTEM/WINDOW.H> /* Window_RecreateWindowForGL/SW/GPU */
+#include <GL/RENDER_GL.H>  /* RenderQuality (the GPU scale to replay) */
 #include <SVGA/SCREEN.H>   /* ModeDesiredX/Y — the framebuffer the engine runs at */
 
 /* The renderer the player chose (0 = software). Values match GpuRendererBackendId
@@ -143,6 +144,11 @@ S32 Renderer_ApplyChoice(GpuRendererBackendId id) {
     }
 
     if (GpuRenderer_Init(id, resX, resY)) {
+        /* A fresh init starts at native scale (GpuRenderer_Init rebuilds the
+           target at 1x); replay the stored RenderQuality so the Display menu's
+           Quality tier holds across a runtime backend switch. The boot path
+           applies its own value in INITADEL.C after Renderer_InitBootBackend. */
+        GpuRenderer_SetRenderQuality((U32)RenderQuality);
         DisplayRenderer = (S32)id;
         return TRUE;
     }

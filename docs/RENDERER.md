@@ -67,8 +67,22 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   every polygon the software rasterizer would draw is offered to the GPU path.
   A non-zero return means the hook consumed the polygon and the software fill
   does not run for it; zero leaves the polygon to the software path. The
-  covered types are consumed, and the body, NZW-before-terrain and menu cases
-  fall back, so the software Log still supplies what the GPU declines.
+  covered types are consumed; outside the engine's 3D pass (menus, holomap,
+  NZW before the first terrain pass) body polys still fall back, so the
+  software Log supplies what the GPU declines.
+- **3D pass** — while `AffScene` (`../SOURCES/OBJECT.CPP`) displays an
+  exterior body it opens `GpuRenderer_Begin3DPass` / `_End3DPass` around
+  `ObjectDisplay` (and the dart body draw). While open,
+  `GpuRenderer_RenderTriangleList` accepts non-Z-buffered body polys instead
+  of declining them: they batch into the offscreen target with the rules
+  types 0-15 already resolve to — `GEQUAL` depth-test against the terrain,
+  no depth-write, painter order from the software sort — so bodies render at
+  the target's render-scaled resolution and are occluded by terrain directly.
+  `GetZO3`/`GetZO4` (`../LIB386/OBJECT/AFF_OBJ.CPP`) fill the body clip-Z
+  while the pass is open (`Fill_Flag_3DPass`, set only by the renderer, so
+  equivalence tests and every other `ObjectDisplay` caller — menus' spinning
+  models, holomap, credits — keep the software Log path). Interiors never
+  open the pass.
 - **Present seam** — `PresentFrame` (`../LIB386/SVGA/SDL.CPP`) hands its Log
   ARGB overlay to the renderer (`SetGpuPresentHooks`, default NULL) instead of
   the SDL streaming texture while a backend is active; the renderer composites
@@ -83,12 +97,15 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   place, so the renderer re-uploads the atlas page it mirrored.
 - **Depth readback** — `AffScene` (`../SOURCES/OBJECT.CPP`, `AFF_ALL`) calls
   `GpuRenderer_ReadbackDepthBuffer` after the exterior terrain pass to refill
-  `PtrZBuffer` from the offscreen target. The object pass draws bodies into the
-  software `Log` and re-applies terrain occlusion with `ZBufBoxOverWrite2`
+  `PtrZBuffer` from the offscreen target. Content that stays in `Log` —
+  sprites, 2D effects — still re-applies terrain occlusion with
+  `ZBufBoxOverWrite2`
   (`../SOURCES/3DEXT/BOXZBUF.CPP`), which reads that depth; without the readback
   it holds nothing from the GPU-drawn terrain. Where terrain is in front,
   `ZBufBoxOverWrite2` writes colour 0, which the present composite blends
   transparent over the same target's terrain, so no colour readback is needed.
+  Bodies in the 3D pass skip that step: the GPU `GEQUAL` test against the
+  target's own depth does their terrain occlusion directly.
   The call is gated on `CubeMode == CUBE_EXTERIEUR`: interior cubes reuse
   `PtrZBuffer`'s backing store for `BufCube`/`BufferBrick` and draw through
   `DrawOverBrick`. OpenGL reads depth directly; SDL3 GPU downloads its
@@ -107,8 +124,8 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   (so that frame's animated polys land over the scrubbed terrain, mirroring
   software `BoxClean` + `DrawAnimatedPolys`), erasing the trails before the
   flagged-body pass draws. Depth is never written between the two calls — the
-  NZW and shadow paths have depth-write off — so the restore repaints colour
-  only and the `GEQUAL` depth tests keep working. Both are gated on the backend
+  NZW, shadow and body paths have depth-write off — so the restore repaints
+  colour only and the `GEQUAL` depth tests keep working. Both are gated on the backend
   being active and `CubeMode == CUBE_EXTERIEUR`. GL stores the copy with
   `glCopyTexSubImage2D` (colour + depth textures); SDL3 GPU replays it with
   texture-to-texture copies in one copy pass (`SDL_CopyGPUTextureToTexture`).
@@ -126,13 +143,15 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   gouraud block, matched through the palette LUT) rather than a fixed
   `level/15`, so the two paths agree per palette and per fog level. Each span
   quad carries the shadow's ground-plane clip-Z, taken by `ProjectShadowExt`
-  as the average of the four footprint corners (in the same `GET_ZO` space the
-  terrain tiles carry), and depth-tests `GEQUAL/GREATER_OR_EQUAL` against the
-  `D16` target the terrain pass left behind: terrain nearer than the plane — a
-  risen ridge or wall between camera and object — culls the shadow, mirroring
-  the software `DrawRecover` occlusion; depth-write stays off so later blends
-  survive. Interior cubes and menus keep `ShadeBoxBlk`, since their terrain is
-  drawn into `Log`.
+  as the nearest of the four footprint corners — the minimum in `GET_ZO`
+  space, where smaller is nearer, in the same space the terrain tiles
+  carry — and depth-tests `GEQUAL/GREATER_OR_EQUAL` against the
+  `D16` target the terrain pass left behind: terrain nearer than the nearest
+  corner — a risen ridge or wall between camera and object — culls the shadow,
+  mirroring the software `DrawRecover` occlusion, while the footprint's own
+  ground never fails the test, so the shadow paints whole; depth-write stays
+  off so later blends survive. Interior cubes and menus keep `ShadeBoxBlk`,
+  since their terrain is drawn into `Log`.
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
@@ -159,6 +178,23 @@ menu → Renderer (Software / OpenGL / SDL3 GPU), persisted to the lba2.cfg
 `Renderer` key and honoured at boot; the `LBA2_GPU_RENDERER=opengl|sdl3gpu`
 env is kept as a one-run dev override. Absent or unknown values keep the
 software rasterizer, which is still the shipped default.
+
+The Display submenu also carries the two GPU-renderer options. **Bilinear**
+(drives `GpuTexFilter` on a GPU backend, the software `TextureFilter`'s
+bilinear 4-tap setting on the software rasterizer) toggles both the CLUT/overlay
+sampling in the 3D pass and the present filter for the Log layer — bodies,
+sprites and HUD — wherever the present scales it. **Quality** (lba2.cfg
+`RenderQuality`, cvar `quality`) cycles the render scale 1x→2x→4x:
+`GpuRenderer_SetRenderQuality` (`../LIB386/GPU/GPURENDERER_COMMON.CPP`)
+rebuilds the offscreen target at the new size. The tier scales only what the
+GPU draws: body polygons decline the intake (`GpuRenderer_RenderTriangleList`
+returns 0 while `Fill_Flag_ZBuffer` is clear) and rasterize into the software
+`Log`, so actors keep native resolution regardless of the tier — the Log layer
+follows the Bilinear present filter instead. The row only exists while a GPU
+backend is live — the software rasterizer has no scale to tier. The boot path
+read (`Renderer_LoadBootQuality`, `../SOURCES/RENDER_SWITCH.CPP`) folds a
+stored 3 into 4, and a runtime backend switch replays the stored quality,
+because `GpuRenderer_Init` starts a fresh backend at native scale.
 
 The frame boundary is owned by the renderer: `GpuRenderer_BeginFrame` runs at
 the top of `AffScene` (`../SOURCES/OBJECT.CPP`) and `GpuRenderer_ClearFBO` at
@@ -190,10 +226,6 @@ only overlay mapping is `palette index 0 = opaque black`:
 
 Remaining work, in order:
 
-1. **Render-quality scaling** — the Display-menu tier list and
-   `GpuRenderer_SetRenderQuality` (1–4×); the `Renderer` config key and the
-   Display-menu toggle the original's "change quality" slot maps onto already
-   landed.
-2. **Resolution changes** — a runtime resolution switch while a backend is
+1. **Resolution changes** — a runtime resolution switch while a backend is
    active is not handled yet; a switch should `GpuRenderer_Shutdown`/re-init
    cleanly.

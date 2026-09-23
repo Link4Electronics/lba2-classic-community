@@ -275,8 +275,10 @@ static void SetEnvMappedQuadUvs(Struc_Point *points, const STRUC_POLY4_ENV *poly
     Z0 = rotated.Z;
 }
 
+/* ZO feeds the GPU depth test as well as the SW Z-buffer fillers: the 3D
+   pass opens it for body polys drawn into the offscreen target. */
 void GetZO3(Struc_Point *dst, U16 index1, U16 index2, U16 index3) {
-    if (!Fill_Flag_ZBuffer || TypeProj != TYPE_3D) {
+    if ((!Fill_Flag_ZBuffer && !Fill_Flag_3DPass) || TypeProj != TYPE_3D) {
         return;
     }
 
@@ -290,7 +292,7 @@ void GetZO3(Struc_Point *dst, U16 index1, U16 index2, U16 index3) {
 }
 
 void GetZO4(Struc_Point *dst, U16 index1, U16 index2, U16 index3, U16 index4) {
-    if (!Fill_Flag_ZBuffer || TypeProj != TYPE_3D) {
+    if ((!Fill_Flag_ZBuffer && !Fill_Flag_3DPass) || TypeProj != TYPE_3D) {
         return;
     }
 

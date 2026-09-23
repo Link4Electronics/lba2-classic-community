@@ -12,6 +12,7 @@
 #include "RES_SWITCH.H"
 #include "RENDER_SWITCH.H"
 #include <POLYGON/POLYFILT.H> /* PolyTexFilter / EnvTexFilter */
+#include <GL/RENDER_GL.H>     /* DisplayTexFilter / RenderQuality (GPU renderer flags) */
 #include <SVGA/SCREEN.H>
 #include <SYSTEM/KEYBOARD_KEYS.H> /* K_F12, the console toggle default */
 #include <SYSTEM/LOG.H>
@@ -87,6 +88,17 @@ static S32 ForcedTexFilter(void) {
     return EnvTexFilter;
 }
 
+/* A runtime RenderQuality write (the `quality` cvar, or any future surface that
+   goes through Settings_Apply) must reach the live backend at once, not at the
+   next boot: the GPU renderer holds its own copy of the scale and rebuilds its
+   target on change. The boot path applies its own value separately, since no
+   backend exists when the settings table is first read, and the hook is a
+   no-op then anyway (GpuRenderer_SetRenderQuality records nothing while the
+   renderer is inactive). */
+static void ApplyRenderQuality(S32 quality) {
+    GpuRenderer_SetRenderQuality((U32)quality);
+}
+
 /* The boot and display settings, declared once. Row order is the cfg's key
  * order, which is user-visible: lba2.cfg is rewritten in this order.
  *
@@ -109,6 +121,19 @@ static const T_SETTING BootSettings[] = {
        global, so a choice always describes what the display shows. */
     {"Renderer", NULL, NULL, &DisplayRenderer, SETTING_OR_DEFAULT, GPU_RENDERER_BACKEND_NONE,
      0, GPU_RENDERER_BACKEND_COUNT - 1, NULL, NULL, NULL},
+    /* The GPU CLUT/overlay sampling flag (the Display submenu's Bilinear row).
+       Boot keeps the GL renderer's original default (bilinear on); the software
+       rasterizer reads the separate TextureFilter key. */
+    {"GpuTexFilter", NULL, "gpu_texfilter", &DisplayTexFilter, SETTING_OR_DEFAULT, TRUE, 0, 1,
+     NULL, NULL, NULL, NULL,
+     "Bilinear CLUT sampling on the GPU renderers (0 nearest, 1 bilinear)"},
+    /* GPU render scale, the Display submenu's Quality tier. Read before
+       InitGraphics by Renderer_LoadBootQuality; the settings pass below reads
+       the same key into the same global, so the boot value and a runtime menu
+       change agree. The cvar write reaches the live backend via the hook. */
+    {"RenderQuality", NULL, "quality", &RenderQuality, SETTING_OR_DEFAULT, 1, 1, 4,
+     NULL, NULL, ApplyRenderQuality, NULL,
+     "GPU render scale (1 = native, 2 = 2x, 4 = 4x)"},
     {"VSync", NULL, NULL, &DisplayVSync, SETTING_OR_DEFAULT, TRUE, 0, 1, &StoredVSync, ForcedVSync, NULL, &SourceVSync},
     {"DitherShading", NULL, "gfx_dither", &GfxDitherShading, SETTING_OR_DEFAULT, FALSE, 0, 1, NULL, NULL, NULL, NULL,
      "Ordered dither on Gouraud shade rows (softens 16-step banding)"},

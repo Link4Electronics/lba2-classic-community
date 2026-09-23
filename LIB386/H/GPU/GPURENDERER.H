@@ -62,6 +62,17 @@ void GpuRenderer_SetRenderQuality(U32 quality);
 // the backend cannot read depth (the software Z-buffer then stays).
 void GpuRenderer_ReadbackDepthBuffer(void);
 
+// The engine's 3D pass. AffScene opens it around each exterior body draw
+// (ObjectDisplay, and the dart body draw) so non-Z-buffered body polys batch
+// into the offscreen target with the terrain GEQUAL test instead of the Log
+// fallback: bodies then render at the target's render-scaled resolution and
+// are depth-occluded by terrain directly. Open/close is a flag pair at the
+// Fill_Poly seam (Fill_Flag_3DPass); every other ObjectDisplay caller —
+// menus' spinning models, holomap, credits — never opens it and keeps the
+// software Log path, as do interiors. No-op while no backend is active.
+void GpuRenderer_Begin3DPass(void);
+void GpuRenderer_End3DPass(void);
+
 // 3D scene shadows. In the exterior pass the terrain lives in the offscreen
 // target, not Log, so the software ShadeBoxBlk has no terrain pixels to
 // darken and produces opaque black over the models. The engine instead hands
@@ -75,8 +86,10 @@ void GpuRenderer_ReadbackDepthBuffer(void);
 // span quad at the shadow's ground-plane clip-Z: terrain nearer than the plane
 // (a risen ridge or wall between camera and object) culls the shadow, mirroring
 // the software DrawRecover occlusion. zPlane is that ground clip-Z in GET_ZO
-// space, produced by ProjectShadowExt as the average of the shadow footprint's
-// four corners. The engine keeps ShadeBoxBlk for paths that draw terrain into Log
+// space, produced by ProjectShadowExt as the nearest (minimum, since smaller
+// GET_ZO is nearer) of the shadow footprint's four corners, so the
+// footprint's own ground never culls the shadow. The engine keeps
+// ShadeBoxBlk for paths that draw terrain into Log
 // (interior, menus). Begin flushes the pending batch so the shadow lands on
 // what precedes it.
 void GpuRenderer_ShadowBegin(S32 level, S32 zPlane);
@@ -93,11 +106,11 @@ void GpuRenderer_ShadowEnd(void);
 // target at the end of the terrain pass into a persistent terrain target;
 // RestoreTerrain repaints it at the head of each AFF_OBJETS exterior frame,
 // before the flagged-body pass, so shadows and animated polys start over clean
-// terrain. Depth stays the target's own across the gap — the NZW/shadow paths
-// never write it — so the restore repaints colour only and the ground-plane
-// tests keep working. The engine calls both gated on the backend being active
-// and CubeMode == CUBE_EXTERIEUR; RestoreTerrain is a no-op until a snapshot
-// was taken.
+// terrain. Depth stays the target's own across the gap — the NZW, shadow and
+// body paths never write it — so the restore repaints colour only and the
+// ground-plane tests keep working. The engine calls both gated on the backend
+// being active and CubeMode == CUBE_EXTERIEUR; RestoreTerrain is a no-op until
+// a snapshot was taken.
 void GpuRenderer_SnapshotTerrain(void);
 void GpuRenderer_RestoreTerrain(void);
 
