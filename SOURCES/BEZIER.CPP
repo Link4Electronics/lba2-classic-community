@@ -13,7 +13,8 @@
 
 #include "C_EXTERN.H"
 
-#include <GPU/GPURENDERER.H> // GpuRenderer_Shadow*: exterior shadow spans
+#include <GL/RENDER_GL.H>       // GpuScene
+#include <GPU/GPURENDERER.H>    // GpuRenderer_Shadow*: exterior shadow spans
 
 // One entry per screen scanline: sizes the shadow-fill span tables below and
 // bounds the fill loop. Must cover the active ModeResY, so it tracks the
@@ -33,8 +34,12 @@ S32 XS0, YS0, XS1, YS1, XS2, YS2, XS3, YS3;
 // True while DrawShadow feeds its spans to the GPU. The exterior terrain
 // lives in the offscreen target, not Log, so ShadeBoxBlk has nothing to
 // darken there; the spans become alpha-black quads over the target instead.
-// Interior and menu paths keep the software fill.
+// With GpuScene the interior room also lives in the FBO: the same spans
+// darken it there (flat, no depth) while UseSwShade keeps ShadeBoxBlk for
+// actor pixels still in the Log — each buffer receives the darken its own
+// pixels received when they shared one buffer.
 static S32 UseGpuShadow = FALSE;
+static S32 UseSwShade = TRUE;
 
 // Nearest of the four footprint-corner clip-Zs (GET_ZO space), gathered in
 // ProjectShadowExt and given to the GPU as the shadow's ground plane. A span
@@ -51,7 +56,8 @@ static S32 ShadowPlaneAZ = 0;
 static void ShadeSpan(S32 x0, S32 y, S32 x1) {
     if (UseGpuShadow) {
         GpuRenderer_ShadowSpan(x0, y, x1);
-    } else {
+    }
+    if (UseSwShade) {
         ShadeBoxBlk(x0, y, x1, y, ShadowLevel);
     }
 }
@@ -519,9 +525,18 @@ S32 ProjectShadowExt(T_SORT *ptrs, S32 beta) {
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 void DrawShadow() {
     UseGpuShadow = FALSE;
+    UseSwShade = TRUE;
     if (CubeMode == CUBE_EXTERIEUR AND GpuRenderer_IsActive()) {
         GpuRenderer_ShadowBegin((S32)ShadowLevel, ShadowPlaneAZ);
         UseGpuShadow = TRUE;
+        UseSwShade = FALSE; /* room/terrain is in the FBO, not Log */
+    } else if (CubeMode == CUBE_INTERIEUR AND GpuScene AND
+               GpuRenderer_IsActive()) {
+        /* Dual path: flat GPU spans darken the FBO room; ShadeBoxBlk keeps
+           darkening actor pixels still sitting in the Log overlay. */
+        GpuRenderer_ShadowBeginFlat((S32)ShadowLevel);
+        UseGpuShadow = TRUE;
+        UseSwShade = TRUE;
     }
 
     DrawLineShade(XS0, YS0, XS1, YS1, XS2, YS2, XS3, YS3);
@@ -530,6 +545,7 @@ void DrawShadow() {
         GpuRenderer_ShadowEnd();
         UseGpuShadow = FALSE;
     }
+    UseSwShade = TRUE;
 
     //	BoxMovingAdd( ClipXMin, ClipYMin, ClipXMax, ClipYMax ) ;
 

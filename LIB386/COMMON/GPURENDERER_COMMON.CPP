@@ -18,6 +18,8 @@
 #include <GPU/GPURENDERER.H>
 #include <GPU/GPURENDERER_BACKEND.H>
 #include <POLYGON/POLY.H>
+#include <SVGA/CLIP.H>
+#include <SVGA/SCREENXY.H>
 #include <SVGA/SDL.H> /* SetGpuPresentHooks: the present seam SDL.CPP exposes */
 #include <SYSTEM/LOG.H>
 
@@ -41,6 +43,7 @@ extern U32 Fill_Fog_Factor;    /* fog-smooth scale (POLY_TEXTURE_Z_FOG)     */
 extern U32 Fill_ScaledFogNear; /* fog-smooth near plane (type 24)           */
 extern S32 AtlasTextureDirty;  /* in-place atlas mutation (same pointer)    */
 extern S32 DisplayTexFilter;   /* bilinear toggle, read once per frame      */
+extern S32 GpuScene;           /* scene layers onto the GPU (GPU_SCENE_PLAN) */
 extern U16 *PtrZBuffer;        /* readback targets (SW Z-buffer / Log)      */
 extern void *Screen;
 extern const U32 *GL_GetPaletteLUT(void);
@@ -138,10 +141,33 @@ static GpuVertex s_shadowVerts[SHADOW_MAX_VERTS];
 static U32 s_shadowVertCount = 0;
 static float s_shadowAlpha = 0.0f;
 static S32 s_shadowPlaneAZ = 32768; /* clip-Z of the shadow's ground plane */
+static S32 s_shadowDepthTest = 1;   /* 0 = interior flat (no FBO depth)    */
 static S32 s_shadowActive = 0;
 
 /* Uploaded-pointer tracking. */
 static const void *s_uploadedAtlas = NULL;
+
+/* ── Interior brick atlas (GpuScene phase 1) ────────────────────────────── */
+/* One RG8 page (R = palette index, G = valid; AffGraph RLE skip leaves
+   G = 0 so the shader discards and the FBO keeps whatever was there).
+   Packed lazily on the first DrawBrick while the flag is on, so a flag-off
+   build never touches the bank. Sentinel typePoly: outside 0..24 so the
+   poly intake never sees it, and Common_BuildDrawParams maps it to
+   polyMode 7. */
+#define GPU_BRICK_TYPE 0x7FFF
+#define GPU_BRICK_ATLAS_W 2048
+#define GPU_BRICK_ATLAS_H 2048
+
+typedef struct GpuBrickRect {
+    U16 x, y, w, h;
+} GpuBrickRect;
+
+static const void *s_brickBank = NULL;
+static U32 s_brickCount = 0;
+static U8 *s_brickAtlasData = NULL; /* RG8, GPU_BRICK_ATLAS_W*H*2      */
+static GpuBrickRect *s_brickRects = NULL;
+static S32 s_brickPackValid = 0;   /* atlas+rects match s_brickBank     */
+static const void *s_uploadedBrickAtlas = NULL;
 
 /* ── Screen-space mapping ───────────────────────────────────────────────── */
 
@@ -189,12 +215,165 @@ static void Common_UploadPalette(void) {
 }
 
 //──────────────────────────────────────────────────────────────────────────
+// Brick atlas pack + upload (GpuScene phase 1).
+//──────────────────────────────────────────────────────────────────────────
+// Decodes one AffGraph brick (header + RLE lines) into the RG8 page at
+// (ox, oy). RLE skip (op 0) leaves G = 0; literals and runs write G = 1.
+static void Common_DecodeBrick(const U8 *data, U8 *atlas, U32 atlasW, S32 ox,
+                               S32 oy) {
+    const U8 deltaX = data[0];
+    const U8 nbLine = data[1];
+    const U8 *graphics = data + 4;
+    S32 line;
+
+    for (line = 0; line < (S32)nbLine; line++) {
+        U8 nbBlock = *graphics++;
+        S32 x = 0;
+        U8 j;
+
+        for (j = 0; j < nbBlock; j++) {
+            U8 control = *graphics;
+            U8 opCode = (U8)(control >> 6);
+            U32 counter = (U32)(control & 0x3F);
+            U8 *px = atlas + ((U32)(oy + line) * atlasW + (U32)(ox + x)) * 2;
+
+            if (opCode == 0) {
+                graphics++;
+                x += (S32)counter + 1; /* skip: leave valid = 0 */
+            } else {
+                counter++; /* one more, same as AffGraph */
+                if (opCode == 1) {
+                    graphics++;
+                    while (counter > 0) {
+                        px[0] = *graphics++;
+                        px[1] = 1;
+                        x++;
+                        px += 2;
+                        counter--;
+                    }
+                } else {
+                    U8 color = graphics[1];
+                    graphics += 2;
+                    while (counter > 0) {
+                        px[0] = color;
+                        px[1] = 1;
+                        x++;
+                        px += 2;
+                        counter--;
+                    }
+                }
+            }
+        }
+        if (x > (S32)deltaX) {
+            break; /* malformed bank: stop decoding this brick */
+        }
+    }
+}
+
+// Shelf-packs every brick in the bank into the fixed RG8 page. Returns
+// FALSE on overflow or an empty bank (caller falls back to software).
+static S32 Common_PackBrickBank(void) {
+    const U32 *offsets;
+    U32 i;
+    U32 penX = 0, penY = 0, rowH = 0;
+
+    if (s_brickBank == NULL) {
+        return FALSE;
+    }
+    offsets = (const U32 *)s_brickBank;
+    s_brickCount = offsets[0] / 4;
+    if (s_brickCount == 0) {
+        return FALSE;
+    }
+    s_brickCount--; /* last offset points at end-of-file, not a brick */
+
+    if (s_brickAtlasData == NULL) {
+        s_brickAtlasData = (U8 *)malloc(GPU_BRICK_ATLAS_W *
+                                        GPU_BRICK_ATLAS_H * 2);
+        s_brickRects =
+            (GpuBrickRect *)malloc(s_brickCount * sizeof(GpuBrickRect));
+        if (s_brickAtlasData == NULL || s_brickRects == NULL) {
+            free(s_brickAtlasData);
+            free(s_brickRects);
+            s_brickAtlasData = NULL;
+            s_brickRects = NULL;
+            s_brickPackValid = 0;
+            return FALSE;
+        }
+    } else {
+        GpuBrickRect *grown = (GpuBrickRect *)realloc(
+            s_brickRects, s_brickCount * sizeof(GpuBrickRect));
+        if (grown == NULL) {
+            s_brickPackValid = 0;
+            return FALSE;
+        }
+        s_brickRects = grown;
+    }
+
+    memset(s_brickAtlasData, 0, GPU_BRICK_ATLAS_W * GPU_BRICK_ATLAS_H * 2);
+
+    for (i = 0; i < s_brickCount; i++) {
+        const U8 *data = (const U8 *)s_brickBank + offsets[i];
+        U32 w = data[0];
+        U32 h = data[1];
+
+        if (w == 0 || h == 0 || penX + w > GPU_BRICK_ATLAS_W) {
+            penX = 0;
+            penY += rowH;
+            rowH = 0;
+        }
+        if (penY + h > GPU_BRICK_ATLAS_H) {
+            Log_Error("[GPU] brick atlas overflow packing %u bricks", (unsigned)s_brickCount);
+            s_brickPackValid = 0;
+            return FALSE;
+        }
+        Common_DecodeBrick(data, s_brickAtlasData, GPU_BRICK_ATLAS_W,
+                           (S32)penX, (S32)penY);
+        s_brickRects[i].x = (U16)penX;
+        s_brickRects[i].y = (U16)penY;
+        s_brickRects[i].w = (U16)w;
+        s_brickRects[i].h = (U16)h;
+        penX += w;
+        if (h > rowH) {
+            rowH = h;
+        }
+    }
+
+    s_brickPackValid = 1;
+    s_uploadedBrickAtlas = NULL; /* force a backend re-upload */
+    return TRUE;
+}
+
+static void Common_UploadBricks(void) {
+    if (!s_brickPackValid || s_brickAtlasData == NULL) {
+        return;
+    }
+    if (s_uploadedBrickAtlas != (const void *)s_brickAtlasData) {
+        s_backend->TexUpdateBricks(s_brickAtlasData, GPU_BRICK_ATLAS_W,
+                                   GPU_BRICK_ATLAS_H);
+        s_uploadedBrickAtlas = s_brickAtlasData;
+    }
+}
+
+//──────────────────────────────────────────────────────────────────────────
 // GpuDrawParams resolution — the flush-time state translation. This is the
 // poly-mode / alpha / depth contract of the reference driver; see
 // GPURENDERER_BACKEND.H for the field semantics.
 //──────────────────────────────────────────────────────────────────────────
 static void Common_BuildDrawParams(GpuDrawParams *out) {
     memset(out, 0, sizeof *out);
+
+    /* Brick quad (GpuScene): nearest atlas sample, palette LUT, no depth,
+       no light. Bilinear is forced off regardless of the player's filter. */
+    if (s_currentTypePoly == GPU_BRICK_TYPE) {
+        out->polyMode = 7;
+        out->bilinear = 0;
+        out->depthTest = 0;
+        out->depthWrite = 0;
+        out->screenScale[0] = s_screenScale[0];
+        out->screenScale[1] = s_screenScale[1];
+        return;
+    }
 
     /* Poly mode + flat colour + alpha mode. */
     if (s_currentTypePoly < POLY_TEXTURE) {
@@ -398,7 +577,7 @@ static void Common_FlushShadowSpans(void) {
     params.alphaMode = 0;
     params.flatColor = s_shadowAlpha;
     params.blend = 1;
-    params.depthTest = 1;
+    params.depthTest = s_shadowDepthTest;
     params.depthWrite = 0;
     params.screenScale[0] = s_screenScale[0];
     params.screenScale[1] = s_screenScale[1];
@@ -417,6 +596,19 @@ void GpuRenderer_ShadowBegin(S32 level, S32 zPlane) {
     s_shadowVertCount = 0;
     s_shadowAlpha = Common_ShadowAlpha(level);
     s_shadowPlaneAZ = zPlane;
+    s_shadowDepthTest = 1;
+    s_shadowActive = 1;
+}
+
+void GpuRenderer_ShadowBeginFlat(S32 level) {
+    if (!s_active) {
+        return;
+    }
+    GpuRenderer_FlushBatch();
+    s_shadowVertCount = 0;
+    s_shadowAlpha = Common_ShadowAlpha(level);
+    s_shadowPlaneAZ = 0;
+    s_shadowDepthTest = 0; /* interior FBO has no terrain depth to test */
     s_shadowActive = 1;
 }
 
@@ -462,6 +654,134 @@ void GpuRenderer_ShadowEnd(void) {
     }
     s_shadowActive = 0;
     Common_FlushShadowSpans();
+}
+
+//──────────────────────────────────────────────────────────────────────────
+// Interior brick grid (see GpuRenderer_SetBrickBank / DrawBrick).
+//──────────────────────────────────────────────────────────────────────────
+void GpuRenderer_SetBrickBank(const void *bank) {
+    if (s_brickBank == bank) {
+        return;
+    }
+    s_brickBank = bank;
+    s_brickCount = 0;
+    s_brickPackValid = 0;
+    s_uploadedBrickAtlas = NULL;
+}
+
+S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y) {
+    const U32 *offsets;
+    const U8 *data;
+    S32 hotX, hotY, deltaX, nbLine;
+    S32 x0, y0, x1, y1, cx0, cy0, cx1, cy1;
+    S32 u0, v0, u1, v1;
+    const GpuBrickRect *rect;
+    GpuVertex *v;
+
+    if (!s_active || !GpuScene || s_brickBank == NULL) {
+        return 0;
+    }
+    if (brickIdx < 0) {
+        return 0;
+    }
+    if (!s_brickPackValid) {
+        if (!Common_PackBrickBank()) {
+            return 0;
+        }
+    }
+    if ((U32)brickIdx >= s_brickCount) {
+        return 0;
+    }
+
+    offsets = (const U32 *)s_brickBank;
+    data = (const U8 *)s_brickBank + offsets[brickIdx];
+    deltaX = data[0];
+    nbLine = data[1];
+    hotX = (S8)data[2];
+    hotY = (S8)data[3];
+    rect = &s_brickRects[brickIdx];
+
+    /* AffOneBrick accumulates these after AffBrickBlockOnly returns, so
+       publish the full unclipped rect exactly as AffGraph does. */
+    x0 = ScreenXMin = x + hotX;
+    y0 = ScreenYMin = y + hotY;
+    x1 = ScreenXMax = x0 + deltaX - 1;
+    y1 = ScreenYMax = y0 + nbLine - 1;
+
+    cx0 = (x0 < ClipXMin) ? ClipXMin : x0;
+    cy0 = (y0 < ClipYMin) ? ClipYMin : y0;
+    cx1 = (x1 > ClipXMax) ? ClipXMax : x1;
+    cy1 = (y1 > ClipYMax) ? ClipYMax : y1;
+    if (cx0 > cx1 || cy0 > cy1) {
+        return 1; /* fully clipped: consumed, nothing visible */
+    }
+
+    Common_UploadPalette();
+    Common_UploadBricks();
+
+    if (s_batchVertCount > 0) {
+        if (s_currentTypePoly != (U32)GPU_BRICK_TYPE ||
+            s_batchAtlas != (const void *)s_brickAtlasData) {
+            GpuRenderer_FlushBatch();
+        }
+    }
+    s_currentTypePoly = (U32)GPU_BRICK_TYPE;
+    s_currentColorPoly = 0;
+    s_batchAtlas = (const void *)s_brickAtlasData;
+    s_batchCLUTGouraud = NULL;
+    s_batchZBuffer = 0;
+    s_batchNZW = 0;
+    s_batch3DPass = 0;
+    s_batchCLUTBaseRow = 0.0f;
+
+    /* Integer UV shift for the clipped window: left edge of pixel cx0 is
+       at local (cx0 - x0), which sits at atlas rect.x + (cx0 - x0). */
+    u0 = (S32)rect->x + (cx0 - x0);
+    v0 = (S32)rect->y + (cy0 - y0);
+    u1 = (S32)rect->x + (cx1 - x0 + 1);
+    v1 = (S32)rect->y + (cy1 - y0 + 1);
+
+    if (s_batchVertCount + 6 > BATCH_MAX_VERTS) {
+        GpuRenderer_FlushBatch();
+    }
+    v = (GpuVertex *)(s_batchVerts + s_batchVertCount * 14);
+    /* Two triangles, pixel centers at integer+0.5 land on texel centers
+       when MapU runs rect.x → rect.x+w across the brick's width. */
+    v[0].XE = (S16)cx0;
+    v[0].YE = (S16)cy0;
+    v[0].MapU = (U16)u0;
+    v[0].MapV = (U16)v0;
+    v[1].XE = (S16)(cx1 + 1);
+    v[1].YE = (S16)cy0;
+    v[1].MapU = (U16)u1;
+    v[1].MapV = (U16)v0;
+    v[2].XE = (S16)(cx1 + 1);
+    v[2].YE = (S16)(cy1 + 1);
+    v[2].MapU = (U16)u1;
+    v[2].MapV = (U16)v1;
+    v[3].XE = (S16)cx0;
+    v[3].YE = (S16)cy0;
+    v[3].MapU = (U16)u0;
+    v[3].MapV = (U16)v0;
+    v[4].XE = (S16)(cx1 + 1);
+    v[4].YE = (S16)(cy1 + 1);
+    v[4].MapU = (U16)u1;
+    v[4].MapV = (U16)v1;
+    v[5].XE = (S16)cx0;
+    v[5].YE = (S16)(cy1 + 1);
+    v[5].MapU = (U16)u0;
+    v[5].MapV = (U16)v1;
+    {
+        U32 k;
+        for (k = 0; k < 6; k++) {
+            v[k].Light = 0;
+            v[k].ZO = 0;
+            v[k].RepMask = 0;
+        }
+    }
+    s_batchVertCount += 6;
+    s_batchTriCount += 2;
+    return 1;
 }
 
 static void Common_PackVertex(GpuVertex *dst, const Struc_Point *src,
@@ -815,6 +1135,8 @@ S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
     Common_UpdateScreenScale();
     s_active = 1;
     s_fboHasTerrain = 0;
+    /* Context recreate: the backend's brick texture is gone. */
+    s_uploadedBrickAtlas = NULL;
 
     if (!be->TargetCreate(resX * s_renderQuality, resY * s_renderQuality)) {
         Log_Warn("[GPU] backend '%s' TargetCreate failed", be->identifier);
@@ -866,6 +1188,10 @@ void GpuRenderer_Shutdown(void) {
     s_batchNZW = 0;
     s_batch3DPass = 0;
     s_uploadedAtlas = NULL;
+    s_uploadedBrickAtlas = NULL;
+    /* The packed page is CPU-side and survives a context recreate only if
+       re-uploaded; drop the upload marker so Init re-sends it. The pack
+       itself stays valid — the bank did not change. */
     s_resX = 0;
     s_resY = 0;
 }
@@ -990,10 +1316,16 @@ void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
 void GpuRenderer_ShadowBegin(S32 level, S32 zPlane) {
     (void)level; (void)zPlane;
 }
+void GpuRenderer_ShadowBeginFlat(S32 level) { (void)level; }
 void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1) {
     (void)x0; (void)y; (void)x1;
 }
 void GpuRenderer_ShadowEnd(void) {}
+void GpuRenderer_SetBrickBank(const void *bank) { (void)bank; }
+S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y) {
+    (void)brickIdx; (void)x; (void)y;
+    return 0;
+}
 void GpuRenderer_SnapshotTerrain(void) {}
 void GpuRenderer_RestoreTerrain(void) {}
 void GpuRenderer_Begin3DPass(void) {}

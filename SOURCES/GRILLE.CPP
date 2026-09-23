@@ -2,6 +2,7 @@
 #include "DIRECTORIES.H"
 
 #include <3D/PROJREC.H>
+#include <GPU/GPURENDERER.H> // GpuRenderer_SetBrickBank / DrawBrick
 #include <SVGA/SCREEN.H>
 
 /*══════════════════════════════════════════════════════════════════════════*
@@ -263,6 +264,9 @@ void InitGrille(U32 numcube) {
     //----------------------------------------------	NEW
     if (!LoadUsedBrick())
         return;
+    /* BufferBrick was rewritten for this cube: hand the bank to the GPU
+       brick path (no-op until GpuScene is on). */
+    GpuRenderer_SetBrickBank(BufferBrick);
     //----------------------------------------------
 
     ManageSystem(); // for streaming
@@ -283,7 +287,9 @@ void InitGrille(U32 numcube) {
 }
 
 /*--------------------------------------------------------------------------*/
-void FreeGrille() {}
+void FreeGrille() {
+    GpuRenderer_SetBrickBank(NULL);
+}
 /*-------------------------------------------------------------------------*/
 /*══════════════════════════════════════════════════════════════════════════*
 		   █▀▀▀▀ ██▄ █ █▀▀▀▄       █   █ █▀▀▀█ █▀▀▀█
@@ -880,7 +886,10 @@ void AffBrickBlock(S32 block, S32 brick, S16 x, S16 y, S16 z) {
         // the iso origin offset slides off that multiple and the rejected bricks
         // start having visible content. See WIDESCREEN_HARDCODED_DIMS_AUDIT.md.
         if (XScreen >= -47 AND XScreen < (S32)ModeDesiredX AND YScreen >= -38 AND YScreen < (S32)ModeDesiredY) {
-            AffGraph(numbrick - 1, XScreen, YScreen, BufferBrick);
+            /* GpuScene: submit as a batched FBO quad; FALSE keeps AffGraph. */
+            if (!GpuRenderer_DrawBrick(numbrick - 1, XScreen, YScreen)) {
+                AffGraph(numbrick - 1, XScreen, YScreen, BufferBrick);
+            }
 
             // ListBrickColon is indexed by `col = (XScreen+24)/24`, which goes
             // negative below -24 and would corrupt the array. Bricks in the
@@ -1061,7 +1070,10 @@ void AffBrickBlockOnly(S32 block, S32 brick, S16 x, S16 y, S16 z) {
         Map2Screen(x - StartXCube, y - StartYCube, z - StartZCube);
 
         if (XScreen >= -24 AND XScreen < (S32)ModeDesiredX AND YScreen >= -38 AND YScreen < (S32)ModeDesiredY) {
-            AffGraph(numbrick - 1, XScreen, YScreen, BufferBrick);
+            /* GpuScene: submit as a batched FBO quad; FALSE keeps AffGraph. */
+            if (!GpuRenderer_DrawBrick(numbrick - 1, XScreen, YScreen)) {
+                AffGraph(numbrick - 1, XScreen, YScreen, BufferBrick);
+            }
         }
     }
 }

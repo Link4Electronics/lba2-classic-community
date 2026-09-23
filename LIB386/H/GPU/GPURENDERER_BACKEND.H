@@ -121,6 +121,10 @@ typedef struct GpuRendererBackend {
     void (*TexUpdateAtlas)(const void *lum);
     void (*TexUpdateCLUT)(const void *lum);
     void (*TexUpdatePalette)(const void *argb);
+    // Brick atlas (GpuScene phase 1): RG8 page, R = palette index, G =
+    // valid (0 = AffGraph RLE skip). Sized by width/height; the backend
+    // creates or recreates its texture when either changes.
+    void (*TexUpdateBricks)(const void *rg, U32 width, U32 height);
 
     // Draw a batch of triangles (fan already expanded). The backend maps
     // params to its shader uniforms/state and draws immediately.

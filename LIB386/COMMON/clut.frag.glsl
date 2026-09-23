@@ -18,7 +18,9 @@ layout(set = 2, binding = 0) uniform sampler2D uAtlas;   /* 256×256 LUMINANCE *
 layout(set = 2, binding = 1) uniform sampler2D uCLUT;    /* 256×256 LUMINANCE (fog table) */
 layout(set = 2, binding = 2) uniform sampler2D uPalette; /* 256×1 ARGB (paletteLUT) */
 layout(std140, set = 3, binding = 0) uniform GpuParams {
-    int   uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow */
+    int   uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable
+                             4=textureNoCLUT 5=fogSmooth 6=sceneShadow
+                             7=brickQuad */
     int   uAlphaMode;     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
     float uFlatColor;     /* palette index (mode 1) / CLUT column (mode 3) */
     int   uBilinear;      /* 0=nearest 1=bilinear CLUT sampling */
@@ -27,6 +29,9 @@ layout(std140, set = 3, binding = 0) uniform GpuParams {
     float uCLUTBaseRow;   /* CLUT row offset for gouraud table (mode 3) */
     float uScaledFogNear; /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
     float uFogRowScale;   /* Fill_Fog_Factor / 65536 (fog-smooth, mode 5) */
+    float uBrickW;        /* brick atlas width (mode 7) */
+    float uBrickH;        /* brick atlas height (mode 7) */
+    float uBrickPad;
 };
 layout(location = 0) in vec2 vTexCoord;
 layout(location = 1) in vec2 vTexCoordOverW;
@@ -174,12 +179,20 @@ void main() {
         color = clutLookup(texel, clutRow);
     } else if (uPolyMode == 6) {
         /* Scene shadow span: flat black at uFlatColor alpha. The SW path
-           darkens Log through PtrCLUGouraud to (15 - level)/15; alpha =
-           level/15 under the alpha blend reproduces that as dst*(1-alpha). */
+            darkens Log through PtrCLUGouraud to (15 - level)/15; alpha =
+            level/15 under the alpha blend reproduces that as dst*(1-alpha). */
         color = vec4(0.0, 0.0, 0.0, uFlatColor);
+    } else if (uPolyMode == 7) {
+        /* Brick atlas (GpuScene): R8G8 page, R = palette index, G = valid.
+           AffGraph RLE skips leave G = 0 so the fragment is discarded and
+           the FBO keeps whatever was there. NEAREST only. */
+        vec2 uv = vTexCoord / vec2(uBrickW, uBrickH);
+        vec2 t = texture(uAtlas, uv).rg;
+        if (t.y < 0.5) discard;
+        color = texture(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
-           Same +128 rounding bias as polyMode 0. */
+            Same +128 rounding bias as polyMode 0. */
         float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;
         vec2 clutUV = vec2((uFlatColor + 0.5) / 256.0,
                            (gouraudRow + 0.5) / 256.0);
@@ -208,11 +221,15 @@ void main() {
 uniform sampler2D uAtlas;   /* 256×256 LUMINANCE */
 uniform sampler2D uCLUT;    /* 256×256 LUMINANCE (fog table) */
 uniform sampler2D uPalette; /* 256×1 BGRA (paletteLUT) */
-uniform int uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow */
+uniform int uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable
+                               4=textureNoCLUT 5=fogSmooth 6=sceneShadow
+                               7=brickQuad */
 uniform float uFlatColor;   /* palette index (mode 1) / CLUT column (mode 3) */
 uniform float uCLUTBaseRow; /* CLUT row offset for gouraud table (mode 3) */
 uniform float uScaledFogNear; /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
-uniform float uFogRowScale;   /* Fill_Fog_Factor / 65536 (fog-smooth, mode 5) */
+uniform float uFogRowScale;   /* Fill_Fog_Factor / 65536 (fog-smooth distance, mode 5) */
+uniform float uBrickW;      /* brick atlas width (mode 7) */
+uniform float uBrickH;      /* brick atlas height (mode 7) */
 uniform int uAlphaMode;     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
 uniform int uBilinear;      /* 0=nearest 1=bilinear CLUT sampling */
 uniform int uChromaKey;     /* 0=no chroma key 1=discard index 0 */
@@ -361,12 +378,20 @@ void main() {
         color = clutLookup(texel, clutRow);
     } else if (uPolyMode == 6) {
         /* Scene shadow span: flat black at uFlatColor alpha. The SW path
-           darkens Log through PtrCLUGouraud to (15 - level)/15; alpha =
-           level/15 under the alpha blend reproduces that as dst*(1-alpha). */
+            darkens Log through PtrCLUGouraud to (15 - level)/15; alpha =
+            level/15 under the alpha blend reproduces that as dst*(1-alpha). */
         color = vec4(0.0, 0.0, 0.0, uFlatColor);
+    } else if (uPolyMode == 7) {
+        /* Brick atlas (GpuScene): R8G8 page, R = palette index, G = valid.
+           AffGraph RLE skips leave G = 0 so the fragment is discarded and
+           the FBO keeps whatever was there. NEAREST only. */
+        vec2 uv = vTexCoord / vec2(uBrickW, uBrickH);
+        vec2 t = texture2D(uAtlas, uv).rg;
+        if (t.y < 0.5) discard;
+        color = texture2D(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
-           Same +128 rounding bias as polyMode 0. */
+            Same +128 rounding bias as polyMode 0. */
         float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;
         vec2 clutUV = vec2((uFlatColor + 0.5) / 256.0,
                            (gouraudRow + 0.5) / 256.0);

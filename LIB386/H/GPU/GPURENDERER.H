@@ -93,8 +93,20 @@ void GpuRenderer_End3DPass(void);
 // (interior, menus). Begin flushes the pending batch so the shadow lands on
 // what precedes it.
 void GpuRenderer_ShadowBegin(S32 level, S32 zPlane);
+// Interior room spans (GpuScene): same flat-black alpha as ShadowBegin,
+// but no depth test — the interior has no terrain in the FBO to occlude
+// against, matching the software ShadeBoxBlk path's plain darken.
+void GpuRenderer_ShadowBeginFlat(S32 level);
 void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1);
 void GpuRenderer_ShadowEnd(void);
+
+// Interior brick grid (GpuScene phase 1). SetBrickBank hands the cube's
+// BufferBrick bank over (NULL on FreeGrille); DrawBrick submits one brick
+// as a screen-space textured quad and returns TRUE when consumed — FALSE
+// leaves the caller on the software AffGraph path (flag off, no backend,
+// pack failure, out-of-range index).
+void GpuRenderer_SetBrickBank(const void *bank);
+S32  GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y);
 
 // Terrain persistence for static-camera (AFF_OBJETS) frames. A camera cut
 // redraws only the flagged bodies, never the terrain; the offscreen target

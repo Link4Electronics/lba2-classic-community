@@ -19,7 +19,7 @@ palette-index). The GL backend below appended exactly this work to its draw
 loop; here it is explicit and testable.
 
 A backend is a thin wire: `GpuRendererBackendGL` and
-`GpuRendererBackendSDL3GPU` (19 operations each) implement the vtable in
+`GpuRendererBackendSDL3GPU` (20 operations each) implement the vtable in
 `../LIB386/H/GPU/GPURENDERER_BACKEND.H`. A backend binds its target, uploads
 the batch, sets the uniforms from the already-resolved `GpuDrawParams`, draws,
 and composites the two framebuffers onto the window. It decides nothing.
@@ -151,7 +151,29 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   mirroring the software `DrawRecover` occlusion, while the footprint's own
   ground never fails the test, so the shadow paints whole; depth-write stays
   off so later blends survive. Interior cubes and menus keep `ShadeBoxBlk`,
-  since their terrain is drawn into `Log`.
+  since their terrain is drawn into `Log`. With `GpuScene` on, interiors
+  split the darken: the room lives in the offscreen target, so
+  `DrawShadow` (`../SOURCES/BEZIER.CPP`) opens `GpuRenderer_ShadowBeginFlat`
+  (same CLUT-derived alpha, depth-test off — the interior FBO has no
+  terrain depth to test) for the FBO spans, while the unchanged
+  `ShadeBoxBlk` keeps darkening actor pixels still sitting in the Log
+  overlay; each buffer receives the darken its own pixels received when
+  they shared one buffer.
+
+- **`GpuScene` and the interior brick grid.** cfg key `GpuScene`, cvar
+  `gpuscene`, default 0. With the flag on and a backend active, the base
+  brick blits in `AffBrickBlock` / `AffBrickBlockOnly` go through
+  `GpuRenderer_DrawBrick`: COMMON shelf-packs the cube's `BufferBrick`
+  bank into one RG8 page (R = palette index, G = valid; AffGraph RLE skips
+  leave G = 0 so the shader discards and the FBO keeps what was there),
+  batches quads as polyMode 7 (nearest, no depth, no light), and each
+  backend samples that page through `uAtlas` when polyMode is 7
+  (`TexUpdateBricks` on the vtable; GL uses LUMINANCE_ALPHA, SDL3 GPU
+  uses R8G8_UNORM). `InitGrille` calls `GpuRenderer_SetBrickBank` after
+  `LoadUsedBrick`; `FreeGrille` passes NULL. With the flag off, or on the
+  software path, every hook falls through to `AffGraph` unchanged.
+  `DrawOverBrick`, `CopyMask`, Z-masks, bodies, sprites and HUD stay in
+  the Log (see GPU_SCENE_PLAN.md phases 2–3).
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and

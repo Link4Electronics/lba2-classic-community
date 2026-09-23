@@ -134,6 +134,13 @@ static const T_SETTING BootSettings[] = {
     {"RenderQuality", NULL, "quality", &RenderQuality, SETTING_OR_DEFAULT, 1, 1, 4,
      NULL, NULL, ApplyRenderQuality, NULL,
      "GPU render scale (1 = native, 2 = 2x, 4 = 4x)"},
+    /* Phased move of scene layers onto the GPU renderers (GPU_SCENE_PLAN.md).
+       Off keeps today's hybrid: the interior room, sprites and the HUD draw
+       through the software path and composite as the Log overlay. The cvar is
+       the runtime surface until the phases read it. */
+    {"GpuScene", NULL, "gpuscene", &GpuScene, SETTING_OR_DEFAULT, FALSE, 0, 1,
+     NULL, NULL, NULL, NULL,
+     "Move scene layers to the GPU renderers (0 = software Log path, 1 = GPU)"},
     {"VSync", NULL, NULL, &DisplayVSync, SETTING_OR_DEFAULT, TRUE, 0, 1, &StoredVSync, ForcedVSync, NULL, &SourceVSync},
     {"DitherShading", NULL, "gfx_dither", &GfxDitherShading, SETTING_OR_DEFAULT, FALSE, 0, 1, NULL, NULL, NULL, NULL,
      "Ordered dither on Gouraud shade rows (softens 16-step banding)"},

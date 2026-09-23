@@ -20,12 +20,14 @@
    Owned by the GL renderer even in software builds (gly is always built, as
    stubs when GPURENDERER is off) so every consumer links against one
    definition. DisplayTexFilter selects bilinear CLUT/overlay sampling in GL
-   mode; RenderQuality is the FBO supersample factor; AtlasTextureDirty is
-   raised by DoTextureAnimation when the 256x256 atlas page is mutated in
-   place. */
+   mode; RenderQuality is the FBO supersample factor; GpuScene gates the
+   phased move of scene layers off the software Log path (both GPU backends
+   read it, like the two above); AtlasTextureDirty is raised by
+   DoTextureAnimation when the 256x256 atlas page is mutated in place. */
 extern "C" {
 S32 DisplayTexFilter = TRUE; /* bilinear by default in GL mode */
 S32 RenderQuality = 1;       /* native resolution by default */
+S32 GpuScene = 0;            /* hybrid Log path until phases enable layers */
 S32 AtlasTextureDirty = 0;
 }
 
@@ -143,6 +145,7 @@ static const char *s_clutFragSrc =
     "uniform int uBilinear;\n"      /* 0=nearest 1=bilinear CLUT sampling */
     "uniform int uChromaKey;\n"     /* 0=no chroma key 1=discard index 0 */
     "uniform int uPerspCorrect;\n"  /* 1=perspective-correct UV/Z (types 16-24) */
+    "uniform vec2 uBrickSize;\n"    /* brick atlas page size (mode 7) */
     "varying vec2 vTexCoord;\n"
     "varying vec2 vTexCoordOverW;\n"
     "varying float vInvW;\n"
@@ -290,6 +293,14 @@ static const char *s_clutFragSrc =
        alpha is the CLUT row's average luminance loss (see Common_ShadowAlpha),
        so blending shadow * (1 - alpha) matches the ShadeBoxBlk darkening. */
     "        color = vec4(0.0, 0.0, 0.0, uFlatColor);\n"
+    "    } else if (uPolyMode == 7) {\n"
+    /* Brick atlas: R = palette index, G = valid (AffGraph RLE skip).
+       NEAREST only; MapU/MapV are absolute texel coords. LUMINANCE_ALPHA
+       packs index in .r and valid in .a. */
+    "        vec2 uv = vTexCoord / uBrickSize;\n"
+    "        vec2 t = texture2D(uAtlas, uv).ra;\n"
+    "        if (t.y < 0.5) discard;\n"
+    "        color = texture2D(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));\n"
     "    } else {\n"
     /* Gouraud table (types 6/7): CLUT lookup, color = column.
        Same +128 rounding bias as polyMode 0. */
@@ -345,12 +356,16 @@ static GLint s_clut_uAlphaMode = -1;
 static GLint s_clut_uBilinear = -1;
 static GLint s_clut_uChromaKey = -1;
 static GLint s_clut_uPerspCorrect = -1;
+static GLint s_clut_uBrickSize = -1;
 
 /* ── GL state — textures ────────────────────────────────────────────────── */
 
 static GLuint s_atlasTex = 0;   /* 256×256 LUMINANCE */
 static GLuint s_clutTex = 0;    /* 256×256 LUMINANCE (full fog table) */
 static GLuint s_paletteTex = 0; /* 256×1 BGRA */
+static GLuint s_brickTex = 0;   /* brick atlas, LUMINANCE_ALPHA (GpuScene) */
+static U32 s_brickTexW = 0;
+static U32 s_brickTexH = 0;
 
 /* ── GL state — batch VBO ───────────────────────────────────────────────── */
 
@@ -592,6 +607,7 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     s_clut_uAlphaMode = glGetUniformLocation(s_clutProgram, "uAlphaMode");
     s_clut_uBilinear = glGetUniformLocation(s_clutProgram, "uBilinear");
     s_clut_uChromaKey = glGetUniformLocation(s_clutProgram, "uChromaKey");
+    s_clut_uBrickSize = glGetUniformLocation(s_clutProgram, "uBrickSize");
 
     Log_Info("[GL] CLUT shader compiled OK (aPos=%d aTexCoord=%d aLight=%d "
              "aZ=%d aRepMask=%d uAtlas=%d uCLUT=%d uPalette=%d uScreenScale=%d).",
@@ -655,6 +671,8 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
                  GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    /* Brick atlas: created on first TexUpdateBricks (size varies). */
+
     /* Present texture: allocated on first upload, at the present size. */
 
     /* GL state */
@@ -701,6 +719,12 @@ static void GL_DestroyContext(void) {
     if (s_paletteTex) {
         glDeleteTextures(1, &s_paletteTex);
         s_paletteTex = 0;
+    }
+    if (s_brickTex) {
+        glDeleteTextures(1, &s_brickTex);
+        s_brickTex = 0;
+        s_brickTexW = 0;
+        s_brickTexH = 0;
     }
     if (s_vbo) {
         glDeleteBuffers(1, &s_vbo);
@@ -918,6 +942,35 @@ static void GL_TexUpdatePalette(const void *argb) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+/* Brick atlas: LUMINANCE_ALPHA, byte0 = palette index, byte1 = valid.
+   Created/resized on size change; NEAREST + CLAMP so mode 7's absolute
+   texel UVs never bleed across shelf-pack gutters. */
+static void GL_TexUpdateBricks(const void *rg, U32 width, U32 height) {
+    if (rg == NULL || width == 0 || height == 0) {
+        return;
+    }
+    if (s_brickTex == 0) {
+        glGenTextures(1, &s_brickTex);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_brickTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (s_brickTexW != width || s_brickTexH != height) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei)width,
+                     (GLsizei)height, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                     rg);
+        s_brickTexW = width;
+        s_brickTexH = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width,
+                        (GLsizei)height, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                        rg);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 static void GL_TexUpdatePresent(const void *argb, U32 pitch, U32 width,
                                 U32 height, S32 linear) {
     if (argb == NULL) {
@@ -1002,6 +1055,10 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     glUniform1f(s_clut_uCLUTBaseRow, params->clutBaseRow);
     glUniform1f(s_clut_uScaledFogNear, params->scaledFogNear);
     glUniform1f(s_clut_uFogRowScale, params->fogRowScale);
+    if (params->polyMode == 7) {
+        glUniform2f(s_clut_uBrickSize, (float)s_brickTexW,
+                    (float)s_brickTexH);
+    }
 
     /* TRANS/TRAME (blend) batches alpha-blend; everything else is opaque.
        INCRUST chroma-keying is a shader discard, not blending, so Z-write
@@ -1013,9 +1070,11 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
         glDisable(GL_BLEND);
     }
 
-    /* Bind textures to units 0/1/2 */
+    /* Bind textures to units 0/1/2. Mode 7 samples the brick atlas through
+       uAtlas; every other mode samples the 256×256 page. */
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_atlasTex);
+    glBindTexture(GL_TEXTURE_2D,
+                  (params->polyMode == 7) ? s_brickTex : s_atlasTex);
     glUniform1i(s_clut_uAtlas, 0);
 
     glActiveTexture(GL_TEXTURE1);
@@ -1244,6 +1303,7 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_TexUpdateAtlas,
     GL_TexUpdateCLUT,
     GL_TexUpdatePalette,
+    GL_TexUpdateBricks,
     GL_DrawTriangles,
     GL_ClearBackbuffer,
     GL_DrawPresentQuad,

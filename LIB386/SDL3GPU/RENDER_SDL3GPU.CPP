@@ -109,7 +109,9 @@ typedef struct S3GpuParams {
     float clutBaseRow;
     float scaledFogNear;
     float fogRowScale;
-    float pad[3];
+    float brickW; /* mode 7: brick atlas page size (std140 match GLSL) */
+    float brickH;
+    float pad;
 } S3GpuParams;
 
 //──────────────────────────────────────────────────────────────────────────
@@ -147,6 +149,9 @@ static SDL_GPUTexture *s_terrainDepth = NULL;
 static SDL_GPUTexture *s_atlasTex = NULL;
 static SDL_GPUTexture *s_clutTex = NULL;
 static SDL_GPUTexture *s_paletteTex = NULL;
+static SDL_GPUTexture *s_brickTex = NULL; /* RG8 brick atlas (GpuScene) */
+static U32 s_brickTexW = 0;
+static U32 s_brickTexH = 0;
 static SDL_GPUTexture *s_overlayTex = NULL;
 static U32 s_overlayW = 0;
 static U32 s_overlayH = 0;
@@ -1097,6 +1102,12 @@ static void S3_DestroyContext(void) {
         SDL_ReleaseGPUTexture(s_device, s_paletteTex);
         s_paletteTex = NULL;
     }
+    if (s_brickTex != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_brickTex);
+        s_brickTex = NULL;
+        s_brickTexW = 0;
+        s_brickTexH = 0;
+    }
     s_overlayW = 0;
     s_overlayH = 0;
 
@@ -1341,6 +1352,33 @@ static void S3_TexUpdatePalette(const void *argb) {
     }
 }
 
+/* Brick atlas: R8G8_UNORM (R = palette index, G = valid). Recreated when
+   the pack size changes; nearest sampler at bind time. */
+static void S3_TexUpdateBricks(const void *rg, U32 width, U32 height) {
+    if (rg == NULL || width == 0 || height == 0) {
+        return;
+    }
+    if (s_brickTex != NULL &&
+        (s_brickTexW != width || s_brickTexH != height)) {
+        SDL_ReleaseGPUTexture(s_device, s_brickTex);
+        s_brickTex = NULL;
+    }
+    if (s_brickTex == NULL) {
+        s_brickTex =
+            S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_R8G8_UNORM, width, height);
+        if (s_brickTex == NULL) {
+            Log_Warn("[SDL3GPU] brick texture create failed: %s",
+                     SDL_GetError());
+            s_brickTexW = 0;
+            s_brickTexH = 0;
+            return;
+        }
+        s_brickTexW = width;
+        s_brickTexH = height;
+    }
+    S3_UploadTextureData(s_brickTex, rg, width, height, 2, width * 2);
+}
+
 static void S3_TexUpdatePresent(const void *argb, U32 pitch, U32 width,
                                 U32 height, S32 linear) {
     (void)linear; /* chosen at composite bind time */
@@ -1577,20 +1615,35 @@ static void S3_FlushDraws(void) {
     samplers[2].sampler = s_samplerNearest;
     SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 3);
 
-    for (i = 0; i < s_drawCount; i++) {
-        const S3DrawCmd *cmd = &s_draws[i];
-        S3ScreenParams sp;
-        sp.screenScale[0] = cmd->screenScale[0];
-        sp.screenScale[1] = cmd->screenScale[1];
-        sp.pad[0] = 0.0f;
-        sp.pad[1] = 0.0f;
-        SDL_BindGPUGraphicsPipeline(s_targetPass,
-                                    s_clutPipelines[cmd->pipelineIndex]);
-        SDL_PushGPUVertexUniformData(s_frameCmd, 0, &sp, sizeof(sp));
-        SDL_PushGPUFragmentUniformData(s_frameCmd, 0, &cmd->params,
-                                       sizeof(cmd->params));
-        SDL_DrawGPUPrimitives(s_targetPass, cmd->vertexCount, 1,
-                              cmd->firstVertex, 0);
+    {
+        /* Mode 7 samples the brick page through uAtlas; the bind is per
+           draw so a frame that mixes brick quads with other polys (shadows
+           use no atlas, terrain never coexists with an interior room) still
+           samples the right texture for each. */
+        S32 boundBrick = 0;
+        for (i = 0; i < s_drawCount; i++) {
+            const S3DrawCmd *cmd = &s_draws[i];
+            S3ScreenParams sp;
+            S32 wantBrick = (cmd->params.polyMode == 7);
+
+            if (wantBrick != boundBrick) {
+                samplers[0].texture = wantBrick ? s_brickTex : s_atlasTex;
+                samplers[0].sampler = s_samplerNearest;
+                SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 3);
+                boundBrick = wantBrick;
+            }
+            sp.screenScale[0] = cmd->screenScale[0];
+            sp.screenScale[1] = cmd->screenScale[1];
+            sp.pad[0] = 0.0f;
+            sp.pad[1] = 0.0f;
+            SDL_BindGPUGraphicsPipeline(s_targetPass,
+                                        s_clutPipelines[cmd->pipelineIndex]);
+            SDL_PushGPUVertexUniformData(s_frameCmd, 0, &sp, sizeof(sp));
+            SDL_PushGPUFragmentUniformData(s_frameCmd, 0, &cmd->params,
+                                           sizeof(cmd->params));
+            SDL_DrawGPUPrimitives(s_targetPass, cmd->vertexCount, 1,
+                                  cmd->firstVertex, 0);
+        }
     }
 
     SDL_EndGPURenderPass(s_targetPass);
@@ -1660,9 +1713,9 @@ static void S3_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     cmd->params.clutBaseRow = params->clutBaseRow;
     cmd->params.scaledFogNear = params->scaledFogNear;
     cmd->params.fogRowScale = params->fogRowScale;
-    cmd->params.pad[0] = 0.0f;
-    cmd->params.pad[1] = 0.0f;
-    cmd->params.pad[2] = 0.0f;
+    cmd->params.brickW = (float)s_brickTexW;
+    cmd->params.brickH = (float)s_brickTexH;
+    cmd->params.pad = 0.0f;
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -1894,6 +1947,7 @@ const GpuRendererBackend GpuRendererBackendSDL3GPU = {
     S3_TexUpdateAtlas,
     S3_TexUpdateCLUT,
     S3_TexUpdatePalette,
+    S3_TexUpdateBricks,
     S3_DrawTriangles,
     S3_ClearBackbuffer,
     S3_DrawPresentQuad,

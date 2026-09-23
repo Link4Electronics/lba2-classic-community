@@ -25,6 +25,9 @@ extern "C" {
 extern S32 DisplayTexFilter;
 //! FBO supersample factor: 1 = native, 2 = SSAA 2x, 4 = SSAA 4x.
 extern S32 RenderQuality;
+//! Scene layers onto the GPU renderers (see GPU_SCENE_PLAN.md); 0 keeps the
+//! software Log path for everything the hybrid does not draw yet.
+extern S32 GpuScene;
 
 // -----------------------------------------------------------------------------
 #ifdef __cplusplus
