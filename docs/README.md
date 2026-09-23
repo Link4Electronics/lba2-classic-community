@@ -126,7 +126,7 @@ doc is now history: where it disagrees with the code, the code wins.
 | [REFACTOR_ROADMAP.md](plan/REFACTOR_ROADMAP.md) | Living | Which areas are worth restructuring and what each one buys, ordered by what tests cover them rather than by how untidy they are. Measures what CI can actually see: 5% of `SOURCES/`, and no 1997 game logic at all. Companion to [FEATURE_WORKFLOW.md](FEATURE_WORKFLOW.md) Example 5. |
 | [ARCH_RULES_PLAN.md](plan/ARCH_RULES_PLAN.md) | Implemented | Checking the boundaries the docs already state: seven rules from CODESTYLE and AGENTS.md, each measured against the tree, plus the four candidates deliberately left out. Companion to [REFACTOR_ROADMAP.md](plan/REFACTOR_ROADMAP.md). |
 | [RENDER_INTERP_PLAN.md](plan/RENDER_INTERP_PLAN.md) | Proposed | Smooth motion above the sim rate (#412), building on the fixed-timestep sim in [MOVEMENT_FRAMERATE.md](MOVEMENT_FRAMERATE.md). Nothing landed. |
-| [GPU_SCENE_PLAN.md](plan/GPU_SCENE_PLAN.md) | Phase 1 Implemented | Moving scene drawing from the software Log path onto the GL / SDL3 GPU backends behind one flag: interior room quads (phase 1, landed), then interior bodies, then sprites/HUD (which deletes the depth readback), all batched through GPURENDERER_COMMON. Menus and text are evaluated last and expected to stay software. |
+| [GPU_SCENE_PLAN.md](plan/GPU_SCENE_PLAN.md) | Phase 2 Implemented | Moving scene drawing from the software Log path onto the GL / SDL3 GPU backends behind one flag: interior room quads (phase 1), then interior bodies (phase 2, landed), then sprites/HUD (which deletes the depth readback), all batched through GPURENDERER_COMMON. Menus and text are evaluated last and expected to stay software. |
 
 ## Knowledge bundle
 

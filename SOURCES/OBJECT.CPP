@@ -3,6 +3,7 @@
 #include <POLYGON/POLYFILT.H>
 
 #include <GPU/GPURENDERER.H> // GpuRenderer_BeginFrame: per-frame filter latch
+#include <GL/RENDER_GL.H>     // GpuScene
 
 #include "DEMO_SEED.H"
 #include "FOLLOWCAM.H" /* FollowCamera: camera zones re-aim the Auto camera */
@@ -4935,13 +4936,17 @@ S32 AffOneObject(T_SORT *pt) {
         }
 
         /* Exterior bodies open the 3D pass so they batch into the offscreen
-           target at render-scaled resolution; menu/holomap/credits callers of
-           ObjectDisplay never open it and keep the software Log path. */
-        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+           target at render-scaled resolution; with GpuScene, interior bodies
+           join them (the room already lives in the FBO). Menu/holomap/credits
+           callers of ObjectDisplay never open it and keep the software Log
+           path. */
+        if (GpuRenderer_IsActive() AND
+            (CubeMode == CUBE_EXTERIEUR OR(GpuScene AND CubeMode == CUBE_INTERIEUR))) {
             GpuRenderer_Begin3DPass();
         }
         aff = ObjectDisplay(&ptrobj->Obj);
-        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+        if (GpuRenderer_IsActive() AND
+            (CubeMode == CUBE_EXTERIEUR OR(GpuScene AND CubeMode == CUBE_INTERIEUR))) {
             GpuRenderer_End3DPass();
         }
 
@@ -5316,13 +5321,15 @@ S32 AffOneObject(T_SORT *pt) {
     case TYPE_DART:
         ptrd = &ListDart[numobj];
 
-        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+        if (GpuRenderer_IsActive() AND
+            (CubeMode == CUBE_EXTERIEUR OR(GpuScene AND CubeMode == CUBE_INTERIEUR))) {
             GpuRenderer_Begin3DPass();
         }
         aff = BodyDisplay_AlphaBeta(ptrd->PosX, ptrd->PosY, ptrd->PosZ,
                                     ptrd->Alpha, ptrd->Beta, 0,
                                     (U8 *)GivePtrObjFix(ptrd->Body));
-        if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
+        if (GpuRenderer_IsActive() AND
+            (CubeMode == CUBE_EXTERIEUR OR(GpuScene AND CubeMode == CUBE_INTERIEUR))) {
             GpuRenderer_End3DPass();
         }
 
@@ -5471,6 +5478,12 @@ startaffscene:
                 if (GpuRenderer_IsActive())
                     GpuRenderer_RestoreTerrain();
                 DrawAnimatedPolys();
+            } else if (GpuScene AND GpuRenderer_IsActive()) {
+                /* Interior with GpuScene: bodies batch into the FBO the same
+                   way, so the previous frame's body paint has to be scrubbed
+                   before this frame's flagged-body pass draws. No
+                   DrawAnimatedPolys — that path is exterior terrain NZW. */
+                GpuRenderer_RestoreTerrain();
             }
         }
         break;
@@ -5505,7 +5518,9 @@ startaffscene:
            hidden pixels become colour 0, which the present composite blends
            transparent over the same target's terrain. Interior cubes keep
            PtrZBuffer's backing store for BufCube/BufferBrick and draw through
-           DrawOverBrick instead. */
+           DrawOverBrick instead — no readback — but with GpuScene the room
+           (and the bodies that follow) live in the FBO, so the room is
+           snapshotted for AFF_OBJETS the same way exterior terrain is. */
         if (GpuRenderer_IsActive() AND CubeMode == CUBE_EXTERIEUR) {
             GpuRenderer_ReadbackDepthBuffer();
             /* Static-camera frames (AFF_OBJETS) redraw the flagged objects but
@@ -5513,6 +5528,11 @@ startaffscene:
                frame's shadows and washed animated polys and smear them into
                trails. Pin the clean terrain here; the AFF_OBJETS head restores
                it before the flagged-body pass. */
+            GpuRenderer_SnapshotTerrain();
+        } else if (GpuScene AND GpuRenderer_IsActive() AND CubeMode == CUBE_INTERIEUR) {
+            /* Pin the clean room after RefreshGrille painted it and before the
+               object pass draws bodies; AFF_OBJETS restores it so each static
+               frame starts from the room, not the previous frame's bodies. */
             GpuRenderer_SnapshotTerrain();
         }
 

@@ -87,6 +87,13 @@ static U32 s_renderQuality = 1; /* 1 = native, 2 = 2x, 4 = 4x */
 /* Persistent FBO-has-terrain flag (see ClearFBO/BeginFrame). */
 static S32 s_fboHasTerrain = 0;
 
+/* Interior sibling of the terrain flag: set when a GpuScene brick quad
+   actually lands in the target this frame (or is still there from the last
+   full redraw — like the terrain flag, it is not cleared on AFF_OBJETS
+   frames). The intake accepts non-Z body / NZW polys when either half is
+   set: exterior needs terrain depth, interior needs room colour. */
+static S32 s_fboHasRoom = 0;
+
 /* The persistent terrain target holds a post-terrain-pass copy of the FBO
    (see SnapshotTerrain/RestoreTerrain). Valid only once a snapshot landed,
    and the restore is a no-op before that so the first AFF_OBJETS frame of a
@@ -781,6 +788,9 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y) {
     }
     s_batchVertCount += 6;
     s_batchTriCount += 2;
+    /* Room colour is now in the target: the body/NZW intake may use the
+       interior half of the FBO-content gate this frame. */
+    s_fboHasRoom = 1;
     return 1;
 }
 
@@ -816,18 +826,21 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
        0-15 already resolve to, at the target's render-scaled resolution.
        Outside the pass — menus' spinning models, holomap, credits — they
        rasterize into the Log, which the present composites over the target,
-       and ShadeBoxBlk keeps real pixels to darken there. Without terrain in
-       the target the Log path stays authoritative, mirroring the NZW rule. */
+       and ShadeBoxBlk keeps real pixels to darken there. Terrain in the
+       target is what exterior bodies depth-test against; interior bodies
+       with GpuScene need only the room colour half of the same gate
+       (s_fboHasRoom), since front-wall re-blits still land in the Log. */
     if (!Fill_Flag_ZBuffer) {
-        if (!Fill_Flag_3DPass || !s_fboHasTerrain) {
+        if (!Fill_Flag_3DPass || !(s_fboHasTerrain || s_fboHasRoom)) {
             return 0;
         }
     }
 
     /* NZW animated polys (flowers, water) take the GPU batch only once the
-       FBO holds valid terrain depth, so they depth-test against it; before
+       FBO holds valid scene content — exterior terrain depth, or interior
+       room colour under GpuScene — so they depth-test against it; before
        that (menus, modal loops) they follow the SW path. */
-    if (Fill_Flag_NZW && !s_fboHasTerrain) {
+    if (Fill_Flag_NZW && !(s_fboHasTerrain || s_fboHasRoom)) {
         return 0;
     }
 
@@ -931,8 +944,10 @@ void GpuRenderer_ClearFBO(void) {
     s_backend->TargetBindClear();
     /* The FBO now holds valid terrain depth for the rest of the frame (and
        stays valid across frames on no-terrain frames — ClearFBO runs at the
-       start of the terrain pass only). */
+       start of the terrain pass only). The clear also wipes room colour, so
+       the interior intake half drops until the next brick quad lands. */
     s_fboHasTerrain = 1;
+    s_fboHasRoom = 0;
 }
 
 void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
@@ -1135,6 +1150,7 @@ S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
     Common_UpdateScreenScale();
     s_active = 1;
     s_fboHasTerrain = 0;
+    s_fboHasRoom = 0;
     /* Context recreate: the backend's brick texture is gone. */
     s_uploadedBrickAtlas = NULL;
 
@@ -1177,6 +1193,7 @@ void GpuRenderer_Shutdown(void) {
     s_backendId = GPU_RENDERER_BACKEND_NONE;
     s_active = 0;
     s_fboHasTerrain = 0;
+    s_fboHasRoom = 0;
     s_terrainValid = 0;
     s_batchVertCount = 0;
     s_batchTriCount = 0;
@@ -1208,6 +1225,7 @@ void GpuRenderer_Resize(U32 resX, U32 resY) {
     /* A different present size invalidates whatever terrain depth the target
        held, and the terrain target is recreated alongside. */
     s_fboHasTerrain = 0;
+    s_fboHasRoom = 0;
     s_terrainValid = 0;
 
     s_backend->TargetDestroy();
@@ -1237,6 +1255,7 @@ void GpuRenderer_SetRenderQuality(U32 quality) {
 
     /* A new render scale rebuilds the target; terrain depth is lost. */
     s_fboHasTerrain = 0;
+    s_fboHasRoom = 0;
     s_terrainValid = 0;
     s_backend->TargetDestroy();
     if (!s_backend->TargetCreate(s_resX * s_renderQuality,

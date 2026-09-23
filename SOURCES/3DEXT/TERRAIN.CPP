@@ -2,6 +2,7 @@
 #include "../PERSO.H"
 
 #include <SVGA/SCREEN.H>
+#include <GPU/GPURENDERER.H> // GpuRenderer_IsActive: exterior Log clear under the GPU hybrid
 
 #define LIMITE_LOIN (60 * 1024)
 #define COLOR_LIMITE 255
@@ -79,9 +80,18 @@ void DrawSkySeaZBuf() {
 /*──────────────────────────────────────────────────────────────────────────*/
 
 void ClsTerrainZBuf() {
-    SetClearColor((U8)FogCoul);
-    Cls();
-    SetClearColor(0);
+    if (GpuRenderer_IsActive()) {
+        /* The GPU target already holds this frame's terrain; only palette
+           index 0 is transparent in the present composite, so a FogCoul fill
+           here would park an opaque overlay over that target. Keep Log at
+           index 0 so the offscreen scene shows through. */
+        SetClearColor(0);
+        Cls();
+    } else {
+        SetClearColor((U8)FogCoul);
+        Cls();
+        SetClearColor(0);
+    }
 
     memset(PtrZBuffer, 255, SIZE_Z_BUFFER); // Clear ZBuffer
 }

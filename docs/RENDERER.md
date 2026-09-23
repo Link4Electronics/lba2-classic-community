@@ -71,18 +71,22 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   NZW before the first terrain pass) body polys still fall back, so the
   software Log supplies what the GPU declines.
 - **3D pass** — while `AffScene` (`../SOURCES/OBJECT.CPP`) displays an
-  exterior body it opens `GpuRenderer_Begin3DPass` / `_End3DPass` around
-  `ObjectDisplay` (and the dart body draw). While open,
-  `GpuRenderer_RenderTriangleList` accepts non-Z-buffered body polys instead
-  of declining them: they batch into the offscreen target with the rules
-  types 0-15 already resolve to — `GEQUAL` depth-test against the terrain,
-  no depth-write, painter order from the software sort — so bodies render at
-  the target's render-scaled resolution and are occluded by terrain directly.
-  `GetZO3`/`GetZO4` (`../LIB386/OBJECT/AFF_OBJ.CPP`) fill the body clip-Z
-  while the pass is open (`Fill_Flag_3DPass`, set only by the renderer, so
-  equivalence tests and every other `ObjectDisplay` caller — menus' spinning
-  models, holomap, credits — keep the software Log path). Interiors never
-  open the pass.
+  exterior body — or, with `GpuScene` on, an interior body — it opens
+  `GpuRenderer_Begin3DPass` / `_End3DPass` around `ObjectDisplay` (and the
+  dart body draw). While open, `GpuRenderer_RenderTriangleList` accepts
+  non-Z-buffered body polys instead of declining them: they batch into the
+  offscreen target with the rules types 0-15 already resolve to — `GEQUAL`
+  depth-test against the terrain (exterior) or the farthest cleared depth
+  (interior: `TYPE_ISO` leaves `Pt_ZO` alone, front-wall re-blits still land
+  in the Log), no depth-write, painter order from the software sort — so
+  bodies render at the target's render-scaled resolution. The intake gate
+  keys on FBO content: `s_fboHasTerrain` (exterior terrain depth, armed by
+  `GpuRenderer_ClearFBO`) or its interior sibling `s_fboHasRoom` (set when
+  `GpuRenderer_DrawBrick` enqueues a room quad). `GetZO3`/`GetZO4`
+  (`../LIB386/OBJECT/AFF_OBJ.CPP`) fill the body clip-Z while the pass is
+  open (`Fill_Flag_3DPass`, set only by the renderer, so equivalence tests
+  and every other `ObjectDisplay` caller — menus' spinning models, holomap,
+  credits — keep the software Log path).
 - **Present seam** — `PresentFrame` (`../LIB386/SVGA/SDL.CPP`) hands its Log
   ARGB overlay to the renderer (`SetGpuPresentHooks`, default NULL) instead of
   the SDL streaming texture while a backend is active; the renderer composites
@@ -112,21 +116,35 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   `D16_UNORM` depth texture, reverses its top-down rows to the bottom-up order
   the common layer expects, and converts the depth to the GL window-depth
   convention the common aZ inverse expects.
-- **Terrain snapshot/restore** — a camera cut (`AFF_OBJETS` in `AffScene`,
-  `../SOURCES/OBJECT.CPP`) redraws only the flagged bodies and never the
-  terrain; the offscreen target keeps the previous frame's colour and depth so
-  the scene does not wipe to black, but that also keeps the previous frame's
-  shadow spans and NZW animated polys, which re-stamp the same pixels into
-  trails — `BoxClean` restores only the `Log` buffer. At the end of the
-  exterior terrain pass `GpuRenderer_SnapshotTerrain` copies the whole target
-  into a persistent terrain target; at the head of each `AFF_OBJETS` exterior
-  frame `GpuRenderer_RestoreTerrain` repaints it, before `DrawAnimatedPolys`
-  (so that frame's animated polys land over the scrubbed terrain, mirroring
-  software `BoxClean` + `DrawAnimatedPolys`), erasing the trails before the
-  flagged-body pass draws. Depth is never written between the two calls — the
-  NZW, shadow and body paths have depth-write off — so the restore repaints
-  colour only and the `GEQUAL` depth tests keep working. Both are gated on the backend
-  being active and `CubeMode == CUBE_EXTERIEUR`. GL stores the copy with
+- **Exterior Log clear** — software `ClsTerrainZBuf`
+  (`../SOURCES/3DEXT/TERRAIN.CPP`) fills `Log` with `FogCoul` so sky gaps show
+  the fog colour. With a GPU backend active the terrain lives in the offscreen
+  target, and only palette index 0 is transparent in the present composite:
+  a `FogCoul` fill would paint an opaque overlay over that target and hide the
+  3D scene. The same routine therefore clears `Log` to index 0 while a backend
+  is live, so the composite shows the GPU frame (HUD and sprites drawn into
+  `Log` afterward still paint over it).
+- **Terrain/room snapshot/restore** — a camera cut (`AFF_OBJETS` in
+  `AffScene`, `../SOURCES/OBJECT.CPP`) redraws only the flagged bodies and
+  never the terrain (or, with `GpuScene`, the room); the offscreen target
+  keeps the previous frame's colour and depth so the scene does not wipe to
+  black, but that also keeps the previous frame's shadow spans, NZW animated
+  polys and body paint, which re-stamp the same pixels into trails —
+  `BoxClean` restores only the `Log` buffer. At the end of the exterior
+  terrain pass — or, with `GpuScene`, the interior room pass —
+  `GpuRenderer_SnapshotTerrain` copies the whole target into a persistent
+  terrain target; at the head of each `AFF_OBJETS` frame under the same gate
+  `GpuRenderer_RestoreTerrain` repaints it, before `DrawAnimatedPolys`
+  (exterior: so that frame's animated polys land over the scrubbed terrain,
+  mirroring software `BoxClean` + `DrawAnimatedPolys`; interior: no
+  `DrawAnimatedPolys` — that path is exterior NZW), erasing the trails
+  before the flagged-body pass draws. Depth is never written between the two
+  calls — the NZW, shadow and body paths have depth-write off — so the
+  restore repaints colour only and the `GEQUAL` depth tests keep working.
+  Both are gated on the backend being active, and on
+  `CubeMode == CUBE_EXTERIEUR` or (`GpuScene` and `CubeMode ==
+  CUBE_INTERIEUR`). No `ReadbackDepthBuffer` runs for the interior: its
+  depth stays on the CPU in `PtrZBuffer`. GL stores the copy with
   `glCopyTexSubImage2D` (colour + depth textures); SDL3 GPU replays it with
   texture-to-texture copies in one copy pass (`SDL_CopyGPUTextureToTexture`).
 - **Scene shadows** — the software path darkens `Log` through `ShadeBoxBlk`
@@ -170,10 +188,13 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   backend samples that page through `uAtlas` when polyMode is 7
   (`TexUpdateBricks` on the vtable; GL uses LUMINANCE_ALPHA, SDL3 GPU
   uses R8G8_UNORM). `InitGrille` calls `GpuRenderer_SetBrickBank` after
-  `LoadUsedBrick`; `FreeGrille` passes NULL. With the flag off, or on the
-  software path, every hook falls through to `AffGraph` unchanged.
-  `DrawOverBrick`, `CopyMask`, Z-masks, bodies, sprites and HUD stay in
-  the Log (see GPU_SCENE_PLAN.md phases 2–3).
+  `LoadUsedBrick`; `FreeGrille` passes NULL. Successful enqueues arm
+  `s_fboHasRoom` (cleared by `GpuRenderer_ClearFBO` and the lifecycle
+  resets), the interior half of the body/NZW intake gate. With the flag
+  off, or on the software path, every hook falls through to `AffGraph`
+  unchanged. With the flag on, interior bodies and the 3D pass join the
+  FBO (see 3D pass above); `DrawOverBrick`, `CopyMask`, Z-masks, sprites
+  and HUD stay in the Log (see GPU_SCENE_PLAN.md phase 3).
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
