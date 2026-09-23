@@ -106,13 +106,9 @@ S32 FlagShowEndDemo = FALSE;
 // map back to s_resMenuEntries[i]. DISPLAY_MENU_MAX_ENTRIES ids reserved.
 #define MENU_ID_RESOLUTION_BASE 2200
 
-// Renderer sub-page rows occupy their own reserved id range, past the
-// resolution one: row i carries id MENU_ID_RENDERER_BASE + i, mapped back to
-// s_rendererChoices[i] (one GpuRendererBackendId per choice).
-#define MENU_ID_RENDERER_BASE 2300
-
 #define MENU_TYPE_TEXT_LANGUAGE 8
 #define MENU_TYPE_VOICE_LANGUAGE 9
+#define MENU_TYPE_RENDERER 10
 
 char NewGameTxt[MULTI_TEXT_MAX];
 
@@ -176,20 +172,24 @@ static DisplayEntry s_resMenuEntries[DISPLAY_MENU_MAX_ENTRIES];
 static S32 s_resMenuCount;
 static U16 ResolutionMenu[4 + (1 + DISPLAY_MENU_MAX_ENTRIES) * 2];
 
-// Renderer sub-page: a "Back" row plus one row per render backend. The row ids
-// in MENU_ID_RENDERER_BASE..+2 map back to s_rendererChoices[row]; the labels
-// come from MENU_LABEL_RENDERER_* (per-choice, so "Renderer: OpenGL/ES" reads
-// in the Display sub-menu too). See GereRendererMenu + BuildCustomMenuText.
+// Render backends the Display submenu's Renderer row cycles through, in
+// cfg-id order (Software, OpenGL, SDL3 GPU); the row's value label comes from
+// MENU_LABEL_RENDERER_* via RendererChoiceLabel. See CycleRendererChoice.
 #define RENDERER_CHOICE_COUNT 3
 static const GpuRendererBackendId s_rendererChoices[RENDERER_CHOICE_COUNT] = {
     GPU_RENDERER_BACKEND_NONE,
     GPU_RENDERER_BACKEND_OPENGL,
     GPU_RENDERER_BACKEND_SDL3GPU,
 };
-static U16 RendererMenu[4 + (1 + RENDERER_CHOICE_COUNT) * 2];
+// Index into s_rendererChoices of the last choice the player stepped to; -1
+// until first use (then resolved from the live backend). A choice that fails
+// to start falls back to software, so re-deriving the step base from the live
+// backend would pin every further step on the failing pair and make the
+// choices past it unreachable by cycling.
+static S32 s_rendererCycleIdx = -1;
 
-// The menu label naming a render backend — shared by the Display-submenu row
-// (a "Renderer: <label>" value) and the renderer sub-page rows.
+// The menu label naming a render backend — the value shown in the Display
+// submenu's "Renderer: <label>" row.
 static MenuLocalizedLabel RendererChoiceLabel(GpuRendererBackendId id) {
     switch (id) {
     case GPU_RENDERER_BACKEND_OPENGL:
@@ -235,10 +235,10 @@ static S32 NextRenderQuality(S32 quality) {
 // A file-static rather than a per-row flag in the menu array: the U16 (type,id)
 // menu format has no spare per-row slot, and growing it for a single marker
 // isn't worth touching every menu. The contract instead: only the resolution
-// and renderer sub-pages set this (BuildResolutionMenu, BuildRendererMenu),
-// and it is cleared back to -1 on every exit path (GereResolutionMenu,
-// GereRendererMenu, Resolution_MainCapture), paired with s_resMenuCount = 0,
-// so no other menu can render a marker. See DrawOneChoice's select bitmask.
+// sub-page sets this (BuildResolutionMenu), and it is cleared back to -1 on
+// every exit path (GereResolutionMenu, Resolution_MainCapture), paired with
+// s_resMenuCount = 0, so no other menu can render a marker. See DrawOneChoice's
+// select bitmask.
 static S32 s_menuMarkRow = -1;
 
 // Controller submenu: split keyboard remap and gamepad remap under one parent
@@ -457,14 +457,6 @@ static void BuildCustomMenuText(S32 num, char *string) {
         return;
     }
 
-    // Renderer sub-page rows: id in the reserved range maps to one of the
-    // fixed backend choices (s_rendererChoices is static, so no count gate).
-    if (num >= MENU_ID_RENDERER_BASE &&
-        num < MENU_ID_RENDERER_BASE + RENDERER_CHOICE_COUNT) {
-        CopyUtf8ToCp850(string, 256, GetLocalizedMenuLabel(RendererChoiceLabel(s_rendererChoices[num - MENU_ID_RENDERER_BASE])));
-        return;
-    }
-
     switch (num) {
     case MENU_ID_SOUND_VOLUME:
         GetMultiText(11, string);
@@ -671,6 +663,34 @@ static void ApplyRendererChoice(GpuRendererBackendId id) {
         WriteConfigFile();
     }
     RepaintMenuBackdrop();
+}
+
+static void BuildDisplayMenu(void);
+
+// Step the Display submenu's Renderer row through s_rendererChoices (Enter and
+// Right step forward, Left steps back). Applies the choice through the shared
+// switch path — a failed start falls back to software — and rebuilds the row
+// list, because the Quality row exists only while a GPU backend is live.
+static void CycleRendererChoice(S32 step) {
+    if (s_rendererCycleIdx < 0) {
+        const GpuRendererBackendId active = GpuRenderer_ActiveBackend();
+        s_rendererCycleIdx = 0;
+        for (S32 i = 0; i < RENDERER_CHOICE_COUNT; i++) {
+            if (s_rendererChoices[i] == active) {
+                s_rendererCycleIdx = i;
+                break;
+            }
+        }
+    }
+
+    s_rendererCycleIdx += step;
+    while (s_rendererCycleIdx >= RENDERER_CHOICE_COUNT)
+        s_rendererCycleIdx -= RENDERER_CHOICE_COUNT;
+    while (s_rendererCycleIdx < 0)
+        s_rendererCycleIdx += RENDERER_CHOICE_COUNT;
+
+    ApplyRendererChoice(s_rendererChoices[s_rendererCycleIdx]);
+    BuildDisplayMenu();
 }
 
 #ifdef CDROM
@@ -2619,6 +2639,17 @@ static void GameMenuApplyMouseWheelDoGameMenu(U16 *ptrmenu, S16 selected, S32 wy
             break;
 #endif
 
+        case MENU_TYPE_RENDERER:
+            if (dir < 0)
+                CycleRendererChoice(-1);
+            else
+                CycleRendererChoice(1);
+            *flag = 1;
+            InitWaitNoInput(dir < 0 ? I_LEFT : I_RIGHT);
+            InitWaitNoKey();
+            applied = 1;
+            break;
+
         default:
             break;
         }
@@ -2989,6 +3020,22 @@ S32 DoGameMenu(U16 *ptrmenu) {
             }
             break;
 #endif
+
+        case MENU_TYPE_RENDERER:
+            if (Input & I_LEFT OR MyKey == K_GRAY_LEFT) {
+                CycleRendererChoice(-1);
+                flag = 1;
+                InitWaitNoInput(I_LEFT);
+                InitWaitNoKey();
+            }
+
+            if (Input & I_RIGHT OR MyKey == K_GRAY_RIGHT) {
+                CycleRendererChoice(1);
+                flag = 1;
+                InitWaitNoInput(I_RIGHT);
+                InitWaitNoKey();
+            }
+            break;
         }
 
         if (FlagMenuMouse && MenuMouse_GetRefCount() > 0) {
@@ -2997,6 +3044,14 @@ S32 DoGameMenu(U16 *ptrmenu) {
             if (wy != 0)
                 GameMenuApplyMouseWheelDoGameMenu(ptrmenu, selected, wy, &timerkey, &flag);
         }
+
+        // CycleRendererChoice rebuilds the Display menu in place (the Quality
+        // row appears with a GPU backend and disappears on software): re-read
+        // the count and clamp the cursor so the redraw below and the Enter
+        // return further down see the rebuilt rows, not the ones entry cached.
+        nb = ptrmenu[1];
+        if (nb > 0 && selected >= nb)
+            selected = (S16)(nb - 1);
 
         if (flag == 1) {
             InitShakeChoice(); //     NEW
@@ -3248,7 +3303,6 @@ S32 GereLanguageMenu(void) {
 /*──────────────────────────────────────────────────────────────────────────*/
 
 static void BuildResolutionMenu(void); /* defined below, near GereResolutionMenu */
-static void BuildRendererMenu(void);   /* defined below, near GereRendererMenu */
 static void BuildDisplayMenu(void);    /* defined below, near GereDisplayMenu */
 
 // Harness one-shot capture of the Display submenu. Mirrors
@@ -3390,38 +3444,6 @@ static S32 GereResolutionMenu(void) {
     return FALSE;
 }
 
-// The renderer sub-page is a fixed one-row-per-backend list, so unlike the
-// resolution one it is not built from a catalog: its rows are the static
-// s_rendererChoices above, in cfg-id order (Software, OpenGL, SDL3 GPU). Cursor
-// lands on (and the green marker flags) whichever backend is live. See
-// GereRendererMenu + BuildCustomMenuText.
-static void BuildRendererMenu(void) {
-    RendererMenu[1] = (U16)(1 + RENDERER_CHOICE_COUNT);
-    RendererMenu[2] = 260;
-    RendererMenu[3] = 0;
-    MenuSetEntry(RendererMenu, 0, 0, 26); /* Back */
-    for (S32 i = 0; i < RENDERER_CHOICE_COUNT; i++)
-        MenuSetEntry(RendererMenu, 1 + i, 0, (U16)(MENU_ID_RENDERER_BASE + i));
-
-    const GpuRendererBackendId active = GpuRenderer_ActiveBackend();
-    S32 cur = -1;
-    for (S32 i = 0; i < RENDERER_CHOICE_COUNT; i++) {
-        if (s_rendererChoices[i] == active) {
-            cur = i;
-            break;
-        }
-    }
-    /* Cursor on the live backend when there is one (software rows down to
-       the first), green marker on it so it stays flagged once the cursor
-       moves, mirroring BuildResolutionMenu. No live backend (never init'd)
-       means software is the presentation path anyway, so the first row is
-       both the cursor and the marker. */
-    if (cur < 0)
-        cur = 0;
-    RendererMenu[0] = (U16)(1 + cur);
-    s_menuMarkRow = 1 + cur;
-}
-
 // Assemble the Display submenu rows for the current state: Back, Resolution,
 // Renderer, Bilinear, then Quality (only while a GPU backend is live — the
 // software rasterizer has no scale to tier), then Vsync and Fullscreen (only
@@ -3435,7 +3457,7 @@ static void BuildDisplayMenu(void) {
 
     MenuSetEntry(DisplayMenu, row++, 0, 26); /* Back */
     MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_RESOLUTION);
-    MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_RENDERER);
+    MenuSetEntry(DisplayMenu, row++, MENU_TYPE_RENDERER, MENU_ID_RENDERER);
     MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_DISPLAY_BILINEAR);
     if (GpuRenderer_ActiveBackend() != GPU_RENDERER_BACKEND_NONE)
         MenuSetEntry(DisplayMenu, row++, 0, MENU_ID_DISPLAY_QUALITY);
@@ -3449,57 +3471,13 @@ static void BuildDisplayMenu(void) {
         DisplayMenu[0] = (U16)(row - 1);
 }
 
-// Renderer sub-page, opened from the Display submenu's Renderer row. Picking a
-// row switches the live present path immediately (ApplyRendererChoice: the
-// software fallback on a failed start keeps a path rendering), keeps the list
-// open so the player can pick again or back out, then re-draws the backdrop on
-// the recreated window and moves the green marker to the now-live backend.
-// On a GL or SDL3 GPU frame the menu itself is only visible when that backend
-// can draw it, which is the point of testing the switch from here.
-static S32 GereRendererMenu(void) {
-    S32 select;
-    S32 flag = 0;
-
-    BuildRendererMenu();
-
-    CopyScreen(Screen, Log);
-    BoxStaticAdd(0, 0, ModeDesiredX - 1, ModeDesiredY - 1);
-
-    if (FlagShadeMenu) {
-        ShadeBoxBlk(0, 0, (S32)ModeDesiredX - 1, (S32)ModeDesiredY - 1, SCREEN_SHADE_LVL);
-    }
-
-    while (!flag) {
-        select = DoGameMenu(RendererMenu);
-
-        if (select == 26 || select == 1000) {
-            flag = 1;
-        } else if (select >= MENU_ID_RENDERER_BASE &&
-                   select < MENU_ID_RENDERER_BASE + RENDERER_CHOICE_COUNT) {
-            ApplyRendererChoice(s_rendererChoices[select - MENU_ID_RENDERER_BASE]);
-            /* Rebuild so the cursor and green marker land on whatever backend
-               came out actually live (a failed start falls back to software —
-               never the row the player picked). */
-            BuildRendererMenu();
-        }
-    }
-
-    // Clear the sub-page-local marker the BuildRendererMenu guard set, so no
-    // other menu renders the green "active value" row.
-    s_menuMarkRow = -1;
-
-    CopyScreen(Screen, Log);
-    BoxStaticAdd(0, 0, ModeDesiredX - 1, ModeDesiredY - 1);
-
-    WaitNoInput();
-
-    return FALSE;
-}
 // Display submenu: a self-contained submenu of OptionsMenu. The "Resolution:
-// <current>" row opens GereResolutionMenu, the "Renderer: <backend>" row opens
-// GereRendererMenu; Bilinear and Vsync and Fullscreen are toggles/cycles. Rows
-// are assembled at entry (BuildDisplayMenu) because Quality only exists while
-// a GPU backend is live and Fullscreen only where windowed mode exists.
+// <current>" row opens GereResolutionMenu, the "Renderer: <backend>" row steps
+// the live backend in place (Enter forward, Left/Right both ways from inside
+// DoGameMenu — CycleRendererChoice); Bilinear and Vsync and Fullscreen are
+// toggles/cycles. Rows are assembled at entry (BuildDisplayMenu) because
+// Quality only exists while a GPU backend is live and Fullscreen only where
+// windowed mode exists.
 S32 GereDisplayMenu(void) {
     S32 select;
     S32 flag = 0;
@@ -3528,11 +3506,10 @@ S32 GereDisplayMenu(void) {
             break;
 
         case MENU_ID_RENDERER:
-            // Open the render backend sub-page.
-            GereRendererMenu();
-            /* The backend may have changed (or fallen back to software), so the
-               Quality row's existence and every row's value have to follow. */
-            BuildDisplayMenu();
+            // Step forward through the backends in place (Right does the same
+            // from inside DoGameMenu). The helper rebuilds the rows because
+            // the Quality row's existence depends on the live backend.
+            CycleRendererChoice(1);
             break;
 
         case MENU_ID_DISPLAY_BILINEAR:
