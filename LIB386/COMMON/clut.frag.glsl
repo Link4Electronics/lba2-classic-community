@@ -183,12 +183,13 @@ void main() {
             level/15 under the alpha blend reproduces that as dst*(1-alpha). */
         color = vec4(0.0, 0.0, 0.0, uFlatColor);
     } else if (uPolyMode == 7) {
-        /* Brick atlas (GpuScene): R8G8 page, R = palette index, G = valid.
-           AffGraph RLE skips leave G = 0 so the fragment is discarded and
-           the FBO keeps whatever was there. NEAREST only. The valid byte is
-           0 or 1 (not 0 or 255), so after UNORM normalize the flag is 0.0
-           or 1/255 — compare against half a step, not 0.5, or every brick
-           discards. */
+        /* Brick or sprite atlas (GpuScene): R8G8 page, R = palette index,
+            G = valid. AffGraph RLE skips and raw color-0 leave G = 0 so the
+            fragment is discarded and the FBO keeps whatever was there. The
+            backend binds the brick or sprite page and feeds its size as
+            uBrickSize. NEAREST only. The valid byte is 0 or 1 (not 0 or
+            255), so after UNORM normalize the flag is 0.0 or 1/255 —
+            compare against half a step, not 0.5, or every brick discards. */
         vec2 uv = vTexCoord / vec2(uBrickW, uBrickH);
         vec2 t = texture(uAtlas, uv).rg;
         if (t.y < (0.5 / 255.0)) discard;
@@ -385,12 +386,13 @@ void main() {
             level/15 under the alpha blend reproduces that as dst*(1-alpha). */
         color = vec4(0.0, 0.0, 0.0, uFlatColor);
     } else if (uPolyMode == 7) {
-        /* Brick atlas (GpuScene): R8G8 page, R = palette index, G = valid.
-           AffGraph RLE skips leave G = 0 so the fragment is discarded and
-           the FBO keeps whatever was there. NEAREST only. The valid byte is
-           0 or 1 (not 0 or 255), so after UNORM normalize the flag is 0.0
-           or 1/255 — compare against half a step, not 0.5, or every brick
-           discards. */
+        /* Brick or sprite atlas (GpuScene): R8G8 page, R = palette index,
+            G = valid. AffGraph RLE skips and raw color-0 leave G = 0 so the
+            fragment is discarded and the FBO keeps whatever was there. The
+            backend binds the brick or sprite page and feeds its size as
+            uBrickSize. NEAREST only. The valid byte is 0 or 1 (not 0 or
+            255), so after UNORM normalize the flag is 0.0 or 1/255 —
+            compare against half a step, not 0.5, or every brick discards. */
         vec2 uv = vTexCoord / vec2(uBrickW, uBrickH);
         vec2 t = texture2D(uAtlas, uv).rg;
         if (t.y < (0.5 / 255.0)) discard;

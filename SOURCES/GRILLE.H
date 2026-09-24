@@ -118,6 +118,11 @@ extern void AffBrickBlockOnly(S32 block, S32 brick, S16 x, S16 y, S16 z);
 extern void AffGrilleLabyrinthe(void);
 
 //-------------------------------------------------------------------
+// Rebuild Screen as the interior re-blit plate under GpuScene, then clear
+// Log for the overlay present. Call only when GpuRenderer_IsSceneInterior().
+extern void AffGrille_BuildScreenPlate(void);
+
+//-------------------------------------------------------------------
 extern void AffOneBrick(S32 x, S32 y, S32 z);
 
 //-------------------------------------------------------------------

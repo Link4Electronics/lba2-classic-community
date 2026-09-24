@@ -53,6 +53,18 @@ void GpuRenderer_ClearFBO(void);
 // gaps match the software ClsTerrainZBuf fill; 0 elsewhere). Applied on the
 // next ClearFBO; the RGB is resolved from the live paletteLUT at that time.
 void GpuRenderer_SetSceneClearIndex(U8 index);
+// Interior vs exterior for this scene: set from CubeMode at the terrain pass
+// (RefreshGrille, beside SetSceneClearIndex). Interior arms brick GEQUAL
+// depth-write and forces body/NZW batches to no-depth (their TYPE_ISO ZO is
+// untouched); exterior keeps the terrain-only scheme. Sticky across
+// AFF_OBJETS frames; flushed if it changes mid-batch.
+void GpuRenderer_SetSceneInterior(S32 interior);
+// TRUE while the interior room lives in the FBO: backend active, GpuScene on,
+// and the last SetSceneInterior mark was interior. Callers keep Log a
+// transparent overlay under this rule (BoxClean clears rather than restores
+// Screen) and rebuild the Screen re-blit plate AffGraph/CopyMask expect on
+// AFF_ALL frames. Always false with the flag off or no backend.
+S32  GpuRenderer_IsSceneInterior(void);
 void GpuRenderer_FlushBatch(void);
 void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
                          U32 height, S32 filterLinear);
@@ -115,9 +127,44 @@ void GpuRenderer_ShadowEnd(void);
 // BufferBrick bank over (NULL on FreeGrille); DrawBrick submits one brick
 // as a screen-space textured quad and returns TRUE when consumed — FALSE
 // leaves the caller on the software AffGraph path (flag off, no backend,
-// pack failure, out-of-range index).
+// pack failure, out-of-range index). zo is the brick's iso view depth
+// (GpuRenderer_IsoWorldZO) stamped on all six vertices; it is written even
+// when the interior mark is off, so the vertex layout stays constant.
 void GpuRenderer_SetBrickBank(const void *bank);
-S32  GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y);
+S32  GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo);
+
+// Opaque world sprites (GpuScene phase 3). DrawSprite packs one sprite from
+// bank into the sprite RG8 atlas (R = palette index, G = valid; transparent
+// pixels and AffGraph RLE skips leave G = 0 so the shader discards) and
+// submits a screen-space quad. rawFormat 0 is the AffGraph/SPRITES.HQR RLE
+// layout; 1 is the ScaleSprite/SPRIRAW.HQR raw-pixel layout (1:1 only —
+// callers with factor != 65536 stay on the software blitter). zo is stamped
+// on all six vertices and only exterior depth-tests it (GET_ZO of the
+// camera-relative clip-Z); interior takes no depth-test — AffGraph never
+// Z-tests and DrawRecover3 owns front-wall occlusion. Returns TRUE when
+// consumed — FALSE leaves the caller on the software AffGraph / ScaleSprite
+// path (flag off, no backend, pack failure, out-of-range index). On success
+// the clipped sprite rect in Log is punched to palette index 0 so the
+// present composite shows the FBO quad through the overlay hole.
+S32  GpuRenderer_DrawSprite(S32 spriteIdx, S32 x, S32 y, U16 zo,
+                            const void *bank, S32 rawFormat);
+
+// Interior iso view depth. Map2Screen's ground axis is (x+z): larger is
+// nearer on screen, so invert into aZ (smaller is nearer under GEQUAL with
+// the depth clear at 0) and clamp the S16 grid sum to the 16-bit field.
+// y is screen-vertical only and does not enter the depth. Pure and
+// header-only so host tests can exercise the whole domain.
+static inline U16 GpuRenderer_IsoWorldZO(S32 x, S32 y, S32 z) {
+    S32 n = x + z;
+    (void)y;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > 65535) {
+        n = 65535;
+    }
+    return (U16)(65535 - n);
+}
 
 // Terrain persistence for static-camera (AFF_OBJETS) frames. A camera cut
 // redraws only the flagged bodies, never the terrain; the offscreen target

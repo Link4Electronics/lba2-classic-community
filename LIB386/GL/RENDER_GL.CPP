@@ -369,6 +369,9 @@ static GLuint s_paletteTex = 0; /* 256×1 BGRA */
 static GLuint s_brickTex = 0;   /* brick atlas, LUMINANCE_ALPHA (GpuScene) */
 static U32 s_brickTexW = 0;
 static U32 s_brickTexH = 0;
+static GLuint s_spriteTex = 0;  /* sprite atlas, LUMINANCE_ALPHA (GpuScene) */
+static U32 s_spriteTexW = 0;
+static U32 s_spriteTexH = 0;
 
 /* ── GL state — batch VBO ───────────────────────────────────────────────── */
 
@@ -729,6 +732,12 @@ static void GL_DestroyContext(void) {
         s_brickTexW = 0;
         s_brickTexH = 0;
     }
+    if (s_spriteTex) {
+        glDeleteTextures(1, &s_spriteTex);
+        s_spriteTex = 0;
+        s_spriteTexW = 0;
+        s_spriteTexH = 0;
+    }
     if (s_vbo) {
         glDeleteBuffers(1, &s_vbo);
         s_vbo = 0;
@@ -1017,6 +1026,38 @@ static void GL_TexUpdateBricks(const void *rg, U32 width, U32 height) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
+/* Sprite atlas: same LUMINANCE_ALPHA layout as the brick page, separate
+   texture so a frame can hold both a room and its sprites. */
+static void GL_TexUpdateSprites(const void *rg, U32 width, U32 height) {
+    if (rg == NULL || width == 0 || height == 0) {
+        return;
+    }
+    if (!Window_GLMakeCurrent()) {
+        Log_Warn("[GL] TexUpdateSprites: no context");
+        return;
+    }
+    if (s_spriteTex == 0) {
+        glGenTextures(1, &s_spriteTex);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_spriteTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (s_spriteTexW != width || s_spriteTexH != height) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei)width,
+                     (GLsizei)height, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                     rg);
+        s_spriteTexW = width;
+        s_spriteTexH = height;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width,
+                        (GLsizei)height, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                        rg);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
 static void GL_TexUpdatePresent(const void *argb, U32 pitch, U32 width,
                                 U32 height, S32 linear) {
     if (argb == NULL) {
@@ -1102,8 +1143,13 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     glUniform1f(s_clut_uScaledFogNear, params->scaledFogNear);
     glUniform1f(s_clut_uFogRowScale, params->fogRowScale);
     if (params->polyMode == 7) {
-        glUniform2f(s_clut_uBrickSize, (float)s_brickTexW,
-                    (float)s_brickTexH);
+        if (params->spriteAtlas) {
+            glUniform2f(s_clut_uBrickSize, (float)s_spriteTexW,
+                        (float)s_spriteTexH);
+        } else {
+            glUniform2f(s_clut_uBrickSize, (float)s_brickTexW,
+                        (float)s_brickTexH);
+        }
     }
 
     /* TRANS/TRAME (blend) batches alpha-blend; everything else is opaque.
@@ -1116,11 +1162,15 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
         glDisable(GL_BLEND);
     }
 
-    /* Bind textures to units 0/1/2. Mode 7 samples the brick atlas through
-       uAtlas; every other mode samples the 256×256 page. */
+    /* Bind textures to units 0/1/2. Mode 7 samples the brick or sprite
+       RG8 page through uAtlas; every other mode samples the 256×256 page. */
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D,
-                  (params->polyMode == 7) ? s_brickTex : s_atlasTex);
+    if (params->polyMode == 7) {
+        glBindTexture(GL_TEXTURE_2D,
+                      params->spriteAtlas ? s_spriteTex : s_brickTex);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, s_atlasTex);
+    }
     glUniform1i(s_clut_uAtlas, 0);
 
     glActiveTexture(GL_TEXTURE1);
@@ -1376,6 +1426,7 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_TexUpdateCLUT,
     GL_TexUpdatePalette,
     GL_TexUpdateBricks,
+    GL_TexUpdateSprites,
     GL_DrawTriangles,
     GL_ClearBackbuffer,
     GL_DrawPresentQuad,

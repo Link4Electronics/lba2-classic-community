@@ -14,7 +14,7 @@
 
 #include "C_EXTERN.H"
 
-#include <GPU/GPURENDERER.H> // GpuRenderer_ClearFBO: terrain-pass frame boundary
+#include <GPU/GPURENDERER.H> // ClearFBO + scene interior mark: terrain-pass frame boundary
 
 extern T_OBJET *APtObj; // dans OBJECT.CPP
 
@@ -147,6 +147,7 @@ void RefreshGrille() {
        Cls fill; interior keeps the SW default (palette 0). */
     GpuRenderer_SetSceneClearIndex(
         (U8)((CubeMode == CUBE_EXTERIEUR) ? FogCoul : 0));
+    GpuRenderer_SetSceneInterior(CubeMode == CUBE_INTERIEUR);
     GpuRenderer_ClearFBO();
 
 #ifdef LBA_EDITOR

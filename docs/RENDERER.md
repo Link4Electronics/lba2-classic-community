@@ -73,12 +73,14 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
 - **3D pass** — while `AffScene` (`../SOURCES/OBJECT.CPP`) displays an
   exterior body — or, with `GpuScene` on, an interior body — it opens
   `GpuRenderer_Begin3DPass` / `_End3DPass` around `ObjectDisplay` (and the
-  dart body draw). While open, `GpuRenderer_RenderTriangleList` accepts
+  dart body draw). While open,   `GpuRenderer_RenderTriangleList` accepts
   non-Z-buffered body polys instead of declining them: they batch into the
   offscreen target with the rules types 0-15 already resolve to — `GEQUAL`
-  depth-test against the terrain (exterior) or the farthest cleared depth
-  (interior: `TYPE_ISO` leaves `Pt_ZO` alone, front-wall re-blits still land
-  in the Log), no depth-write, painter order from the software sort — so
+  depth-test against the terrain (exterior) or, interior under `GpuScene`,
+  no depth at all (`GpuRenderer_SetSceneInterior` forces depth-test/write
+  off because `TYPE_ISO` leaves `Pt_ZO` alone and would otherwise
+  GEQUAL-test garbage against brick-written depth; front-wall re-blits still
+  land in the Log), no depth-write, painter order from the software sort — so
   bodies render at the target's render-scaled resolution. The intake gate
   keys on FBO content: `s_fboHasTerrain` (exterior terrain depth, armed by
   `GpuRenderer_ClearFBO`) or its interior sibling `s_fboHasRoom` (set when
@@ -198,17 +200,59 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   `GpuRenderer_DrawBrick`: COMMON shelf-packs the cube's `BufferBrick`
   bank into one RG8 page (R = palette index, G = valid; AffGraph RLE skips
   leave G = 0 so the shader discards and the FBO keeps what was there),
-  batches quads as polyMode 7 (nearest, no depth, no light), and each
+  batches quads as polyMode 7 (nearest, no light), and each
   backend samples that page through `uAtlas` when polyMode is 7
   (`TexUpdateBricks` on the vtable; GL uses LUMINANCE_ALPHA, SDL3 GPU
-  uses R8G8_UNORM). `InitGrille` calls `GpuRenderer_SetBrickBank` after
+  uses R8G8_UNORM). Each quad carries `GpuRenderer_IsoWorldZO(x,y,z)` —
+  the fixed iso camera's `x+z` depth axis inverted into aZ — on all six
+  vertices; while `GpuRenderer_SetSceneInterior` marks the cube interior
+  (set from `CubeMode` in `RefreshGrille` beside the scene clear index),
+  those quads depth-test `GEQUAL` and depth-write, so the nearer brick
+  wins regardless of grid draw order and later sprites can test against
+  the nearest room surface. Interior body/NZW batches under the same mark
+  force depth-test and depth-write off (`TYPE_ISO` leaves `Pt_ZO`
+  untouched; front-wall Log re-blits remain the only body occlusion).
+  Exterior keeps the terrain-only depth scheme and never draws brick
+  quads. `InitGrille` calls `GpuRenderer_SetBrickBank` after
   `LoadUsedBrick`; `FreeGrille` passes NULL. Successful enqueues arm
   `s_fboHasRoom` (cleared by `GpuRenderer_ClearFBO` and the lifecycle
   resets), the interior half of the body/NZW intake gate. With the flag
   off, or on the software path, every hook falls through to `AffGraph`
   unchanged. With the flag on, interior bodies and the 3D pass join the
-  FBO (see 3D pass above); `DrawOverBrick`, `CopyMask`, Z-masks, sprites
-  and HUD stay in the Log (see GPU_SCENE_PLAN.md phase 3).
+  FBO (see 3D pass above); `DrawOverBrick`, `CopyMask`, Z-masks, HUD and
+  blend/scaled sprites stay in the Log.
+
+  Two Log/Screen rules keep that split correct. `CopyMask` re-blits wall
+  pixels **from `Screen`**, but with the flag on `Cls` leaves `Log` empty
+  and `RefreshGrille` paints only the FBO — so on `AFF_ALL` frames
+  `GpuRenderer_IsSceneInterior()` (`AffGrille_BuildScreenPlate` in
+  `../SOURCES/GRILLE.CPP`) runs one software `AffGraph` pass into `Log`
+  (forcing `s_swPlateBricks` so no second FBO batch is submitted),
+  snapshots it to `Screen`, then clears `Log` to 0 for the overlay.
+  And `BoxClean` / `DefaultBoxOneClean` restores `Screen`→`Log` by
+  default, which would paint the room plate over FBO bodies in the dirty
+  regions — `AffScene` sets `BoxOneClean` to `DefaultBoxOneClear`
+  (clear to 0) under the same interior rule, back to the default
+  otherwise, so mid-dialog `BoxClean` callers inherit it. Both rules
+  are dead with the flag off.
+
+- **`GpuScene` and opaque world sprites.** With the flag on, the three
+  world-sprite sites in `AffOneObject` (`../SOURCES/OBJECT.CPP` —
+  `TYPE_OBJ_SPRITE`, `TYPE_OBJ_ANIM_3DS`, and the opaque branch of
+  `TYPE_EXTRA`) try `GpuRenderer_DrawSprite` first: COMMON shelf-packs
+  that HQR entry into a separate RG8 page (same layout as the brick atlas;
+  raw sprites encode color 0 as G = 0) and submits a polyMode-7 quad with
+  `spriteAtlas = 1`, so the backend binds the sprite texture through
+  `TexUpdateSprites`. Interior quads take no depth-test/write — software
+  `AffGraph` never Z-tests, iso floor tiles under a standing sprite would
+  fail `GEQUAL` against brick depth, and front-wall occlusion is already
+  `DrawRecover3`'s re-blit into Log. Exterior quads depth-test `GEQUAL`
+  with no depth-write against terrain depth (re-rotate the world point and
+  stamp `GET_ZO(CameraZr - Z0)`). On success the clipped
+  opaque footprint in Log is punched to palette index 0 so the present
+  composite shows the FBO quad; interior still runs `DrawRecover3` for the
+  front-wall re-blit. HUD sites, `ScaleSpriteTransp` / `EXTRA_TRANSPARENT`
+  (blend table), and any `ScaleFactorSprite != 65536` stay software.
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and

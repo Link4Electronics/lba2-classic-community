@@ -38,7 +38,7 @@ extern "C" {
 // One polygon batch's render state, resolved from the polygon type by the
 // common layer and consumed by the backend's draw program.
 typedef struct GpuDrawParams {
-    S32  polyMode;      ///< 0=textured(CLUT) 1=flat 2=gouraud 3=gouraud-table 4=texel-is-index 5=fog-smooth 6=scene-shadow
+    S32  polyMode;      ///< 0=textured(CLUT) 1=flat 2=gouraud 3=gouraud-table 4=texel-is-index 5=fog-smooth 6=scene-shadow 7=brick/sprite-quad
     S32  alphaMode;     ///< 0=opaque 1=TRANS(semi) 2=TRAME(stipple)
     float flatColor;     ///< palette index (modes 1/2/4), CLUT column (mode 3) or shadow alpha (mode 6)
     S32  bilinear;      ///< 1=smooth CLUT sampling (3D textured types)
@@ -50,6 +50,11 @@ typedef struct GpuDrawParams {
     S32  blend;         ///< 1=alpha blending (TRANS/TRAME)
     S32  depthTest;     ///< 0=off 1=GEQUAL (mirror of SW PtrZBuffer >= test)
     S32  depthWrite;    ///< 1=write the offscreen depth target
+    // Mode 7 atlas page selector: 0 = brick RG8 (uBrickSize tracks the brick
+    // texture), 1 = sprite RG8 (same shader path; the backend binds the sprite
+    // texture and feeds its size as uBrickSize). Keeps sprites on polyMode 7
+    // without a new fragment mode (and without an SDL3 SPIR-V layout change).
+    S32  spriteAtlas;
     float screenScale[2]; ///< [2/resX, 2/resY] pixel -> clip
     // Software Fill_Poly clip window for this batch (engine pixels, inclusive).
     // The backends scissor to the same rect so GPU geometry never paints
@@ -138,6 +143,9 @@ typedef struct GpuRendererBackend {
     // valid (0 = AffGraph RLE skip). Sized by width/height; the backend
     // creates or recreates its texture when either changes.
     void (*TexUpdateBricks)(const void *rg, U32 width, U32 height);
+    // Sprite atlas (GpuScene phase 3): same RG8 layout as the brick page,
+    // separate texture so a frame can hold both a room and its sprites.
+    void (*TexUpdateSprites)(const void *rg, U32 width, U32 height);
 
     // Draw a batch of triangles (fan already expanded). The backend maps
     // params to its shader uniforms/state and draws immediately.

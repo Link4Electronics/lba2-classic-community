@@ -2,7 +2,7 @@
 #include "DIRECTORIES.H"
 
 #include <3D/PROJREC.H>
-#include <GPU/GPURENDERER.H> // GpuRenderer_SetBrickBank / DrawBrick
+#include <GPU/GPURENDERER.H> // GpuRenderer_SetBrickBank / DrawBrick / IsoWorldZO
 #include <SVGA/SCREEN.H>
 
 /*══════════════════════════════════════════════════════════════════════════*
@@ -29,6 +29,12 @@ S32 YpOrgw;
 #define MAX_BRICK 256 // 150
 
 S16 NbBrickColon[NB_COLON];
+
+/* When set, AffBrickBlock / AffBrickBlockOnly force the software AffGraph
+   path and skip GpuRenderer_DrawBrick. AFF_ALL builds the Screen re-blit
+   plate with this so CopyMask sources wall pixels without submitting a
+   second FBO batch. */
+static S32 s_swPlateBricks = 0;
 
 typedef struct
 {
@@ -886,8 +892,11 @@ void AffBrickBlock(S32 block, S32 brick, S16 x, S16 y, S16 z) {
         // the iso origin offset slides off that multiple and the rejected bricks
         // start having visible content. See WIDESCREEN_HARDCODED_DIMS_AUDIT.md.
         if (XScreen >= -47 AND XScreen < (S32)ModeDesiredX AND YScreen >= -38 AND YScreen < (S32)ModeDesiredY) {
-            /* GpuScene: submit as a batched FBO quad; FALSE keeps AffGraph. */
-            if (!GpuRenderer_DrawBrick(numbrick - 1, XScreen, YScreen)) {
+            /* GpuScene: submit as a batched FBO quad; FALSE keeps AffGraph.
+               s_swPlateBricks forces AffGraph for the Screen plate pass. */
+            if (s_swPlateBricks
+                    OR !GpuRenderer_DrawBrick(numbrick - 1, XScreen, YScreen,
+                                              GpuRenderer_IsoWorldZO(x, y, z))) {
                 AffGraph(numbrick - 1, XScreen, YScreen, BufferBrick);
             }
 
@@ -1070,8 +1079,11 @@ void AffBrickBlockOnly(S32 block, S32 brick, S16 x, S16 y, S16 z) {
         Map2Screen(x - StartXCube, y - StartYCube, z - StartZCube);
 
         if (XScreen >= -24 AND XScreen < (S32)ModeDesiredX AND YScreen >= -38 AND YScreen < (S32)ModeDesiredY) {
-            /* GpuScene: submit as a batched FBO quad; FALSE keeps AffGraph. */
-            if (!GpuRenderer_DrawBrick(numbrick - 1, XScreen, YScreen)) {
+            /* GpuScene: submit as a batched FBO quad; FALSE keeps AffGraph.
+               s_swPlateBricks forces AffGraph for the Screen plate pass. */
+            if (s_swPlateBricks
+                    OR !GpuRenderer_DrawBrick(numbrick - 1, XScreen, YScreen,
+                                              GpuRenderer_IsoWorldZO(x, y, z))) {
                 AffGraph(numbrick - 1, XScreen, YScreen, BufferBrick);
             }
         }
@@ -1113,6 +1125,24 @@ void AffGrilleLabyrinthe() {
             }
         }
     }
+}
+
+/* Rebuild the software room into Log, snapshot it to Screen for DrawOverBrick's
+   CopyMask (which sources wall pixels from Screen), then clear Log so the
+   present shows the FBO room through the overlay. Only called under
+   GpuRenderer_IsSceneInterior(); the plate pass forces AffGraph so no second
+   FBO batch is submitted. */
+void AffGrille_BuildScreenPlate(void) {
+    s_swPlateBricks = 1;
+    if (ModeLabyrinthe) {
+        AffGrilleLabyrinthe();
+    } else {
+        AffGrille();
+    }
+    s_swPlateBricks = 0;
+
+    CopyScreen(Log, Screen);
+    memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
 }
 
 // Affiche un cube de block (3*3*3) autour du point passe (coordonnees world)
