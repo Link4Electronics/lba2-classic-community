@@ -49,6 +49,10 @@ const char *GpuRenderer_BackendName(GpuRendererBackendId id);
 // keeps the previous frame's 3D content.
 void GpuRenderer_BeginFrame(void);
 void GpuRenderer_ClearFBO(void);
+// Palette index used as the offscreen clear colour (exterior FogCoul so sky
+// gaps match the software ClsTerrainZBuf fill; 0 elsewhere). Applied on the
+// next ClearFBO; the RGB is resolved from the live paletteLUT at that time.
+void GpuRenderer_SetSceneClearIndex(U8 index);
 void GpuRenderer_FlushBatch(void);
 void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
                          U32 height, S32 filterLinear);
@@ -61,6 +65,13 @@ void GpuRenderer_SetRenderQuality(U32 quality);
 // from the offscreen depth target. A no-op when no GPU backend is active or
 // the backend cannot read depth (the software Z-buffer then stays).
 void GpuRenderer_ReadbackDepthBuffer(void);
+
+// Colour readback of the offscreen target into a top-down 0x00RRGGBB buffer
+// of size width x height (engine pixels). Flushes the pending batch first.
+// Returns FALSE when no backend is active or the backend cannot read colour,
+// so the caller can fall back to the software Log frame. Used by --screenshot
+// so a GPU run captures the 3D the player sees, not only the Log overlay.
+S32 GpuRenderer_ReadbackPresented(void *rgb, U32 width, U32 height);
 
 // The engine's 3D pass. AffScene opens it around each exterior body draw
 // (ObjectDisplay, and the dart body draw) so non-Z-buffered body polys batch

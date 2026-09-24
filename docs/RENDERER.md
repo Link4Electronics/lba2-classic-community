@@ -120,10 +120,20 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   (`../SOURCES/3DEXT/TERRAIN.CPP`) fills `Log` with `FogCoul` so sky gaps show
   the fog colour. With a GPU backend active the terrain lives in the offscreen
   target, and only palette index 0 is transparent in the present composite:
-  a `FogCoul` fill would paint an opaque overlay over that target and hide the
-  3D scene. The same routine therefore clears `Log` to index 0 while a backend
-  is live, so the composite shows the GPU frame (HUD and sprites drawn into
-  `Log` afterward still paint over it).
+  a `FogCoul` fill of `Log` would paint an opaque overlay over that target and
+  hide the 3D scene. The same routine therefore clears `Log` to index 0 while a
+  backend is live, so the composite shows the GPU frame (HUD and sprites drawn
+  into `Log` afterward still paint over it). The offscreen target itself is
+  cleared to the scene `FogCoul` RGB (`GpuRenderer_SetSceneClearIndex` from
+  `RefreshGrille`, `../SOURCES/INTEXT.CPP`) so pixels the GPU never covers —
+  outside the drawn horizon, above the sky strip — match the software fill
+  rather than black. Interior passes palette index 0, the software default.
+- **Clip-window scissor** — software `Fill_Poly` rasterizes only inside
+  `ClipXMin..ClipYMax` (cinema bars, dialogue windows, `AFF_ALL_FLIP`
+  unsetting the clip window). The GPU intake runs before that screen-space
+  clip, so each batch carries the live window in `GpuDrawParams` and the
+  backends scissor to the same rect (GL bottom-left Y-flip; SDL3 top-left),
+  scaled through `screenScale` into target pixels.
 - **Terrain/room snapshot/restore** — a camera cut (`AFF_OBJETS` in
   `AffScene`, `../SOURCES/OBJECT.CPP`) redraws only the flagged bodies and
   never the terrain (or, with `GpuScene`, the room); the offscreen target
@@ -173,10 +183,14 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   split the darken: the room lives in the offscreen target, so
   `DrawShadow` (`../SOURCES/BEZIER.CPP`) opens `GpuRenderer_ShadowBeginFlat`
   (same CLUT-derived alpha, depth-test off — the interior FBO has no
-  terrain depth to test) for the FBO spans, while the unchanged
-  `ShadeBoxBlk` keeps darkening actor pixels still sitting in the Log
-  overlay; each buffer receives the darken its own pixels received when
-  they shared one buffer.
+  terrain depth to test) for the FBO spans, while `ShadeBoxBlkOverlay`
+  (`../SOURCES/FLOW_A.CPP`) keeps darkening non-zero actor/HUD pixels
+  still sitting in the Log overlay; index 0 is the overlay's transparent
+  hole and is left alone so the FBO shows through (plain `ShadeBoxBlk`
+  would map 0 through `clut[0]`, an opaque shade colour, painting the
+  shadow span as solid holes over the room and body). Each buffer
+  receives the darken its own pixels received when they shared one
+  buffer.
 
 - **`GpuScene` and the interior brick grid.** cfg key `GpuScene`, cvar
   `gpuscene`, default 0. With the flag on and a backend active, the base

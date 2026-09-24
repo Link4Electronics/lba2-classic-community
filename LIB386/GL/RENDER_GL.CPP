@@ -45,6 +45,7 @@ S32 AtlasTextureDirty = 0;
 #endif
 
 #include <SDL3/SDL.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* paletteLUT builds 0xAARRGGBB which in little-endian memory is
@@ -296,10 +297,12 @@ static const char *s_clutFragSrc =
     "    } else if (uPolyMode == 7) {\n"
     /* Brick atlas: R = palette index, G = valid (AffGraph RLE skip).
        NEAREST only; MapU/MapV are absolute texel coords. LUMINANCE_ALPHA
-       packs index in .r and valid in .a. */
+       packs index in .r and valid in .a. The valid byte is 0 or 1 (not
+       0 or 255), so after UNORM normalize the flag is 0.0 or 1/255 —
+       compare against half a step, not 0.5, or every brick discards. */
     "        vec2 uv = vTexCoord / uBrickSize;\n"
     "        vec2 t = texture2D(uAtlas, uv).ra;\n"
-    "        if (t.y < 0.5) discard;\n"
+    "        if (t.y < (0.5 / 255.0)) discard;\n"
     "        color = texture2D(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));\n"
     "    } else {\n"
     /* Gouraud table (types 6/7): CLUT lookup, color = column.
@@ -771,7 +774,7 @@ static S32 GL_TargetIsValid(void) {
     return (s_fbo != 0) ? TRUE : FALSE;
 }
 
-static void GL_TargetBindClear(void) {
+static void GL_TargetBindClear(U32 rgb) {
     if (!s_initialized) {
         return;
     }
@@ -786,6 +789,11 @@ static void GL_TargetBindClear(void) {
         glViewport(0, 0, (GLsizei)s_texWidth, (GLsizei)s_texHeight);
     }
 
+    /* Scene clear RGB (exterior FogCoul): sky gaps outside the drawn
+       horizon must match the software Cls fill, not black. */
+    glClearColor((float)((rgb >> 16) & 0xFF) / 255.0f,
+                 (float)((rgb >> 8) & 0xFF) / 255.0f,
+                 (float)(rgb & 0xFF) / 255.0f, 1.0f);
     /* Depth clear to 0.0 matches GL_GEQUAL (closer objects higher). */
 #ifdef USE_GLES2
     glClearDepthf(0.0f);
@@ -816,6 +824,40 @@ static S32 GL_TargetReadDepth(void *depthDst, U32 width, U32 height) {
     glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
     glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_DEPTH_COMPONENT,
                  GL_UNSIGNED_SHORT, depthDst);
+    return TRUE;
+}
+
+/* Raw colour readback: U32 0x00RRGGBB, bottom-up (GL origin). The common
+   layer flips to top-down and box-downsamples when SSAA is on. */
+static S32 GL_TargetReadColor(void *colorDst, U32 width, U32 height) {
+    if (!s_initialized || !s_fbo || colorDst == NULL) {
+        return FALSE;
+    }
+    if (!Window_GLMakeCurrent()) {
+        return FALSE;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+    /* GL_RGBA bytes are R,G,B,A; swizzle into 0x00RRGGBB per pixel. GL
+       bottom-up rows already match the TargetReadColor contract. */
+    static U8 *s_rgbaScratch = NULL;
+    static U32 s_rgbaScratchBytes = 0;
+    const U32 need = width * height * 4;
+    if (s_rgbaScratchBytes < need) {
+        free(s_rgbaScratch);
+        s_rgbaScratch = (U8 *)malloc(need);
+        s_rgbaScratchBytes = s_rgbaScratch ? need : 0;
+    }
+    if (s_rgbaScratch == NULL) {
+        return FALSE;
+    }
+    glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_RGBA,
+                 GL_UNSIGNED_BYTE, s_rgbaScratch);
+    const U32 count = width * height;
+    U32 *dst = (U32 *)colorDst;
+    for (U32 i = 0; i < count; i++) {
+        const U8 *p = s_rgbaScratch + i * 4;
+        dst[i] = ((U32)p[0] << 16) | ((U32)p[1] << 8) | (U32)p[2];
+    }
     return TRUE;
 }
 
@@ -947,6 +989,10 @@ static void GL_TexUpdatePalette(const void *argb) {
    texel UVs never bleed across shelf-pack gutters. */
 static void GL_TexUpdateBricks(const void *rg, U32 width, U32 height) {
     if (rg == NULL || width == 0 || height == 0) {
+        return;
+    }
+    if (!Window_GLMakeCurrent()) {
+        Log_Warn("[GL] TexUpdateBricks: no context");
         return;
     }
     if (s_brickTex == 0) {
@@ -1131,6 +1177,28 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     }
     glDepthMask(params->depthWrite ? GL_TRUE : GL_FALSE);
 
+    /* Scissor to the software Fill_Poly clip window (engine pixels mapped
+       through screenScale into target pixels). GL's origin is bottom-left,
+       so the rect's top-down engine Y is flipped against the target height. */
+    {
+        const float engW = 2.0f / params->screenScale[0];
+        const float engH = 2.0f / params->screenScale[1];
+        const float sx = (float)s_fboWidth / engW;
+        const float sy = (float)s_fboHeight / engH;
+        const float x0 = (float)params->clipX0 * sx;
+        const float yTop = (float)params->clipY0 * sy;
+        const float yBot = (float)(params->clipY1 + 1) * sy;
+        const float w = (float)(params->clipX1 - params->clipX0 + 1) * sx;
+        const float h = yBot - yTop;
+        const float gy = (float)s_fboHeight - yBot;
+        glEnable(GL_SCISSOR_TEST);
+        if (w <= 0.0f || h <= 0.0f) {
+            glScissor(0, 0, 0, 0);
+        } else {
+            glScissor((int)x0, (int)gy, (int)w, (int)h);
+        }
+    }
+
     /* Draw all batched triangles */
     glDrawArrays(GL_TRIANGLES, 0, (GLsizei)vertexCount);
 
@@ -1163,9 +1231,12 @@ static void GL_ClearBackbuffer(void) {
         return;
     }
 
-    /* Switch back to the default framebuffer and drop depth state. */
+    /* Switch back to the default framebuffer and drop depth state.
+       Scissor only governs the offscreen 3D pass; the present quads draw
+       the whole letterbox content. */
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glDisable(GL_DEPTH_TEST);
+    glDisable(GL_SCISSOR_TEST);
 
     /* Compute letterbox viewport to maintain the game's aspect ratio,
        matching the SW renderer's SDL_LOGICAL_PRESENTATION_LETTERBOX. */
@@ -1296,6 +1367,7 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_TargetWidth,
     GL_TargetHeight,
     GL_TargetReadDepth,
+    GL_TargetReadColor,
     GL_TargetSnapshotTerrain,
     GL_TargetRestoreTerrain,
     GL_SetVSync,

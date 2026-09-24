@@ -7,7 +7,10 @@ and for record/replay regression nets.
 
 This is an outside-in harness. It reuses existing engine seams — the
 [console command bus](CONSOLE.md) for `--exec`, the normal save-load sequence for
-`--load`, the existing `SavePNG` for `--screenshot` — rather than changing game logic. It
+`--load`, the existing PNG writer for `--screenshot` (Log alone under software; under a
+GPU backend, Log composited over a colour readback of the offscreen target via
+`GpuRenderer_ReadbackPresented` / `SavePNGRGB`, so the capture matches what the player
+sees) — rather than changing game logic. It
 is not a scripting runtime. See
 [AUTOMATION_RESEARCH.md](plan/AUTOMATION_RESEARCH.md) and
 [AUTOMATION_PLAN.md](plan/AUTOMATION_PLAN.md) for the design.

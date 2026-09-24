@@ -129,8 +129,18 @@ static const void *s_batchCLUTGouraud = NULL;
 static U8 s_batchZBuffer = 0;
 static U8 s_batchNZW = 0;
 static U8 s_batch3DPass = 0;
+static S32 s_batchClipX0 = 0;
+static S32 s_batchClipY0 = 0;
+static S32 s_batchClipX1 = 0;
+static S32 s_batchClipY1 = 0;
 
 static S32 s_bilinearCLUT = 0; /* bilinear CLUT sampling flag for 3D */
+
+/* Scene clear colour as a palette index (exterior FogCoul). Resolved to
+   0xRRGGBB from paletteLUT at ClearFBO so the offscreen gaps match the
+   software Cls fill; interior passes 0, which is also the SW ClearColor
+   default after ClsTerrainZBuf resets it. */
+static U8 s_sceneClearIndex = 0;
 
 /* ── Scene-shadow span buffer ───────────────────────────────────────────── */
 /* Shadows are flat black quads, one 2-triangle strip per scanline span. The
@@ -369,6 +379,10 @@ static void Common_UploadBricks(void) {
 //──────────────────────────────────────────────────────────────────────────
 static void Common_BuildDrawParams(GpuDrawParams *out) {
     memset(out, 0, sizeof *out);
+    out->clipX0 = s_batchClipX0;
+    out->clipY0 = s_batchClipY0;
+    out->clipX1 = s_batchClipX1;
+    out->clipY1 = s_batchClipY1;
 
     /* Brick quad (GpuScene): nearest atlas sample, palette LUT, no depth,
        no light. Bilinear is forced off regardless of the player's filter. */
@@ -467,9 +481,6 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
     out->screenScale[0] = s_screenScale[0];
     out->screenScale[1] = s_screenScale[1];
 }
-
-//──────────────────────────────────────────────────────────────────────────
-// Batch lifecycle
 //──────────────────────────────────────────────────────────────────────────
 void GpuRenderer_FlushBatch(void) {
     if (!s_active || s_batchVertCount == 0) {
@@ -588,6 +599,10 @@ static void Common_FlushShadowSpans(void) {
     params.depthWrite = 0;
     params.screenScale[0] = s_screenScale[0];
     params.screenScale[1] = s_screenScale[1];
+    params.clipX0 = ClipXMin;
+    params.clipY0 = ClipYMin;
+    params.clipX1 = ClipXMax;
+    params.clipY1 = ClipYMax;
 
     s_backend->DrawTriangles((const GpuVertex *)s_shadowVerts,
                              s_shadowVertCount, &params);
@@ -728,7 +743,9 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y) {
 
     if (s_batchVertCount > 0) {
         if (s_currentTypePoly != (U32)GPU_BRICK_TYPE ||
-            s_batchAtlas != (const void *)s_brickAtlasData) {
+            s_batchAtlas != (const void *)s_brickAtlasData ||
+            s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
+            s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
             GpuRenderer_FlushBatch();
         }
     }
@@ -740,6 +757,12 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y) {
     s_batchNZW = 0;
     s_batch3DPass = 0;
     s_batchCLUTBaseRow = 0.0f;
+    /* Brick geometry is already vertex-clipped to Clip* above; keep the
+       scissor at the live window so a mid-frame clip change still reaps. */
+    s_batchClipX0 = ClipXMin;
+    s_batchClipY0 = ClipYMin;
+    s_batchClipX1 = ClipXMax;
+    s_batchClipY1 = ClipYMax;
 
     /* Integer UV shift for the clipped window: left edge of pixel cx0 is
        at local (cx0 - x0), which sits at atlas rect.x + (cx0 - x0). */
@@ -856,10 +879,10 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     }
 
     /* Flush on any change that alters the draw state: type, colour, atlas
-       page, CLUT fog row, Z-buffer mode, or 3D-pass mode. SetCLUT runs
-       per terrain tile with a different fog distance, so a tile boundary
-       must flush or neighbouring tiles would render at the wrong
-       brightness. */
+       page, CLUT fog row, Z-buffer mode, 3D-pass mode, or the software
+       clip window (the backends scissor to it). SetCLUT runs per terrain
+       tile with a different fog distance, so a tile boundary must flush or
+       neighbouring tiles would render at the wrong brightness. */
     if (s_batchVertCount > 0) {
         if (s_currentTypePoly != (U32)typePoly ||
             s_currentColorPoly != (U32)colorPoly ||
@@ -868,7 +891,9 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
             s_batchCLUTGouraud != (const void *)PtrCLUTGouraud ||
             s_batchZBuffer != Fill_Flag_ZBuffer ||
             s_batchNZW != Fill_Flag_NZW ||
-            s_batch3DPass != Fill_Flag_3DPass) {
+            s_batch3DPass != Fill_Flag_3DPass ||
+            s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
+            s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
             GpuRenderer_FlushBatch();
         }
     }
@@ -883,6 +908,10 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     s_batchZBuffer = Fill_Flag_ZBuffer;
     s_batchNZW = Fill_Flag_NZW;
     s_batch3DPass = Fill_Flag_3DPass;
+    s_batchClipX0 = ClipXMin;
+    s_batchClipY0 = ClipYMin;
+    s_batchClipX1 = ClipXMax;
+    s_batchClipY1 = ClipYMax;
 
     /* CLUT base row: SetCLUT(fog) per terrain tile sets PtrCLUTGouraud
        within PtrCLUTFog; the batch captured on a CLUT change keeps the row
@@ -933,6 +962,10 @@ void GpuRenderer_BeginFrame(void) {
     s_bilinearCLUT = DisplayTexFilter;
 }
 
+void GpuRenderer_SetSceneClearIndex(U8 index) {
+    s_sceneClearIndex = index;
+}
+
 void GpuRenderer_ClearFBO(void) {
     if (!s_active) {
         return;
@@ -941,7 +974,16 @@ void GpuRenderer_ClearFBO(void) {
        re-enters here mid-frame) so the clear wipes it: flushing after the
        clear would draw that stale batch over the fresh target. */
     GpuRenderer_FlushBatch();
-    s_backend->TargetBindClear();
+    {
+        /* Software Cls fills with a palette index; the FBO clear must show
+           the same RGB so sky gaps under the horizon match ClsTerrainZBuf. */
+        const U32 *lut = GL_GetPaletteLUT();
+        U32 rgb = 0;
+        if (lut != NULL) {
+            rgb = lut[s_sceneClearIndex] & 0x00FFFFFF;
+        }
+        s_backend->TargetBindClear(rgb);
+    }
     /* The FBO now holds valid terrain depth for the rest of the frame (and
        stays valid across frames on no-terrain frames — ClearFBO runs at the
        start of the terrain pass only). The clear also wipes room colour, so
@@ -1088,6 +1130,85 @@ void GpuRenderer_ReadbackDepthBuffer(void) {
 }
 
 //──────────────────────────────────────────────────────────────────────────
+// Colour readback of the offscreen target into a top-down 0x00RRGGBB buffer
+// (see GpuRenderer_ReadbackPresented in GPU/GPURENDERER.H). Used by --screenshot
+// so a GPU run captures the 3D the player sees, not only the Log overlay.
+//──────────────────────────────────────────────────────────────────────────
+S32 GpuRenderer_ReadbackPresented(void *rgb, U32 width, U32 height) {
+    if (!s_active || rgb == NULL || width == 0 || height == 0) {
+        return FALSE;
+    }
+
+    GpuRenderer_FlushBatch();
+
+    const U32 fboW = s_backend->TargetWidth();
+    const U32 fboH = s_backend->TargetHeight();
+    if (fboW == 0 || fboH == 0) {
+        return FALSE;
+    }
+
+    const U32 totalPixels = fboW * fboH;
+    static U32 *s_colorBuf = NULL;
+    static U32 s_colorBufSize = 0;
+    if (s_colorBufSize < totalPixels) {
+        free(s_colorBuf);
+        s_colorBuf = (U32 *)malloc(totalPixels * sizeof(U32));
+        s_colorBufSize = s_colorBuf ? totalPixels : 0;
+    }
+    if (s_colorBuf == NULL) {
+        return FALSE;
+    }
+
+    if (!s_backend->TargetReadColor(s_colorBuf, fboW, fboH)) {
+        return FALSE;
+    }
+
+    U32 *dst = (U32 *)rgb;
+    if (fboW == width && fboH == height) {
+        /* Backend rows are bottom-up; flip to top-down. */
+        for (U32 sy = 0; sy < height; sy++) {
+            const U32 *srcRow = s_colorBuf + (fboH - 1 - sy) * fboW;
+            U32 *dstRow = dst + sy * width;
+            for (U32 sx = 0; sx < width; sx++) {
+                dstRow[sx] = srcRow[sx] & 0x00FFFFFFu;
+            }
+        }
+    } else {
+        /* SSAA: box-downsample each screen-pixel block (matches the present
+           path's linear filter closely enough for harness comparison). */
+        const U32 scaleX = fboW / width;
+        const U32 scaleY = fboH / height;
+        if (scaleX == 0 || scaleY == 0) {
+            return FALSE;
+        }
+        for (U32 sy = 0; sy < height; sy++) {
+            U32 *dstRow = dst + sy * width;
+            /* Bottom-up source row block for this top-down screen row. */
+            const U32 fyBase = (fboH - 1 - sy * scaleY) - scaleY + 1;
+            for (U32 sx = 0; sx < width; sx++) {
+                U32 r = 0, g = 0, b = 0, n = 0;
+                const U32 fx0 = sx * scaleX;
+                for (U32 fy = fyBase; fy < fyBase + scaleY; fy++) {
+                    const U32 *srcRow = s_colorBuf + fy * fboW;
+                    for (U32 fx = fx0; fx < fx0 + scaleX; fx++) {
+                        const U32 p = srcRow[fx];
+                        r += (p >> 16) & 0xFF;
+                        g += (p >> 8) & 0xFF;
+                        b += p & 0xFF;
+                        n++;
+                    }
+                }
+                if (n == 0) {
+                    n = 1;
+                }
+                dstRow[sx] = ((r / n) << 16) | ((g / n) << 8) | (b / n);
+            }
+        }
+    }
+    return TRUE;
+}
+
+//──────────────────────────────────────────────────────────────────────────
 // Terrain snapshot/restore (see GpuRenderer_SnapshotTerrain in
 // GPU/GPURENDERER.H). End of the exterior terrain pass: the common layer pins
 // a copy of the target it just drew so a later AFF_OBJETS frame can scrub the
@@ -1206,6 +1327,10 @@ void GpuRenderer_Shutdown(void) {
     s_batch3DPass = 0;
     s_uploadedAtlas = NULL;
     s_uploadedBrickAtlas = NULL;
+    s_batchClipX0 = 0;
+    s_batchClipY0 = 0;
+    s_batchClipX1 = 0;
+    s_batchClipY1 = 0;
     /* The packed page is CPU-side and survives a context recreate only if
        re-uploaded; drop the upload marker so Init re-sends it. The pack
        itself stays valid — the bank did not change. */
@@ -1315,6 +1440,7 @@ const char *GpuRenderer_BackendName(GpuRendererBackendId id) {
 }
 void GpuRenderer_BeginFrame(void) {}
 void GpuRenderer_ClearFBO(void) {}
+void GpuRenderer_SetSceneClearIndex(U8 index) { (void)index; }
 void GpuRenderer_FlushBatch(void) {}
 void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
                          U32 height, S32 filterLinear) {
@@ -1328,6 +1454,10 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
 }
 void GpuRenderer_SetRenderQuality(U32 quality) { (void)quality; }
 void GpuRenderer_ReadbackDepthBuffer(void) {}
+S32 GpuRenderer_ReadbackPresented(void *rgb, U32 width, U32 height) {
+    (void)rgb; (void)width; (void)height;
+    return FALSE;
+}
 void GpuRenderer_SetVSync(S32 enabled) { (void)enabled; }
 void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
     (void)x0; (void)y0; (void)x1; (void)y1;

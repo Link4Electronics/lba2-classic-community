@@ -104,6 +104,8 @@ For each listed ASM/CPP pair:
 - `BoxFlow` / `ShadeBoxBlk` / `CopyBlockShade`
   - Added repeated-application stability sequences for all three helpers.
   - Added custom clip-window edge cases for `BoxFlow` and `ShadeBoxBlk`.
+- `ShadeBoxBlkOverlay` (new, no ASM original — GpuScene interior dual-path darken)
+  - Host test `tests/shadebox_overlay/` pins that index 0 stays transparent while non-zero overlay pixels still take the shade CLUT, including clip-window edges.
 
 ### 3DEXT
 

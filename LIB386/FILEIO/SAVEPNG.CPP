@@ -43,4 +43,35 @@ void SavePNG(char *filename, void *screen, S32 xres, S32 yres, void *ptrpalette)
     Free(rgb);
 }
 
+void SavePNGRGB(char *filename, void *rgbPixels, S32 xres, S32 yres) {
+    const U32 *src = (const U32 *)rgbPixels;
+    U8 *rgb;
+    S32 x, y;
+    int result;
+
+    if (!rgbPixels) {
+        return;
+    }
+    rgb = (U8 *)Malloc(xres * yres * 3);
+    if (!rgb) {
+        LogPrintf("Error: Failed to allocate memory for screenshot\n");
+        return;
+    }
+    for (y = 0; y < yres; y++) {
+        for (x = 0; x < xres; x++) {
+            U32 p = src[y * xres + x];
+            rgb[(y * xres + x) * 3 + 0] = (U8)((p >> 16) & 0xFF);
+            rgb[(y * xres + x) * 3 + 1] = (U8)((p >> 8) & 0xFF);
+            rgb[(y * xres + x) * 3 + 2] = (U8)(p & 0xFF);
+        }
+    }
+    result = stbi_write_png(filename, xres, yres, 3, rgb, xres * 3);
+    if (result) {
+        LogPrintf("Screenshot saved: %s\n", filename);
+    } else {
+        LogPrintf("Error: Failed to save screenshot to %s\n", filename);
+    }
+    Free(rgb);
+}
+
 // ──────────────────────────────────────────────────────────────────────────

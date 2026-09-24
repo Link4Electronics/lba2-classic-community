@@ -142,7 +142,11 @@ void RefreshGrille() {
     /* The terrain pass owns the offscreen target's colour and depth: clear it
        here so a frame that redraws terrain starts clean, while a frame that
        only redraws objects (AffScene AFF_OBJETS) keeps the previous 3D content
-       and depth, exactly like the software Z-buffer. */
+       and depth, exactly like the software Z-buffer. The clear colour is the
+       scene FogCoul so sky gaps outside the drawn horizon match the software
+       Cls fill; interior keeps the SW default (palette 0). */
+    GpuRenderer_SetSceneClearIndex(
+        (U8)((CubeMode == CUBE_EXTERIEUR) ? FogCoul : 0));
     GpuRenderer_ClearFBO();
 
 #ifdef LBA_EDITOR

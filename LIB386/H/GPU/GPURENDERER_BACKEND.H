@@ -51,6 +51,13 @@ typedef struct GpuDrawParams {
     S32  depthTest;     ///< 0=off 1=GEQUAL (mirror of SW PtrZBuffer >= test)
     S32  depthWrite;    ///< 1=write the offscreen depth target
     float screenScale[2]; ///< [2/resX, 2/resY] pixel -> clip
+    // Software Fill_Poly clip window for this batch (engine pixels, inclusive).
+    // The backends scissor to the same rect so GPU geometry never paints
+    // outside the ClipX/ClipY window the software rasterizer would honour.
+    S32 clipX0;
+    S32 clipY0;
+    S32 clipX1;
+    S32 clipY1;
 } GpuDrawParams;
 
 //──────────────────────────────────────────────────────────────────────────
@@ -88,12 +95,18 @@ typedef struct GpuRendererBackend {
     S32  (*TargetCreate)(U32 width, U32 height);
     void (*TargetDestroy)(void);
     S32  (*TargetIsValid)(void);
-    void (*TargetBindClear)(void);
+    // Bind the offscreen target and clear colour+depth. rgb is 0xRRGGBB —
+    // the scene clear (exterior FogCoul) so sky gaps match software Cls.
+    void (*TargetBindClear)(U32 rgb);
     U32  (*TargetWidth)(void);
     U32  (*TargetHeight)(void);
     // Depth readback (bottom-up, GL window-depth): 16-bit, or FALSE if
     // unreadable.
     S32  (*TargetReadDepth)(void *dst, U32 width, U32 height);
+    // Colour readback of the offscreen target: U32 0x00RRGGBB, bottom-up
+    // rows (GL's origin). width/height are the target's own size. FALSE if
+    // the backend cannot read colour (the caller then falls back to Log).
+    S32  (*TargetReadColor)(void *dst, U32 width, U32 height);
 
     // Terrain persistence (see GpuRenderer_SnapshotTerrain/RestoreTerrain).
     // The backend keeps a persistent "terrain target" (colour + depth) sized

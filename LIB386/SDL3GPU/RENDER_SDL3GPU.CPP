@@ -203,6 +203,8 @@ static U32 s_swapchainH = 0;
    overlap a render pass) and whether it still needs its first clear. */
 static SDL_GPURenderPass *s_targetPass = NULL;
 static S32 s_targetNeedsClear = TRUE;
+/* 0xRRGGBB for the next deferred target clear (scene FogCoul). */
+static U32 s_targetClearRgb = 0;
 
 /* Letterbox rect computed by ClearBackbuffer for both composite quads. */
 static S32 s_vpX = 0;
@@ -224,6 +226,10 @@ typedef struct S3DrawCmd {
     U32 firstVertex;
     U32 vertexCount;
     float screenScale[2];
+    S32 clipX0;
+    S32 clipY0;
+    S32 clipX1;
+    S32 clipY1;
     S3GpuParams params;
 } S3DrawCmd;
 
@@ -879,6 +885,92 @@ static S32 S3_TargetReadDepth(void *depthDst, U32 width, U32 height) {
     return TRUE;
 }
 
+/* Colour readback: U32 0x00RRGGBB, bottom-up (flip SDL's top-down download
+   with the same helper as depth). The colour target is B8G8R8A8; on LE that
+   is already [B,G,R,A] in memory, mask to 0x00RRGGBB after the flip. */
+static S32 S3_TargetReadColor(void *colorDst, U32 width, U32 height) {
+    U32 colorBytes;
+    SDL_GPUCopyPass *cp;
+    SDL_GPUTextureRegion src;
+    SDL_GPUTextureTransferInfo dstInfo;
+    SDL_GPUFence *fence;
+    const void *mapped;
+    U32 *pixels;
+    U32 count;
+    U32 i;
+
+    if (s_device == NULL || s_targetColor == NULL || colorDst == NULL ||
+        width == 0 || height == 0) {
+        return FALSE;
+    }
+
+    S3_FlushDraws();
+    if (s_frameCmd == NULL) {
+        s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
+        if (s_frameCmd == NULL) {
+            Log_Warn("[SDL3GPU] command buffer acquire failed: %s",
+                     SDL_GetError());
+            return FALSE;
+        }
+    }
+    if (s_targetPass != NULL) {
+        SDL_EndGPURenderPass(s_targetPass);
+        s_targetPass = NULL;
+    }
+
+    colorBytes = width * height * 4;
+    if (!S3_EnsureReadbackTb(&s_readbackDepthTb, &s_readbackDepthTbBytes,
+                             colorBytes)) {
+        return FALSE;
+    }
+
+    cp = SDL_BeginGPUCopyPass(s_frameCmd);
+    SDL_zero(src);
+    src.texture = s_targetColor;
+    src.w = width;
+    src.h = height;
+    src.d = 1;
+    SDL_zero(dstInfo);
+    dstInfo.transfer_buffer = s_readbackDepthTb;
+    dstInfo.offset = 0;
+    dstInfo.pixels_per_row = width;
+    dstInfo.rows_per_layer = height;
+    SDL_DownloadFromGPUTexture(cp, &src, &dstInfo);
+    SDL_EndGPUCopyPass(cp);
+
+    fence = SDL_SubmitGPUCommandBufferAndAcquireFence(s_frameCmd);
+    s_frameCmd = NULL;
+    s_targetPass = NULL;
+    if (fence == NULL) {
+        Log_Warn("[SDL3GPU] colour readback submit failed: %s",
+                 SDL_GetError());
+        return FALSE;
+    }
+    if (!SDL_WaitForGPUFences(s_device, true, &fence, 1)) {
+        Log_Warn("[SDL3GPU] colour readback wait failed: %s",
+                 SDL_GetError());
+        SDL_ReleaseGPUFence(s_device, fence);
+        return FALSE;
+    }
+    SDL_ReleaseGPUFence(s_device, fence);
+
+    mapped = SDL_MapGPUTransferBuffer(s_device, s_readbackDepthTb, false);
+    if (mapped == NULL) {
+        Log_Warn("[SDL3GPU] colour readback map failed: %s",
+                 SDL_GetError());
+        return FALSE;
+    }
+    S3_CopyReadbackPlane(colorDst, mapped, width, height, 4);
+    SDL_UnmapGPUTransferBuffer(s_device, s_readbackDepthTb);
+
+    pixels = (U32 *)colorDst;
+    count = width * height;
+    for (i = 0; i < count; i++) {
+        pixels[i] &= 0x00FFFFFFu;
+    }
+    return TRUE;
+}
+
 /* Copies the offscreen target (colour + depth) into the persistent terrain
    target. Texture-to-texture copies of the same format, recorded in one copy
    pass after whatever the target still holds has been rendered. */
@@ -1289,9 +1381,10 @@ static S32 S3_TargetIsValid(void) {
     return (s_targetColor != NULL && s_targetDepth != NULL) ? TRUE : FALSE;
 }
 
-static void S3_TargetBindClear(void) {
+static void S3_TargetBindClear(U32 rgb) {
     /* The clear is deferred to the first triangle pass of the frame so it
        shares the frame command buffer with the draws it precedes. */
+    s_targetClearRgb = rgb;
     s_targetNeedsClear = TRUE;
 }
 
@@ -1502,9 +1595,11 @@ static void S3_BeginTargetPass(void) {
 
     SDL_zero(cti);
     cti.texture = s_targetColor;
-    cti.clear_color.r = 0.0f;
-    cti.clear_color.g = 0.0f;
-    cti.clear_color.b = 0.0f;
+    /* Scene clear RGB (exterior FogCoul): sky gaps outside the drawn
+       horizon must match the software Cls fill, not black. */
+    cti.clear_color.r = (float)((s_targetClearRgb >> 16) & 0xFF) / 255.0f;
+    cti.clear_color.g = (float)((s_targetClearRgb >> 8) & 0xFF) / 255.0f;
+    cti.clear_color.b = (float)(s_targetClearRgb & 0xFF) / 255.0f;
     cti.clear_color.a = 1.0f;
     cti.load_op = loadOp;
     cti.store_op = SDL_GPU_STOREOP_STORE;
@@ -1632,6 +1727,24 @@ static void S3_FlushDraws(void) {
                 SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 3);
                 boundBrick = wantBrick;
             }
+            /* Scissor to the software Fill_Poly clip window (engine pixels
+               through screenScale into target pixels). SDL3 GPU render
+               targets use a top-left origin, same as the engine rows. */
+            {
+                const float engW = 2.0f / cmd->screenScale[0];
+                const float engH = 2.0f / cmd->screenScale[1];
+                const float sx = (float)s_targetW / engW;
+                const float sy = (float)s_targetH / engH;
+                const float x0 = (float)cmd->clipX0 * sx;
+                const float y0 = (float)cmd->clipY0 * sy;
+                const float w = (float)(cmd->clipX1 - cmd->clipX0 + 1) * sx;
+                const float h = (float)(cmd->clipY1 - cmd->clipY0 + 1) * sy;
+                scissor.x = (int)x0;
+                scissor.y = (int)y0;
+                scissor.w = (w > 0.0f) ? (int)w : 0;
+                scissor.h = (h > 0.0f) ? (int)h : 0;
+                SDL_SetGPUScissor(s_targetPass, &scissor);
+            }
             sp.screenScale[0] = cmd->screenScale[0];
             sp.screenScale[1] = cmd->screenScale[1];
             sp.pad[0] = 0.0f;
@@ -1704,6 +1817,10 @@ static void S3_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     cmd->vertexCount = vertexCount;
     cmd->screenScale[0] = params->screenScale[0];
     cmd->screenScale[1] = params->screenScale[1];
+    cmd->clipX0 = params->clipX0;
+    cmd->clipY0 = params->clipY0;
+    cmd->clipX1 = params->clipX1;
+    cmd->clipY1 = params->clipY1;
     cmd->params.polyMode = params->polyMode;
     cmd->params.alphaMode = params->alphaMode;
     cmd->params.flatColor = params->flatColor;
@@ -1940,6 +2057,7 @@ const GpuRendererBackend GpuRendererBackendSDL3GPU = {
     S3_TargetWidth,
     S3_TargetHeight,
     S3_TargetReadDepth,
+    S3_TargetReadColor,
     S3_TargetSnapshotTerrain,
     S3_TargetRestoreTerrain,
     S3_SetVSync,

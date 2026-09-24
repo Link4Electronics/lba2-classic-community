@@ -35,9 +35,9 @@ S32 XS0, YS0, XS1, YS1, XS2, YS2, XS3, YS3;
 // lives in the offscreen target, not Log, so ShadeBoxBlk has nothing to
 // darken there; the spans become alpha-black quads over the target instead.
 // With GpuScene the interior room also lives in the FBO: the same spans
-// darken it there (flat, no depth) while UseSwShade keeps ShadeBoxBlk for
-// actor pixels still in the Log — each buffer receives the darken its own
-// pixels received when they shared one buffer.
+// darken it there (flat, no depth) while UseSwShade keeps ShadeBoxBlkOverlay
+// for non-zero actor pixels still in the Log — each buffer receives the
+// darken its pixels received when they shared one buffer.
 static S32 UseGpuShadow = FALSE;
 static S32 UseSwShade = TRUE;
 
@@ -58,7 +58,15 @@ static void ShadeSpan(S32 x0, S32 y, S32 x1) {
         GpuRenderer_ShadowSpan(x0, y, x1);
     }
     if (UseSwShade) {
-        ShadeBoxBlk(x0, y, x1, y, ShadowLevel);
+        /* Dual path (UseGpuShadow also set): Log is an overlay, not the
+           framebuffer — 0 is transparent and must stay 0 so the FBO shows
+           through. Plain ShadeBoxBlk maps 0 through clut[0] (opaque), which
+           paints the shadow span as a solid hole over the room and body. */
+        if (UseGpuShadow) {
+            ShadeBoxBlkOverlay(x0, y, x1, y, ShadowLevel);
+        } else {
+            ShadeBoxBlk(x0, y, x1, y, ShadowLevel);
+        }
     }
 }
 
@@ -532,8 +540,9 @@ void DrawShadow() {
         UseSwShade = FALSE; /* room/terrain is in the FBO, not Log */
     } else if (CubeMode == CUBE_INTERIEUR AND GpuScene AND
                GpuRenderer_IsActive()) {
-        /* Dual path: flat GPU spans darken the FBO room; ShadeBoxBlk keeps
-           darkening actor pixels still sitting in the Log overlay. */
+        /* Dual path: flat GPU spans darken the FBO room; ShadeBoxBlkOverlay
+           keeps darkening non-zero actor pixels still sitting in the Log
+           (index 0 stays transparent so the FBO body shows through). */
         GpuRenderer_ShadowBeginFlat((S32)ShadowLevel);
         UseGpuShadow = TRUE;
         UseSwShade = TRUE;

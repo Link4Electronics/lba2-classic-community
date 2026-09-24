@@ -56,6 +56,51 @@ void ShadeBoxBlk(S32 x0, S32 y0, S32 x1, S32 y1, S32 deccoul) {
     }
 }
 
+/* Dual-path shadow darken (GpuScene interior): same CLUT row as ShadeBoxBlk,
+   but index 0 is the overlay's transparent hole — leave it so the FBO shows
+   through. clut[0] is an opaque shade colour (224 on the retail fog table),
+   so applying it would paint the whole shadow span as a solid hole over the
+   room and body. Non-zero overlay pixels (sprites, HUD, re-blit) still darken. */
+void ShadeBoxBlkOverlay(S32 x0, S32 y0, S32 x1, S32 y1, S32 deccoul) {
+    if (x0 > ClipXMax || x1 < ClipXMin || y0 > ClipYMax || y1 < ClipYMin) {
+        return;
+    }
+
+    if (x0 < ClipXMin) {
+        x0 = ClipXMin;
+    }
+    if (x1 > ClipXMax) {
+        x1 = ClipXMax;
+    }
+    if (y0 < ClipYMin) {
+        y0 = ClipYMin;
+    }
+    if (y1 > ClipYMax) {
+        y1 = ClipYMax;
+    }
+
+    S32 deltaY = y1 - y0 + 1;
+    S32 deltaX = x1 - x0 + 1;
+
+    U8 *dst = (U8 *)Log + TabOffLine[y0] + x0;
+    U32 screenWidth = TabOffLine[1];
+
+    U32 clutOffset = 15 * 256;
+    U8 clutOffsetHighByte = (clutOffset >> 8) & 0xFF;
+    clutOffsetHighByte -= (U8)(deccoul & 0xFF);
+    clutOffset = (clutOffset & 0xFFFF00FF) | (clutOffsetHighByte << 8);
+    U8 *clut = PtrCLUTGouraud + clutOffset;
+
+    for (S32 y = 0; y < deltaY; y++) {
+        for (S32 x = 0; x < deltaX; x++) {
+            if (dst[x] != 0) {
+                dst[x] = clut[dst[x]];
+            }
+        }
+        dst += screenWidth;
+    }
+}
+
 void CopyBlockShade(S32 x0, S32 y0, S32 x1, S32 y1, U8 *src,
                     S32 xd, S32 yd, U8 *dst, S32 shade) {
     U8 *srcPtr = src + TabOffLine[y0] + x0;

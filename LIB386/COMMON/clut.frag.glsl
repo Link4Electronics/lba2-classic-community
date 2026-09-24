@@ -185,10 +185,13 @@ void main() {
     } else if (uPolyMode == 7) {
         /* Brick atlas (GpuScene): R8G8 page, R = palette index, G = valid.
            AffGraph RLE skips leave G = 0 so the fragment is discarded and
-           the FBO keeps whatever was there. NEAREST only. */
+           the FBO keeps whatever was there. NEAREST only. The valid byte is
+           0 or 1 (not 0 or 255), so after UNORM normalize the flag is 0.0
+           or 1/255 — compare against half a step, not 0.5, or every brick
+           discards. */
         vec2 uv = vTexCoord / vec2(uBrickW, uBrickH);
         vec2 t = texture(uAtlas, uv).rg;
-        if (t.y < 0.5) discard;
+        if (t.y < (0.5 / 255.0)) discard;
         color = texture(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
@@ -384,10 +387,13 @@ void main() {
     } else if (uPolyMode == 7) {
         /* Brick atlas (GpuScene): R8G8 page, R = palette index, G = valid.
            AffGraph RLE skips leave G = 0 so the fragment is discarded and
-           the FBO keeps whatever was there. NEAREST only. */
+           the FBO keeps whatever was there. NEAREST only. The valid byte is
+           0 or 1 (not 0 or 255), so after UNORM normalize the flag is 0.0
+           or 1/255 — compare against half a step, not 0.5, or every brick
+           discards. */
         vec2 uv = vTexCoord / vec2(uBrickW, uBrickH);
         vec2 t = texture2D(uAtlas, uv).rg;
-        if (t.y < 0.5) discard;
+        if (t.y < (0.5 / 255.0)) discard;
         color = texture2D(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.

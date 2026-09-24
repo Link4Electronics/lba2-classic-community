@@ -49,6 +49,7 @@ exists in both `.ASM` and `.CPP` form.
 
 - [x] `FLOW_A.ASM` -> `FLOW_A.CPP`
    - Added `tests/test_flow_a.cpp` covering `BoxFlow`, `ShadeBoxBlk`, and `CopyBlockShade` with fixed clipped/unclipped cases, custom clip-window boundary cases, repeated-application stability sequences, plus deterministic random stress, comparing the full destination buffers byte-for-byte.
+   - `ShadeBoxBlkOverlay` (new, no ASM original — GpuScene interior dual-path darken that leaves index 0 transparent) is covered by host test `tests/shadebox_overlay/`.
 
 - [x] `FIRE.ASM` -> `FIRE.CPP`
    - Added `tests/test_fire.cpp` covering `Do_Fire` with zero, all-`0xFF`, checkerboard, sequential, vertical-stripe, and edge-impulse inputs plus 300 deterministic random rounds, comparing both 32x36 work buffers, the 32x256 texture output, and the unchanged color table byte-for-byte after two consecutive calls from the same initial seed/state.

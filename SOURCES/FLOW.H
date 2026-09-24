@@ -140,6 +140,9 @@ extern void ShadeBoxBlk(S32 X0, S32 Y0, S32 X1, S32 Y1, S32 deccoul);
 
 #pragma aux ShadeBoxBlk "*" parm caller[] modify[eax ecx edx]
 
+/* GpuScene interior dual path: darken non-zero Log overlay only (see FLOW_A.CPP). */
+extern void ShadeBoxBlkOverlay(S32 X0, S32 Y0, S32 X1, S32 Y1, S32 deccoul);
+
 /*──────────────────────────────────────────────────────────────────────────*/
 extern void CopyBlockShade(S32 x0, S32 y0, S32 x1, S32 y1, U8 *src,
                            S32 xd, S32 yd, U8 *dst, S32 shade);

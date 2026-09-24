@@ -70,6 +70,7 @@ add_subdirectory(numeric_contract)
 add_subdirectory(ui_layout)
 add_subdirectory(settings)
 add_subdirectory(user_dirs)
+add_subdirectory(shadebox_overlay)
 
 if(LBA2_BUILD_ASM_EQUIV_TESTS)
 include(cmake/asm_test_helpers.cmake)
