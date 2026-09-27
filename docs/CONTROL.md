@@ -538,7 +538,7 @@ whole savegame baseline corpus) are byte-identical to the merged behaviour. See
 
 ## UI capture
 
-Seven console verbs drive each modal UI surface from the harness, render a settled frame,
+Six console verbs drive each modal UI surface from the harness, render a settled frame,
 write a PNG via `SavePNG`, then exit cleanly. The world-space `--dump-state` is the
 guardrail for *simulation* state; these are the guardrail for *UI* rendering — what
 widescreen, font, palette, or layout changes are most likely to disturb.
@@ -546,7 +546,6 @@ widescreen, font, palette, or layout changes are most likely to disturb.
 | Verb | Captures |
 |---|---|
 | `ui inventory <path>` | The inventory wheel + items + scene background |
-| `ui comportement <path>` | The behaviour (CTRL) wheel + info bar + scene background |
 | `ui holomap <path>` | The rotating planet globe + island name strip |
 | `ui dialog <text-id> <path>` | The dialogue bubble + portrait + typewriter text for that text-id |
 | `ui menu-options <path>` | The in-game ESC menu (Volume / Language / Advanced / Controls) over the shaded scene |

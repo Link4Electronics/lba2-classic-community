@@ -41,6 +41,11 @@ void Console_PrintColored(int colour, const char *fmt, ...);
 
 /** Called from video layer pre-present callback. Overlays console onto ARGB frameBuffer if open. */
 void Console_PrePresent(U32 *frameBuffer, U32 pitch, U32 width, U32 height, const U8 *palette_rgb);
+/** TRUE when Console_PrePresent will read or write the ARGB buffer this frame
+ *  (console open, or a PPM screenshot pending — PNG screenshots go through
+ *  SavePNG on Log, not here). When FALSE with a GPU backend live, PresentFrame
+ *  skips the CPU Log→ARGB conversion and presents Log's indices directly. */
+int Console_PrePresentNeedsArgb(void);
 
 /** Event filter: call from ManageEvents. Returns 1 if event was consumed (toggle or console input). */
 int Console_FeedEvent(const void *sdlEvent);

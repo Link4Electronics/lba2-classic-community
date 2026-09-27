@@ -15,6 +15,9 @@
 #include <SVGA/VIDEO.H>
 #include <SYSTEM/KEYBOARD_KEYS.H>
 
+#include <GPU/GPURENDERER.H> /* SetOverlayOpaqueRect + IsActive: modal present rule */
+#include "EXTFUNC.H"         /* AffGrilleExt_BuildScreenPlate */
+
 #include <stdint.h>
 #include "AMBIANCE.H"
 #include "BOOT_EXIT.H"
@@ -507,6 +510,25 @@ void MenuComportement(S32 affone) {
 
     InitMove(&RealRot, -1024);
 
+    /* The behaviour modal is a full-2D overlay: DrawMenuComportement shades
+       Log through the CLUT and paints intentional index-0 strokes (DrawCadreBox
+       colour 0, empty life/magic bars). Under a GPU backend Log holds zeros
+       for the FBO composite outside 2D content, so ShadeBoxBlk would darken
+       holes to a flat shade and index 0 would present as transparent instead
+       of black. Pin the UI rect (frame + info bar) and put the software plate
+       into Log the same way MenuInventory does: AFF_ALL leaves Screen zeros
+       on both marks now (the interior re-blit is FBO quads, not CopyMask), so
+       exterior rebuilds the terrain plate and interior the room plate, then
+       both copy Screen into Log. */
+    GpuRenderer_SetOverlayOpaqueRect(CTRL_X0, CTRL_Y0, CTRL_X1, CTRL_Y1 + 90);
+    if (GpuRenderer_IsActive()) {
+        if (CubeMode == CUBE_EXTERIEUR)
+            AffGrilleExt_BuildScreenPlate();
+        else if (GpuRenderer_IsSceneInterior())
+            AffGrille_BuildScreenPlate();
+        CopyScreen(Screen, Log);
+    }
+
     BackupScreen(TRUE); // Screen => ScreenAux
 
     memoisland = Island;
@@ -633,6 +655,11 @@ void MenuComportement(S32 affone) {
     RestoreCamera();
     if (CubeMode == CUBE_INTERIEUR)
         CameraCenter(0);
+
+    /* Back to the gameplay frame: index 0 is a transparent window onto the
+       3D target again once the modal owns nothing. Clear before RestoreScreen
+       so its AffScene present is not forced opaque over the whole frame. */
+    GpuRenderer_SetOverlayOpaqueRect(0, 0, 0, 0);
 
     RestoreScreen();
 

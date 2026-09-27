@@ -1246,6 +1246,15 @@ static void Console_Draw(void) {
     }
 }
 
+int Console_PrePresentNeedsArgb(void) {
+    /* PPM screenshots are written from the ARGB buffer inside
+       Console_PrePresent; PNG screenshots go through SavePNG on Log and do
+       not need the conversion. The console itself draws into the buffer. */
+    if (s_screenshot_path[0] && !s_screenshot_png)
+        return 1;
+    return s_console_open;
+}
+
 void Console_PrePresent(U32 *frameBuffer, U32 pitch, U32 width, U32 height, const U8 *palette_rgb) {
     U32 y, x;
     /* Screenshot without console: PNG is done by game (SavePNG); only PPM here. */
