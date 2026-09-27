@@ -171,6 +171,35 @@ all three, and `check-tooling.sh` expects most hosts to lack the last two.
 `make test` sets `LBA2_BUILD_ASM_EQUIV_TESTS=OFF`, so none of this is needed for
 the host-only pass.
 
+### SDL3 GPU shaders
+
+The SDL3 GPU backend compiles its shaders at build time; the repo ships no
+prebuilt bytecode. Without these the configure *succeeds and warns*, so a
+green build says nothing about whether `Renderer: sdl3gpu` will start — every
+CI leg asserts the generated format header instead, which is also the cheapest
+way to see locally what a build can render. A `GPURENDERER=OFF` build needs
+none of it.
+
+| Tool | Needed for | Version owner | Install |
+|------|-----------|---------------|---------|
+| `glslangValidator` (or `glslang`, `glslc`) | GLSL → SPIR-V, the source every other format is cross-compiled from | — (any recent release) | `apt install glslang-tools`, `brew install glslang`, `pacman -S mingw-w64-ucrt-x86_64-glslang` |
+| `spirv-cross` (or `SDL_shadercross`) | SPIR-V → MSL on macOS, SPIR-V → HLSL on Windows | — | `brew install spirv-cross`, `pacman -S mingw-w64-ucrt-x86_64-spirv-cross`. SDL_shadercross is the translator SDL itself uses, but it publishes no releases, so there is no binary to point at |
+| `dxc` | HLSL → DXIL, the D3D12 shader format (Windows only) | [scripts/ci/install-dxc.sh](../scripts/ci/install-dxc.sh) (release URL + SHA-256) | `bash scripts/ci/install-dxc.sh` under MSYS2, which installs into `$MSYSTEM_PREFIX/bin`. MSYS2 packages no `dxc` |
+
+What each platform ends up shipping:
+
+- **macOS** — SPIR-V + MSL. There is no fallback: the configure **fails** if
+  neither `spirv-cross` nor `SDL_shadercross` is present, because Metal is the
+  only driver and SPIR-V alone cannot run.
+- **Windows** — DXIL only, so D3D12. SPIR-V is still compiled as the
+  cross-compilation intermediate but is not advertised while DXIL exists:
+  SDL probes backends Metal → Vulkan → D3D12, so a build offering both runs on
+  Vulkan wherever a driver exists. Without `dxc` the build keeps SPIR-V
+  instead, leaving Vulkan as the fallback rather than no backend at all.
+- **Linux and Android** — SPIR-V (Vulkan).
+
+`check-tooling.sh` reports all three rows under its per-lane section.
+
 ### Releasing
 
 Maintainer lane; see [RELEASING.md](RELEASING.md).
@@ -287,6 +316,7 @@ degrade to a skip when absent.
 | Build and play | 1 | retail game data — [GAME_DATA.md](GAME_DATA.md) |
 | Fix a bug in `SOURCES/` | 1 + clang-format | `make test` for the host pass |
 | Touch `LIB386/` | 1 + 2 | the container runs the ASM suite for you |
+| Work on the SDL3 GPU renderer | 1 + [SDL3 GPU shaders](#sdl3-gpu-shaders) | the configure only warns without the translators, so assert the format header — [RENDERER.md](RENDERER.md#build) |
 | Edit a script or workflow | 1 + shellcheck / ruff / actionlint | run `shellcheck -S warning` to match the gate |
 | Edit docs only | lychee | `make docs-links`; the [docs-only CI gate](CI.md) covers `build` and `test`, but the link check still runs |
 | Run the control harness | 1 | retail data; Pillow for image asserts — [CONTROL.md](CONTROL.md) |

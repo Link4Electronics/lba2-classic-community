@@ -55,13 +55,17 @@ jobs:
           # Toolchain only. The X11/Wayland/ALSA dev packages a static SDL3
           # needs at the lba2cc link step come from the setup-sdl3 action
           # below, which installs them unconditionally for link: static.
+          # glslang-tools is the shader toolchain: glslangValidator compiles
+          # the shared GLSL to SPIR-V, the format SDL's GPU backend loads on
+          # Linux. The configure only warns without it, so a tarball built
+          # here would carry a renderer that cannot create a device.
           for attempt in 1 2 3; do
             # Killing apt mid-transaction leaves dpkg interrupted, and every
             # later attempt aborts on that before fetching anything.
             sudo dpkg --configure -a || true
             if timeout -k 30 90 sudo apt-get "${apt_opts[@]}" update \
               && timeout -k 30 240 sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends \
-                cmake ninja-build build-essential; then
+                cmake ninja-build build-essential glslang-tools; then
               exit 0
             fi
             if [ "${attempt}" = 3 ]; then
@@ -91,6 +95,17 @@ jobs:
                 -DLBA2_LINK_STATIC=ON \
                 -DLBA2_RELEASE_SYMBOLS=ON \
                 -DCMAKE_BUILD_TYPE=Release
+
+      # The configure warns rather than fails when no GLSL compiler is found,
+      # so the header is what says whether the tarball embeds a usable backend.
+      - name: Verify shaders are embedded (SPIR-V)
+        run: |
+          HDR="out/build/linux/LIB386/SDL3GPU/sdl3gpu_shader_formats.h"
+          if ! grep -q "SDL3GPU_SHADERFORMAT_SPIRV_AVAILABLE 1" "$HDR"; then
+            echo "expected SPIRV_AVAILABLE 1 in $HDR:" >&2
+            cat "$HDR" >&2
+            exit 1
+          fi
 
       - name: Build
         run: cmake --build --preset linux

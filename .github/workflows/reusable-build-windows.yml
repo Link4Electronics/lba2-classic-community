@@ -61,8 +61,19 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-ninja
             ${{ matrix.sdl3_pkg }}
+            mingw-w64-ucrt-x86_64-glslang
+            mingw-w64-ucrt-x86_64-spirv-cross
+            curl
+            unzip
             xz
             zip
+
+      # glslang compiles the shared GLSL to SPIR-V (the DXIL path's
+      # intermediate) and spirv-cross turns that into SM6.0 HLSL; dxc, which
+      # compiles the HLSL to DXIL, is not packaged by MSYS2 and comes from the
+      # pinned zip in scripts/ci/install-dxc.sh (also the file that pins it).
+      - name: Install DXC (DXIL compiler)
+        run: bash scripts/ci/install-dxc.sh
 
       - name: Configure (static-link release build)
         run: |
@@ -70,6 +81,21 @@ jobs:
                 -DLBA2_LINK_STATIC=ON \
                 -DLBA2_RELEASE_SYMBOLS=ON \
                 -DCMAKE_BUILD_TYPE=Release
+
+      # Configure succeeds without any of this — it warns and the backend just
+      # has no shaders — so the header is what says whether the shipped build
+      # can start a D3D12 device at all. SPIR-V has to stay unadvertised: SDL
+      # probes Vulkan before D3D12, so a build that offers both runs on Vulkan
+      # wherever a driver exists.
+      - name: Verify shaders are embedded (DXIL, no SPIR-V)
+        run: |
+          HDR="out/build/${{ matrix.preset }}/LIB386/SDL3GPU/sdl3gpu_shader_formats.h"
+          if ! grep -q "SDL3GPU_SHADERFORMAT_DXIL_AVAILABLE 1" "$HDR" || \
+             ! grep -q "SDL3GPU_SHADERFORMAT_SPIRV_AVAILABLE 0" "$HDR"; then
+            echo "expected DXIL_AVAILABLE 1 and SPIRV_AVAILABLE 0 in $HDR:" >&2
+            cat "$HDR" >&2
+            exit 1
+          fi
 
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}

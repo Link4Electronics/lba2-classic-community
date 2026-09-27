@@ -58,6 +58,13 @@ jobs:
           link: static
           build-type: Release
 
+      # glslang compiles the shared GLSL to SPIR-V; spirv-cross cross-compiles
+      # that to MSL, the format SDL's Metal backend loads. Neither is on the
+      # runner image, and without them the configure fails outright: Apple has
+      # no SPIR-V fallback, Metal is the only driver.
+      - name: Install shader toolchain
+        run: brew install glslang spirv-cross
+
       - name: Configure (static-link release build)
         run: |
           cmake --preset ${{ matrix.preset }} \
@@ -65,6 +72,19 @@ jobs:
                 -DLBA2_LINK_STATIC=ON \
                 -DLBA2_RELEASE_SYMBOLS=ON \
                 -DCMAKE_BUILD_TYPE=Release
+
+      # Configure fails without the tools above, so this is belt-and-braces:
+      # it catches the case where they exist but produced nothing usable, and
+      # says in one line what the shipped binary can render.
+      - name: Verify shaders are embedded (SPIR-V + MSL)
+        run: |
+          HDR="out/build/${{ matrix.preset }}/LIB386/SDL3GPU/sdl3gpu_shader_formats.h"
+          if ! grep -q "SDL3GPU_SHADERFORMAT_SPIRV_AVAILABLE 1" "$HDR" || \
+             ! grep -q "SDL3GPU_SHADERFORMAT_MSL_AVAILABLE 1" "$HDR"; then
+            echo "expected SPIRV_AVAILABLE 1 and MSL_AVAILABLE 1 in $HDR:" >&2
+            cat "$HDR" >&2
+            exit 1
+          fi
 
       - name: Build
         run: cmake --build --preset ${{ matrix.preset }}

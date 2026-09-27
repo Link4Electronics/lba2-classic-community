@@ -51,6 +51,40 @@ jobs:
       # and put a third-party action plus a release download on the critical
       # path. The linux-tarball release job builds the same presets against
       # apt's older CMake, so this floor has cover.
+      #
+      # glslangValidator compiles the shared GLSL to SPIR-V, the format SDL's
+      # GPU backend needs on Linux (Vulkan). The runner image ships none and
+      # configure only warns without it, so a green build alone would say
+      # nothing about whether the renderer can start.
+      #
+      # Bounded and retried for the same reason as the apt in
+      # .github/actions/setup-sdl3: a stalled Ubuntu mirror gives no error to
+      # retry on and no wall clock of its own, so it goes quiet until the job
+      # timeout fires.
+      - name: Install shader toolchain
+        run: |
+          apt_opts=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=15
+            -o Acquire::https::Timeout=15
+          )
+          for attempt in 1 2 3; do
+            # Killing apt mid-transaction leaves dpkg interrupted, and every
+            # later attempt aborts on that before fetching anything.
+            sudo dpkg --configure -a || true
+            if timeout -k 30 90 sudo apt-get "${apt_opts[@]}" update \
+              && timeout -k 30 240 sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends \
+                glslang-tools; then
+              exit 0
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "apt failed after 3 attempts" >&2
+              exit 1
+            fi
+            echo "apt attempt $attempt failed or timed out; retrying in 10s"
+            sleep 10
+          done
+
       - name: Configure
         run: |
           cmake -S . -B build \
@@ -59,6 +93,15 @@ jobs:
             -DLBA2_BUILD_TESTS=ON \
             -DLBA2_BUILD_ASM_EQUIV_TESTS=OFF \
             --preset linux
+
+      - name: Verify shaders are embedded (SPIR-V)
+        run: |
+          HDR="build/LIB386/SDL3GPU/sdl3gpu_shader_formats.h"
+          if ! grep -q "SDL3GPU_SHADERFORMAT_SPIRV_AVAILABLE 1" "$HDR"; then
+            echo "expected SPIRV_AVAILABLE 1 in $HDR:" >&2
+            cat "$HDR" >&2
+            exit 1
+          fi
 
       # The generated .desktop entry and AppStream metainfo are copied into the
       # AppDir verbatim, so validating them here validates what ships. Both are

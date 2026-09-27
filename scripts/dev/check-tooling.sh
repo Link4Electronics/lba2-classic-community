@@ -374,6 +374,33 @@ else
     row gap "uasm" "ENABLE_ASM=ON only; the container fetches ${UASM_PIN:-the pinned build} itself"
 fi
 
+# SDL3 GPU backend shaders. They are compiled in at configure time, so a
+# missing translator does not fail the build — it leaves the backend with
+# nothing to load and the renderer falls back. Reported rather than fatal for
+# that reason: the software and OpenGL renderers need none of it, and the
+# Apple case below is the one where it is not optional.
+if glsl_compiler="$(first_of glslangValidator glslang glslc)"; then
+    row ok "GLSL compiler" "$glsl_compiler — GLSL to SPIR-V"
+else
+    row gap "GLSL compiler" "apt install glslang-tools, brew install glslang, pacman -S mingw-w64-ucrt-x86_64-glslang"
+fi
+if cross_compiler="$(first_of shadercross spirv-cross)"; then
+    row ok "SPIR-V cross-compiler" "$cross_compiler — MSL on macOS, HLSL on Windows"
+elif [ "$HOST" = macos ]; then
+    row gap "SPIR-V cross-compiler" "mandatory here: configure fails on Apple without it (brew install spirv-cross)"
+elif [ "$HOST" = windows ]; then
+    row gap "SPIR-V cross-compiler" "for DXIL/D3D12 — pacman -S mingw-w64-ucrt-x86_64-spirv-cross"
+else
+    row info "SPIR-V cross-compiler" "not needed on Linux; SPIR-V is the format the backend loads"
+fi
+if [ "$HOST" = windows ]; then
+    if have dxc; then
+        row ok "dxc" "HLSL to DXIL — what the Windows build advertises"
+    else
+        row gap "dxc" "bash scripts/ci/install-dxc.sh (pinned there); without it Windows falls back to Vulkan"
+    fi
+fi
+
 # Releasing
 if have gh; then
     if gh auth status >/dev/null 2>&1; then

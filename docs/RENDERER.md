@@ -56,6 +56,23 @@ per-API blocks with `##ifdef GL_ES` / `##ifdef GL_CORE` / `##ifdef SDL3GPU` /
 `gs3`) and links them into the engine. The engine target compiles with
 `USE_GPURENDERER`; a `GPURENDERER=OFF` build has no GPU references at all.
 
+Which shader formats that build embeds depends on what the configure finds:
+[../LIB386/SDL3GPU/CMakeLists.txt](../LIB386/SDL3GPU/CMakeLists.txt) writes
+`sdl3gpu_shader_formats.h`, and the device-create mask plus the shader table
+are built from it. SPIR-V wherever a GLSL compiler exists, MSL wherever a
+SPIR-V cross-compiler exists as well, DXIL on Windows only when `dxc` or
+SDL_shadercross is available. The configure warns rather than fails when they
+are missing — the exception is Apple, where no MSL means no backend can run at
+all — so every CI leg asserts the generated header instead of trusting the
+build to have noticed. The per-platform installs and the `dxc` pin live in
+[TOOLING.md](TOOLING.md#sdl3-gpu-shaders).
+
+Windows advertises DXIL alone while it has DXIL. SDL probes backends in
+Metal, Vulkan, D3D12 order, so a Windows build that also offers SPIR-V would
+run on Vulkan wherever a driver exists and D3D12 would never be reached; a
+Windows build with no `dxc` keeps SPIR-V, leaving Vulkan as the fallback
+rather than nothing.
+
 ## How the engine plugs in
 
 The game never calls the renderer directly; three seams keep the software

@@ -71,6 +71,18 @@ jobs:
           done
           echo "AppImage build failed after 3 attempts" >&2
           exit 1
+      # make-appimage.sh installs shaderc itself, so this only proves the
+      # install did what the tag claims: the configure warns rather than fails
+      # when no GLSL compiler is found, and a green build alone would say
+      # nothing about whether the shipped renderer can start.
+      - name: Verify shaders are embedded (SPIR-V)
+        run: |
+          HDR="build/LIB386/SDL3GPU/sdl3gpu_shader_formats.h"
+          if ! grep -q "SDL3GPU_SHADERFORMAT_SPIRV_AVAILABLE 1" "$HDR"; then
+            echo "expected SPIRV_AVAILABLE 1 in $HDR:" >&2
+            cat "$HDR" >&2
+            exit 1
+          fi
       - name: Upload temporary artifact
         uses: actions/upload-artifact@v7
         with:

@@ -78,6 +78,17 @@ if(GLSL_COMPILER)
     endif()
 endif()
 
+# Windows ships D3D12 and nothing else. SDL probes backends in Metal, Vulkan,
+# D3D12 order, so an advertised SPIR-V would select Vulkan on any machine with
+# a Vulkan driver and D3D12 would never be reached. SPIR-V remains the DXIL
+# intermediate here (it is what spirv-cross translates), but while DXIL was
+# built it is neither advertised to the device mask nor embedded. A build
+# without a cross-compiler pair keeps SPIR-V, so Vulkan stays the fallback
+# instead of leaving Windows with no backend at all.
+if(WIN32 AND SDL3GPU_SHADERFORMAT_DXIL_AVAILABLE)
+    set(SDL3GPU_SHADERFORMAT_SPIRV_AVAILABLE 0)
+endif()
+
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/sdl3gpu_shader_formats.h"
     "#ifndef SDL3GPU_SHADER_FORMATS_H_\n"
     "#define SDL3GPU_SHADER_FORMATS_H_\n"
