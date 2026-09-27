@@ -31,8 +31,8 @@ S32 YpOrgw;
 S16 NbBrickColon[NB_COLON];
 
 /* When set, AffBrickBlock / AffBrickBlockOnly force the software AffGraph
-   path and skip GpuRenderer_DrawBrick. AFF_ALL builds the Screen re-blit
-   plate with this so CopyMask sources wall pixels without submitting a
+   path and skip GpuRenderer_DrawBrick. AffGrille_BuildScreenPlate sets this
+   so the on-demand Screen plate (2D modals) rasterizes without submitting a
    second FBO batch. */
 static S32 s_swPlateBricks = 0;
 
@@ -674,6 +674,24 @@ void InitBufferCube() {
  *══════════════════════════════════════════════════════════════════════════*/
 /*──────────────────────────────────────────────────────────────────────────*/
 
+/* Recouvrement: paint one front-wall brick over the actor. Under GpuScene
+   the interior room lives in the FBO and Screen carries no plate on a normal
+   frame, so the same brick quad is submitted again after the body — batch
+   order is paint order, and bodies take no depth so the wall lands on top.
+   The mask bank contributes nothing the atlas does not already hold:
+   CalcGraphMsk derives it from the brick's own RLE spans, which the atlas
+   encodes in G, so the shader's G == 0 discard is CopyMask's gate. Whenever
+   the backend declines (flag off, no backend, pack failure) CopyMask runs
+   exactly as before. */
+static void ReBlitOverActorBrick(const T_COLONB *ptrlbc) {
+    if (GpuRenderer_DrawBrickOver(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys,
+                                  GpuRenderer_IsoWorldZO(ptrlbc->Xm, ptrlbc->Ym,
+                                                         ptrlbc->Zm))) {
+        return;
+    }
+    CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+}
+
 void DrawOverBrick(S32 xm, S32 ym, S32 zm) {
     register T_COLONB *ptrlbc;
     S32 col, i;
@@ -736,7 +754,7 @@ void DrawOverBrick(S32 xm, S32 ym, S32 zm) {
                                    1
                                        //				AND WorldColBrick(xw+SIZE_BRICK_XZ,yw,zw)==1 ) )
                                        AND WorldColBrick(xw + SIZE_BRICK_XZ, yw, zw) >= 1)) {
-                        CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+                        ReBlitOverActorBrick(ptrlbc);
                     }
                 }
             }
@@ -766,17 +784,17 @@ void DrawOverBrick3(S32 xm, S32 ym, S32 zm, S32 ymax) {
                 if (ptrlbc->Ym > ymax) {
                     if ((ptrlbc->Zm >= zm)
                             OR(ptrlbc->Xm >= xm)) {
-                        CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+                        ReBlitOverActorBrick(ptrlbc);
                     }
                 } else if (ptrlbc->Ym >= ym) {
                     if ((ptrlbc->Zm == zm)
                             AND(ptrlbc->Xm == xm)) {
-                        CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+                        ReBlitOverActorBrick(ptrlbc);
                     }
 
                     if ((ptrlbc->Zm > zm)
                             OR(ptrlbc->Xm > xm)) {
-                        CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+                        ReBlitOverActorBrick(ptrlbc);
                     }
                 }
             }
@@ -808,12 +826,12 @@ void DrawOverBrickCage(S32 xm, S32 ym, S32 zm) {
                                  AND ptrlbc->Ym >= ym) {
                     if ((ptrlbc->Zm == zm)
                             AND(ptrlbc->Xm == xm)) {
-                        CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+                        ReBlitOverActorBrick(ptrlbc);
                     }
 
                     if ((ptrlbc->Zm > zm)
                             OR(ptrlbc->Xm > xm)) {
-                        CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
+                        ReBlitOverActorBrick(ptrlbc);
                     }
                 }
             }
@@ -1127,11 +1145,12 @@ void AffGrilleLabyrinthe() {
     }
 }
 
-/* Rebuild the software room into Log, snapshot it to Screen for DrawOverBrick's
-   CopyMask (which sources wall pixels from Screen), then clear Log so the
-   present shows the FBO room through the overlay. Only called under
-   GpuRenderer_IsSceneInterior(); the plate pass forces AffGraph so no second
-   FBO batch is submitted. */
+/* Rebuild the software room into Screen for the 2D modals that shade through
+   it (inventory wheel, behaviour panel), then clear Log so the present shows
+   the FBO room through the overlay. A normal frame needs no plate — DrawOverBrick
+   re-blits its front walls as FBO quads — so AFF_ALL never calls this; the
+   callers that do are under GpuRenderer_IsSceneInterior(). The plate pass
+   forces AffGraph so no second FBO batch is submitted. */
 void AffGrille_BuildScreenPlate(void) {
     s_swPlateBricks = 1;
     if (ModeLabyrinthe) {

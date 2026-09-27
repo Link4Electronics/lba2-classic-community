@@ -17,10 +17,13 @@ precision mediump float;
 layout(set = 2, binding = 0) uniform sampler2D uAtlas;   /* 256×256 LUMINANCE */
 layout(set = 2, binding = 1) uniform sampler2D uCLUT;    /* 256×256 LUMINANCE (fog table) */
 layout(set = 2, binding = 2) uniform sampler2D uPalette; /* 256×1 ARGB (paletteLUT) */
+layout(set = 2, binding = 3) uniform sampler2D uBlendSrcLog; /* full-screen RG8: R = walked source index, G = Log index */
+layout(set = 2, binding = 4) uniform sampler2D uBlendDst;    /* per-sprite FBO rect copy, A = destination index */
+layout(set = 2, binding = 5) uniform sampler2D uTransPal;    /* 256×256 R8 blend table: row = source, column = destination */
 layout(std140, set = 3, binding = 0) uniform GpuParams {
     int   uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable
                              4=textureNoCLUT 5=fogSmooth 6=sceneShadow
-                             7=brickQuad */
+                             7=brickQuad 8=blendSprite */
     int   uAlphaMode;     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
     float uFlatColor;     /* palette index (mode 1) / CLUT column (mode 3) */
     int   uBilinear;      /* 0=nearest 1=bilinear CLUT sampling */
@@ -32,6 +35,10 @@ layout(std140, set = 3, binding = 0) uniform GpuParams {
     float uBrickW;        /* brick atlas width (mode 7) */
     float uBrickH;        /* brick atlas height (mode 7) */
     float uBrickPad;
+    float uBlendLogW;     /* blend page width in pixels (mode 8) */
+    float uBlendLogH;     /* blend page height in pixels (mode 8) */
+    float uBlendDstW;     /* dst rect width in pixels (mode 8) */
+    float uBlendDstH;     /* dst rect height in pixels (mode 8) */
 };
 layout(location = 0) in vec2 vTexCoord;
 layout(location = 1) in vec2 vTexCoordOverW;
@@ -194,6 +201,32 @@ void main() {
         vec2 t = texture(uAtlas, uv).rg;
         if (t.y < (0.5 / 255.0)) discard;
         color = texture(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));
+    } else if (uPolyMode == 8) {
+        /* Blend sprite (EXTRA_TRANSPARENT): integer ScaleSpriteTransp
+            equivalent. vTexCoord is the local rect pixel coordinate; the CPU
+            walk put the sampled source index (R) and the live Log index (G)
+            in uBlendSrcLog, the scene's pre-draw destination index sits in
+            uBlendDst.a (Log wins where the software path read Log), and
+            uTransPal is the 64 KB transpTable (row = source, column =
+            destination). Palette index 0 is skipped by the software walk —
+            discard reproduces that. The result color's alpha carries the
+            result index so a chained blend sprite sees it as destination. */
+        vec2 px = floor(vTexCoord);
+        vec4 sl = texture(uBlendSrcLog,
+                          (px + 0.5) / vec2(uBlendLogW, uBlendLogH));
+        float srcIdx = floor(sl.r * 255.0 + 0.5);
+        if (srcIdx < 0.5) discard;
+        float logIdx = floor(sl.g * 255.0 + 0.5);
+        float dstIdx = floor(texture(uBlendDst,
+                                     (px + 0.5) / vec2(uBlendDstW, uBlendDstH))
+                                .a * 255.0 + 0.5);
+        if (logIdx >= 0.5) dstIdx = logIdx;
+        float result = floor(texture(uTransPal,
+                                     vec2((dstIdx + 0.5) / 256.0,
+                                          (srcIdx + 0.5) / 256.0))
+                                 .r * 255.0 + 0.5);
+        color = texture(uPalette, vec2((result + 0.5) / 256.0, 0.5));
+        color.a = result / 255.0;
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
             Same +128 rounding bias as polyMode 0. */
@@ -225,15 +258,22 @@ void main() {
 uniform sampler2D uAtlas;   /* 256×256 LUMINANCE */
 uniform sampler2D uCLUT;    /* 256×256 LUMINANCE (fog table) */
 uniform sampler2D uPalette; /* 256×1 BGRA (paletteLUT) */
+uniform sampler2D uBlendSrcLog; /* full-screen RG8: R = walked source index, G = Log index */
+uniform sampler2D uBlendDst;    /* per-sprite FBO rect copy, A = destination index */
+uniform sampler2D uTransPal;    /* 256×256 R8 blend table: row = source, column = destination */
 uniform int uPolyMode;      /* 0=texture 1=flat 2=gouraud 3=gouraudTable
                                4=textureNoCLUT 5=fogSmooth 6=sceneShadow
-                               7=brickQuad */
+                               7=brickQuad 8=blendSprite */
 uniform float uFlatColor;   /* palette index (mode 1) / CLUT column (mode 3) */
 uniform float uCLUTBaseRow; /* CLUT row offset for gouraud table (mode 3) */
 uniform float uScaledFogNear; /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
 uniform float uFogRowScale;   /* Fill_Fog_Factor / 65536 (fog-smooth distance, mode 5) */
 uniform float uBrickW;      /* brick atlas width (mode 7) */
 uniform float uBrickH;      /* brick atlas height (mode 7) */
+uniform float uBlendLogW;   /* blend page width in pixels (mode 8) */
+uniform float uBlendLogH;   /* blend page height in pixels (mode 8) */
+uniform float uBlendDstW;   /* dst rect width in pixels (mode 8) */
+uniform float uBlendDstH;   /* dst rect height in pixels (mode 8) */
 uniform int uAlphaMode;     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
 uniform int uBilinear;      /* 0=nearest 1=bilinear CLUT sampling */
 uniform int uChromaKey;     /* 0=no chroma key 1=discard index 0 */
@@ -397,6 +437,32 @@ void main() {
         vec2 t = texture2D(uAtlas, uv).rg;
         if (t.y < (0.5 / 255.0)) discard;
         color = texture2D(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));
+    } else if (uPolyMode == 8) {
+        /* Blend sprite (EXTRA_TRANSPARENT): integer ScaleSpriteTransp
+            equivalent. vTexCoord is the local rect pixel coordinate; the CPU
+            walk put the sampled source index (R) and the live Log index (G)
+            in uBlendSrcLog, the scene's pre-draw destination index sits in
+            uBlendDst.a (Log wins where the software path read Log), and
+            uTransPal is the 64 KB transpTable (row = source, column =
+            destination). Palette index 0 is skipped by the software walk —
+            discard reproduces that. The result color's alpha carries the
+            result index so a chained blend sprite sees it as destination. */
+        vec2 px = floor(vTexCoord);
+        vec2 sl = texture2D(uBlendSrcLog,
+                            (px + 0.5) / vec2(uBlendLogW, uBlendLogH)).ra;
+        float srcIdx = floor(sl.x * 255.0 + 0.5);
+        if (srcIdx < 0.5) discard;
+        float logIdx = floor(sl.y * 255.0 + 0.5);
+        float dstIdx = floor(texture2D(uBlendDst,
+                                       (px + 0.5) / vec2(uBlendDstW, uBlendDstH))
+                              .a * 255.0 + 0.5);
+        if (logIdx >= 0.5) dstIdx = logIdx;
+        float result = floor(texture2D(uTransPal,
+                                       vec2((dstIdx + 0.5) / 256.0,
+                                            (srcIdx + 0.5) / 256.0))
+                                 .r * 255.0 + 0.5);
+        color = texture2D(uPalette, vec2((result + 0.5) / 256.0, 0.5));
+        color.a = result / 255.0;
     } else {
         /* Gouraud table (types 6/7): CLUT lookup, color = column.
             Same +128 rounding bias as polyMode 0. */

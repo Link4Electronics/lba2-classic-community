@@ -32,6 +32,8 @@ S32 screenLockCount = 0;
 bool frameDirty = false;
 static PrePresentFn s_prePresent = NULL;
 static PrePresentFn s_overlayPrePresent = NULL;
+static PrePresentNeedsArgbFn s_prePresentNeedsArgb = NULL;
+static PrePresentNeedsArgbFn s_overlayPrePresentNeedsArgb = NULL;
 static PresentTimingFn s_presentBegin = NULL;
 static PresentTimingFn s_presentEnd = NULL;
 static U32 paletteLUT[PAL_MAX_COLORS];
@@ -300,6 +302,14 @@ void SetOverlayPrePresentCallback(PrePresentFn fn) {
     s_overlayPrePresent = fn;
 }
 
+void SetPrePresentNeedsArgb(PrePresentNeedsArgbFn fn) {
+    s_prePresentNeedsArgb = fn;
+}
+
+void SetOverlayPrePresentNeedsArgb(PrePresentNeedsArgbFn fn) {
+    s_overlayPrePresentNeedsArgb = fn;
+}
+
 void SetPresentTimingCallbacks(PresentTimingFn begin, PresentTimingFn end) {
     s_presentBegin = begin;
     s_presentEnd = end;
@@ -362,24 +372,40 @@ static void PresentFrame() {
     assert(sdlPalette != NULL);
     assert(Log != NULL);
 
-    void *stagingPixels;
-    U32 stagingPitch;
-    if (!AcquirePresentTarget(&stagingPixels, &stagingPitch)) {
-        return;
-    }
+    const S32 gpuActive =
+        (s_gpuPresent != NULL && s_gpuIsActive != NULL && s_gpuIsActive());
+    /* R8 present: with a GPU backend live and no callback that reads or
+       writes the ARGB staging this frame, hand Log's palette indices straight
+       to the renderer and skip the CPU conversion. Control_ServiceListen
+       ignores the buffer; Console/Touch report through their NeedsArgb query. */
+    const S32 needsArgb =
+        (s_prePresentNeedsArgb != NULL && s_prePresentNeedsArgb()) ||
+        (s_overlayPrePresentNeedsArgb != NULL &&
+         s_overlayPrePresentNeedsArgb());
+    const S32 useIndexed = gpuActive && !needsArgb;
 
-    U8 *logMem = (U8 *)Log;
+    void *stagingPixels = NULL;
+    U32 stagingPitch = 0;
+    if (!useIndexed) {
+        if (!AcquirePresentTarget(&stagingPixels, &stagingPitch)) {
+            return;
+        }
 
-    for (U32 y = 0; y < ModeDesiredY; ++y) {
-        U8 *srcRow = logMem + y * ModeDesiredX;
-        U32 *dstRow = (U32 *)((U8 *)stagingPixels + y * stagingPitch);
-        for (U32 x = 0; x < ModeDesiredX; ++x) {
-            dstRow[x] = paletteLUT[srcRow[x]];
+        U8 *logMem = (U8 *)Log;
+
+        for (U32 y = 0; y < ModeDesiredY; ++y) {
+            U8 *srcRow = logMem + y * ModeDesiredX;
+            U32 *dstRow = (U32 *)((U8 *)stagingPixels + y * stagingPitch);
+            for (U32 x = 0; x < ModeDesiredX; ++x) {
+                dstRow[x] = paletteLUT[srcRow[x]];
+            }
         }
     }
 
     if (s_prePresent || s_overlayPrePresent) {
-        /* Build the 256-entry RGB table once; both callbacks take the same. */
+        /* Build the 256-entry RGB table once; both callbacks take the same.
+           Indexed frames pass NULL buffers — every registered NeedsArgb
+           query said this frame's callbacks would not touch them. */
         static U8 paletteRgb[256 * 3];
         for (int i = 0; i < 256; i++) {
             U32 c = paletteLUT[i];
@@ -388,24 +414,34 @@ static void PresentFrame() {
             paletteRgb[i * 3 + 2] = (U8)(c);
         }
         if (s_prePresent)
-            s_prePresent((U32 *)stagingPixels, stagingPitch, ModeResX, ModeResY, paletteRgb);
+            s_prePresent((U32 *)stagingPixels, stagingPitch, ModeResX, ModeResY,
+                         paletteRgb);
         if (s_overlayPrePresent)
-            s_overlayPrePresent((U32 *)stagingPixels, stagingPitch, ModeResX, ModeResY, paletteRgb);
+            s_overlayPrePresent((U32 *)stagingPixels, stagingPitch, ModeResX,
+                                ModeResY, paletteRgb);
     }
 
-    if (s_gpuPresent != NULL && s_gpuIsActive != NULL && s_gpuIsActive()) {
-        /* GPU present: hand the Log ARGB overlay to the renderer, which
-           composites it over its GPU framebuffer (the GL 3D pass) and swaps
-           the window itself. When no renderer is active these hooks are NULL
-           and the software streaming-texture commit below runs, exactly as
-           before. The Log buffer uses palette index 0 as the transparent
-           colour (sprites, INCRUST panels), so the overlay only shows 3D
-           behind those pixels if entry 0 carries alpha 0 — the GL 3D path
-           already forces this on its own palette texture via GL_UploadPalette,
-           and the same is applied here to the overlay's ARGB conversion. */
+    if (gpuActive) {
+        /* GPU present: hand the Log overlay to the renderer, which composites
+           it over its GPU framebuffer (the GL 3D pass) and swaps the window
+           itself. When no renderer is active these hooks are NULL and the
+           software streaming-texture commit below runs, exactly as before.
+           The Log buffer uses palette index 0 as the transparent colour
+           (sprites, INCRUST panels), so the overlay only shows 3D behind
+           those pixels if entry 0 carries alpha 0 — the GL 3D path already
+           forces this on its own palette texture via GL_UploadPalette, and
+           the same is applied here to the overlay's ARGB conversion. The R8
+           path skips that conversion; the present shader reads the LUT
+           directly, where TexUpdatePalette has already forced entry 0's
+           alpha to 0. */
         paletteLUT[0] &= 0x00FFFFFF;
-        s_gpuPresent(stagingPixels, stagingPitch, ModeDesiredX, ModeDesiredY,
-                     FALSE);
+        if (useIndexed) {
+            s_gpuPresent(Log, ModeDesiredX, ModeDesiredX, ModeDesiredY, FALSE,
+                         TRUE);
+        } else {
+            s_gpuPresent(stagingPixels, stagingPitch, ModeDesiredX,
+                         ModeDesiredY, FALSE, FALSE);
+        }
         return;
     }
 

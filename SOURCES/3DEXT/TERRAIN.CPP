@@ -80,7 +80,11 @@ void DrawSkySeaZBuf() {
 /*──────────────────────────────────────────────────────────────────────────*/
 
 void ClsTerrainZBuf() {
-    if (GpuRenderer_IsActive()) {
+    /* Software-plate passes force the software fillers while the backend is
+       still active (GpuRenderer_SetSoftwarePolys): the clear must then be
+       the software FogCoul fill, or the plate would start from zeros and
+       ShadeBoxBlk would darken holes instead of scene colours. */
+    if (GpuRenderer_IsActive() && !GpuRenderer_GetSoftwarePolys()) {
         /* The GPU target already holds this frame's terrain; only palette
            index 0 is transparent in the present composite, so a FogCoul fill
            here would park an opaque overlay over that target. Keep Log at

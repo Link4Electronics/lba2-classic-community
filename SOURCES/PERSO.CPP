@@ -2181,6 +2181,14 @@ static void ControlPrePresent(U32 *frameBuffer, U32 pitch, U32 width, U32 height
     Console_PrePresent(frameBuffer, pitch, width, height, palette_rgb);
 }
 
+/* Whether ControlPrePresent will touch the ARGB buffer this frame. The listen
+   poll ignores it; the console compositor only draws when open (or a PPM
+   screenshot is pending). When this and the overlay query are both FALSE and
+   a GPU backend owns the present, PresentFrame skips the CPU conversion. */
+static S32 ControlPrePresentNeedsArgb(void) {
+    return Console_PrePresentNeedsArgb();
+}
+
 int main(int argc, char *argv[]) {
     /* --version: print resolved engine version (from VERSION file at the
      * repo root, optionally suffixed with -dirty) and exit. Handled before
@@ -2502,6 +2510,7 @@ int main(int argc, char *argv[]) {
     /* Console hooks: keyboard toggle/input interception + final-frame overlay compositing. */
     SetEventFilter(Console_FeedEvent);
     SetPrePresentCallback(ControlPrePresent);
+    SetPrePresentNeedsArgb(ControlPrePresentNeedsArgb);
 
     /* Touch virtual gamepad (Android / mobile). Init before Perftrace so
        timing callbacks nest correctly. No-op on non-Android builds.
@@ -2514,6 +2523,7 @@ int main(int argc, char *argv[]) {
        nothing to draw. */
     TouchOverlay_Init();
     SetOverlayPrePresentCallback(TouchOverlay_Render);
+    SetOverlayPrePresentNeedsArgb(TouchOverlay_PrePresentNeedsArgb);
 
     /* Perftrace: ring-buffer per-frame timing capture; off by default, opt-in
        via the `perftrace` console verb. See docs/PERFTRACE.md. */

@@ -1147,6 +1147,23 @@ void MenuInventory(U32 tempo) {
     GpuRenderer_SetOverlayOpaqueRect(INV_START_X + 1, INV_START_Y + 1,
                                      INV_END_X - 1, INV_END_Y - 1);
 
+    /* Screen plate under a GPU backend: AFF_ALL ends with CopyScreen(Log,
+       Screen) while Log is cleared for the FBO composite, so Screen holds
+       zeros. OpenInventory's CopyScreen(Screen, Log) would then feed
+       ShadeBoxBlk empty indices and the wheel would darken to a flat shade
+       instead of the scene. Rebuild the plate once here (after any capture
+       pre-arm AffScene, which has the same hole): terrain for the exterior,
+       room for the interior — AFF_ALL no longer builds the interior one,
+       DrawOverBrick's front-wall re-blits being FBO quads now. Skipped for
+       the cleanroom --black-bg golden, which must stay scene-free. Interior
+       with the flag off keeps the plate AFF_ALL copied out of Log. */
+    if (GpuRenderer_IsActive() && !(s_inv_capture_path[0] && Console_GetCaptureBlackBg())) {
+        if (CubeMode == CUBE_EXTERIEUR)
+            AffGrilleExt_BuildScreenPlate();
+        else if (GpuRenderer_IsSceneInterior())
+            AffGrille_BuildScreenPlate();
+    }
+
     OpenInventory(); // draw all
 
     InitDial(2); // game divers txt

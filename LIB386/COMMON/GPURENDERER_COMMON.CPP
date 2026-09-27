@@ -18,8 +18,11 @@
 #include <GPU/GPURENDERER.H>
 #include <GPU/GPURENDERER_BACKEND.H>
 #include <GPU/GPUSPRITE_DECODE.H>
+#include <GPU/GPUBLEND_WALK.H>
+#include <GPU/GPUPRESENT_DIRTY.H>
 #include <POLYGON/POLY.H>
 #include <SVGA/CLIP.H>
+#include <SVGA/FONT.H> /* PtrFont / ColMask walk behind GpuRenderer_DrawHudText */
 #include <SVGA/SCREEN.H>
 #include <SVGA/SCREENXY.H>
 #include <SVGA/SDL.H> /* SetGpuPresentHooks: the present seam SDL.CPP exposes */
@@ -60,8 +63,8 @@ typedef struct BackendSlot {
 } BackendSlot;
 
 static const BackendSlot s_backends[] = {
-    { GPU_RENDERER_BACKEND_OPENGL, &GpuRendererBackendGL },
-    { GPU_RENDERER_BACKEND_SDL3GPU, &GpuRendererBackendSDL3GPU },
+    {GPU_RENDERER_BACKEND_OPENGL, &GpuRendererBackendGL},
+    {GPU_RENDERER_BACKEND_SDL3GPU, &GpuRendererBackendSDL3GPU},
 };
 static const U32 s_backendCount =
     (U32)(sizeof(s_backends) / sizeof(s_backends[0]));
@@ -82,7 +85,7 @@ static const GpuRendererBackend *s_backend = NULL;
 static GpuRendererBackendId s_backendId = GPU_RENDERER_BACKEND_NONE;
 static S32 s_active = 0;
 static S32 s_vsyncWanted = 1; /* present pacing, default on */
-static U32 s_resX = 0;  /* present surface size (engine pixel space) */
+static U32 s_resX = 0;        /* present surface size (engine pixel space) */
 static U32 s_resY = 0;
 static U32 s_renderQuality = 1; /* 1 = native, 2 = 2x, 4 = 4x */
 
@@ -103,6 +106,12 @@ static S32 s_fboHasRoom = 0;
    brick-written depth. Not a frame-content flag: ClearFBO does not reset
    it. */
 static S32 s_sceneInterior = 0;
+
+/* One-shot software-plate mode (GpuRenderer_SetSoftwarePolys): while set,
+   RenderTriangleList yields every poly to the software rasterizer so a
+   caller can rebuild Log with palette indices. Reset on Init/Shutdown so a
+   failed plate pass cannot leave the hook dead. */
+static S32 s_forceSoftwarePolys = 0;
 
 /* The persistent terrain target holds a post-terrain-pass copy of the FBO
    (see SnapshotTerrain/RestoreTerrain). Valid only once a snapshot landed,
@@ -182,6 +191,11 @@ static const void *s_uploadedAtlas = NULL;
    poly intake never sees it, and Common_BuildDrawParams maps it to
    polyMode 7. */
 #define GPU_BRICK_TYPE 0x7FFF
+/* Same quad and atlas as GPU_BRICK_TYPE, batched separately because it takes
+   no depth: CopyMask, the software re-blit it replaces, overwrites Log
+   unconditionally, and a GEQUAL test against the room's own depth would drop
+   a wall in front of a body whenever a nearer brick owns that texel. */
+#define GPU_BRICKOVER_TYPE 0x7FFD
 #define GPU_BRICK_ATLAS_W 2048
 #define GPU_BRICK_ATLAS_H 2048
 
@@ -193,7 +207,7 @@ static const void *s_brickBank = NULL;
 static U32 s_brickCount = 0;
 static U8 *s_brickAtlasData = NULL; /* RG8, GPU_BRICK_ATLAS_W*H*2      */
 static GpuBrickRect *s_brickRects = NULL;
-static S32 s_brickPackValid = 0;   /* atlas+rects match s_brickBank     */
+static S32 s_brickPackValid = 0; /* atlas+rects match s_brickBank     */
 static const void *s_uploadedBrickAtlas = NULL;
 
 /* ── Opaque world-sprite atlas (GpuScene phase 3) ───────────────────────── */
@@ -228,7 +242,7 @@ static const void *s_uploadedSpriteAtlas = NULL;
 
 /* ── Screen-space mapping ───────────────────────────────────────────────── */
 
-static float s_screenScale[2] = { 0.0f, 0.0f };
+static float s_screenScale[2] = {0.0f, 0.0f};
 
 static void Common_UpdateScreenScale(void) {
     s_screenScale[0] = 2.0f / (float)s_resX;
@@ -448,6 +462,45 @@ static void Common_ResetSpriteAtlas(void) {
     s_uploadedSpriteAtlas = NULL;
 }
 
+// Reserves a w x h shelf slot at the current pen without committing it:
+// allocates the page, wraps the pen to the next row, resets a full page,
+// and reports the slot in outRect. The caller fills the slot (decode or a
+// walked copy) and then Common_ShelfCommit advances the pen — a failed fill
+// leaves the slot free for the retry, the same as before the split.
+static S32 Common_ShelfReserve(U32 w, U32 h, GpuBrickRect *outRect) {
+    if (s_spriteAtlasData == NULL) {
+        Common_ResetSpriteAtlas();
+        if (s_spriteAtlasData == NULL) {
+            return FALSE;
+        }
+    }
+    if (s_spritePenX + w > GPU_SPRITE_ATLAS_W) {
+        s_spritePenX = 0;
+        s_spritePenY += s_spriteRowH;
+        s_spriteRowH = 0;
+    }
+    if (s_spritePenY + h > GPU_SPRITE_ATLAS_H) {
+        Common_ResetSpriteAtlas();
+        if (s_spriteAtlasData == NULL) {
+            return FALSE;
+        }
+        if (w > GPU_SPRITE_ATLAS_W || h > GPU_SPRITE_ATLAS_H) {
+            return FALSE;
+        }
+    }
+    outRect->x = (U16)s_spritePenX;
+    outRect->y = (U16)s_spritePenY;
+    return TRUE;
+}
+
+static void Common_ShelfCommit(U32 w, U32 h) {
+    s_spritePenX += w;
+    if (h > s_spriteRowH) {
+        s_spriteRowH = h;
+    }
+    s_spriteAtlasDirty = 1;
+}
+
 // Shelf-packs one sprite into the page, or returns the cached rect. The
 // caller holds a bank whose sprite at `idx` is a single AffGraph or
 // ScaleSprite entry (header at bank[idx] offset). Returns FALSE on a
@@ -462,6 +515,7 @@ static S32 Common_PackSprite(const void *bank, S32 idx, S32 rawFormat,
     U32 w;
     U32 h;
     U32 i;
+    GpuBrickRect rect;
     GpuSpriteCacheEntry *grown;
 
     if (bank == NULL || idx < 0) {
@@ -493,37 +547,19 @@ static S32 Common_PackSprite(const void *bank, S32 idx, S32 rawFormat,
         dataMax = GPU_SPRITE_ATLAS_W; /* generous; decode stops on overrun */
     }
 
-    if (s_spriteAtlasData == NULL) {
-        Common_ResetSpriteAtlas();
-        if (s_spriteAtlasData == NULL) {
-            return FALSE;
-        }
-    }
-
-    if (s_spritePenX + w > GPU_SPRITE_ATLAS_W) {
-        s_spritePenX = 0;
-        s_spritePenY += s_spriteRowH;
-        s_spriteRowH = 0;
-    }
-    if (s_spritePenY + h > GPU_SPRITE_ATLAS_H) {
-        Common_ResetSpriteAtlas();
-        if (s_spriteAtlasData == NULL) {
-            return FALSE;
-        }
-        if (w > GPU_SPRITE_ATLAS_W || h > GPU_SPRITE_ATLAS_H) {
-            return FALSE;
-        }
-    }
+    /* Eviction before Reserve so the returned slot sits on the fresh page. */
     if (s_spriteCacheCount >= GPU_SPRITE_CACHE_MAX) {
         Common_ResetSpriteAtlas();
         if (s_spriteAtlasData == NULL) {
             return FALSE;
         }
     }
+    if (!Common_ShelfReserve(w, h, &rect)) {
+        return FALSE;
+    }
 
     if (!GpuSprite_Decode(rawFormat, data, dataMax, s_spriteAtlasData,
-                          GPU_SPRITE_ATLAS_W, (S32)s_spritePenX,
-                          (S32)s_spritePenY)) {
+                          GPU_SPRITE_ATLAS_W, (S32)rect.x, (S32)rect.y)) {
         return FALSE;
     }
 
@@ -533,18 +569,11 @@ static S32 Common_PackSprite(const void *bank, S32 idx, S32 rawFormat,
     grown->bank = bank;
     grown->idx = idx;
     grown->rawFormat = rawFormat;
-    grown->rect.x = (U16)s_spritePenX;
-    grown->rect.y = (U16)s_spritePenY;
-    grown->rect.w = (U16)w;
-    grown->rect.h = (U16)h;
+    grown->rect = rect;
     grown->w = (U16)w;
     grown->h = (U16)h;
 
-    s_spritePenX += w;
-    if (h > s_spriteRowH) {
-        s_spriteRowH = h;
-    }
-    s_spriteAtlasDirty = 1;
+    Common_ShelfCommit(w, h);
     *outRect = grown->rect;
     *outW = w;
     *outH = h;
@@ -596,13 +625,18 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
        bricks additionally write iso GEQUAL depth so the nearer brick wins
        regardless of grid draw order and later sprites can test against the
        nearest room surface; exterior never draws brick quads, so without
-       the interior mark keep the plain no-depth batch. */
-    if (s_currentTypePoly == GPU_BRICK_TYPE) {
+       the interior mark keep the plain no-depth batch. A front-wall
+       re-blit (GPU_BRICKOVER_TYPE) takes no depth at all in either mark:
+       it must land over the body unconditionally, exactly as the software
+       CopyMask did, and must leave the room pass's depth for the re-blits
+       that follow it. */
+    if (s_currentTypePoly == GPU_BRICK_TYPE || s_currentTypePoly == GPU_BRICKOVER_TYPE) {
         out->polyMode = 7;
         out->bilinear = 0;
         out->spriteAtlas = 0;
-        out->depthTest = s_sceneInterior ? 1 : 0;
-        out->depthWrite = s_sceneInterior ? 1 : 0;
+        out->depthTest =
+            (s_currentTypePoly == GPU_BRICK_TYPE && s_sceneInterior) ? 1 : 0;
+        out->depthWrite = out->depthTest;
         out->screenScale[0] = s_screenScale[0];
         out->screenScale[1] = s_screenScale[1];
         return;
@@ -663,7 +697,9 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
        a Z-marker polygon, not textured. */
     out->perspCorrect =
         (s_currentTypePoly >= POLY_TEXTURE_Z &&
-         s_currentTypePoly <= POLY_TEXTURE_Z_FOG) ? 1 : 0;
+         s_currentTypePoly <= POLY_TEXTURE_Z_FOG)
+            ? 1
+            : 0;
 
     /* Chroma key: only INCRUST types (12-15, 20-23; bit 2 of the type)
        discard palette index 0. */
@@ -788,7 +824,8 @@ static float Common_ShadowAlpha(S32 level) {
         }
         ratioSum += 1.0 - ((double)(dst >> 16 & 0xFF) * 0.299 +
                            (double)(dst >> 8 & 0xFF) * 0.587 +
-                           (double)(dst & 0xFF) * 0.114) / lumSrc;
+                           (double)(dst & 0xFF) * 0.114) /
+                              lumSrc;
         count++;
     }
     if (count == 0) {
@@ -931,7 +968,14 @@ void GpuRenderer_SetBrickBank(const void *bank) {
     s_uploadedBrickAtlas = NULL;
 }
 
-S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
+/* Shared body of DrawBrick / DrawBrickOver: pack the brick, clip its rect to
+   the live window and enqueue the quad. over selects the re-blit variant —
+   batched as GPU_BRICKOVER_TYPE (no depth) and it must not publish the
+   unclipped rect in ScreenXMin/Max, because the caller is mid-object and
+   reads back the sprite it has just drawn. The room pass does publish:
+   AffOneBrick accumulates those bounds after AffBrickBlockOnly returns. */
+static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo,
+                                  S32 over) {
     const U32 *offsets;
     const U8 *data;
     S32 hotX, hotY, deltaX, nbLine;
@@ -939,6 +983,7 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
     S32 u0, v0, u1, v1;
     const GpuBrickRect *rect;
     GpuVertex *v;
+    U32 typePoly;
 
     if (!s_active || !GpuScene || s_brickBank == NULL) {
         return 0;
@@ -963,12 +1008,16 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
     hotY = (S8)data[3];
     rect = &s_brickRects[brickIdx];
 
-    /* AffOneBrick accumulates these after AffBrickBlockOnly returns, so
-       publish the full unclipped rect exactly as AffGraph does. */
-    x0 = ScreenXMin = x + hotX;
-    y0 = ScreenYMin = y + hotY;
-    x1 = ScreenXMax = x0 + deltaX - 1;
-    y1 = ScreenYMax = y0 + nbLine - 1;
+    x0 = x + hotX;
+    y0 = y + hotY;
+    x1 = x0 + deltaX - 1;
+    y1 = y0 + nbLine - 1;
+    if (!over) {
+        ScreenXMin = x0;
+        ScreenYMin = y0;
+        ScreenXMax = x1;
+        ScreenYMax = y1;
+    }
 
     cx0 = (x0 < ClipXMin) ? ClipXMin : x0;
     cy0 = (y0 < ClipYMin) ? ClipYMin : y0;
@@ -981,15 +1030,16 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
     Common_UploadPalette();
     Common_UploadBricks();
 
+    typePoly = over ? (U32)GPU_BRICKOVER_TYPE : (U32)GPU_BRICK_TYPE;
     if (s_batchVertCount > 0) {
-        if (s_currentTypePoly != (U32)GPU_BRICK_TYPE ||
+        if (s_currentTypePoly != typePoly ||
             s_batchAtlas != (const void *)s_brickAtlasData ||
             s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
             s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
             GpuRenderer_FlushBatch();
         }
     }
-    s_currentTypePoly = (U32)GPU_BRICK_TYPE;
+    s_currentTypePoly = typePoly;
     s_currentColorPoly = 0;
     s_batchAtlas = (const void *)s_brickAtlasData;
     s_batchCLUTGouraud = NULL;
@@ -1055,6 +1105,19 @@ S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
        interior half of the FBO-content gate this frame. */
     s_fboHasRoom = 1;
     return 1;
+}
+
+S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
+    return Common_SubmitBrickQuad(brickIdx, x, y, zo, 0);
+}
+
+S32 GpuRenderer_DrawBrickOver(S32 brickIdx, S32 x, S32 y, U16 zo) {
+    /* Interior only: elsewhere DrawOverBrick does not run, and a stray
+       enqueue would overpaint the exterior terrain pass. */
+    if (!s_sceneInterior) {
+        return 0;
+    }
+    return Common_SubmitBrickQuad(brickIdx, x, y, zo, 1);
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -1175,6 +1238,717 @@ S32 GpuRenderer_DrawSprite(S32 spriteIdx, S32 x, S32 y, U16 zo,
     return 1;
 }
 
+//──────────────────────────────────────────────────────────────────────────
+// Scaled opaque world sprites (see GpuRenderer_DrawScaleSprite).
+//──────────────────────────────────────────────────────────────────────────
+S32 GpuRenderer_DrawScaleSprite(S32 x, S32 y, S32 factorx, S32 factory,
+                                U16 zo, const void *bank) {
+    static U8 *s_scaleWalkIdx = NULL;
+    static U32 s_scaleWalkBytes = 0;
+    GpuBlendBounds b;
+    GpuBrickRect rect;
+    GpuVertex *v;
+    U32 need;
+    U32 rectW;
+    U32 rectH;
+    S32 walkOk;
+    S32 row;
+
+    if (!s_active || !GpuScene || bank == NULL || Log == NULL ||
+        TabOffLine == NULL) {
+        return 0;
+    }
+
+    need = s_resX * s_resY;
+    if (s_scaleWalkBytes < need) {
+        free(s_scaleWalkIdx);
+        s_scaleWalkIdx = (U8 *)malloc(need);
+        s_scaleWalkBytes = s_scaleWalkIdx ? need : 0;
+    }
+    if (s_scaleWalkIdx == NULL) {
+        return 0;
+    }
+
+    /* The walk is ScaleSprite itself (the blend walk mirrors it line for
+       line), so the packed texels and the published Screen* bounds are what
+       the software blitter would have produced for this factor and clip. */
+    walkOk = GpuBlend_Walk(0, x, y, factorx, factory, bank, ClipXMin,
+                           ClipYMin, ClipXMax, ClipYMax, s_scaleWalkIdx,
+                           s_resX, &b);
+    ScreenXMin = b.xMin;
+    ScreenYMin = b.yMin;
+    ScreenXMax = b.xMax;
+    ScreenYMax = b.yMax;
+    if (!walkOk) {
+        return 1; /* sentinels: software would draw nothing either */
+    }
+
+    rectW = (U32)(b.xMax - b.xMin);
+    rectH = (U32)(b.yMax - b.yMin);
+    if (rectW == 0 || rectH == 0) {
+        return 1;
+    }
+    if (!Common_ShelfReserve(rectW, rectH, &rect)) {
+        return 0; /* Screen* stay valid: software re-walks and publishes */
+    }
+    for (row = 0; row < (S32)rectH; row++) {
+        const U8 *srcRow =
+            s_scaleWalkIdx + (U32)(b.yMin + row) * s_resX + (U32)b.xMin;
+        U8 *dstRow = s_spriteAtlasData +
+                     (((U32)rect.y + (U32)row) * GPU_SPRITE_ATLAS_W +
+                      (U32)rect.x) *
+                         2;
+        S32 col;
+        for (col = 0; col < (S32)rectW; col++) {
+            U8 px = srcRow[col];
+            dstRow[col * 2] = px;
+            dstRow[col * 2 + 1] = (px != 0) ? 1 : 0;
+        }
+    }
+    Common_ShelfCommit(rectW, rectH);
+
+    Common_UploadPalette();
+    Common_UploadSprites();
+
+    if (s_batchVertCount > 0) {
+        if (s_currentTypePoly != (U32)GPU_SPRITE_TYPE ||
+            s_batchAtlas != (const void *)s_spriteAtlasData ||
+            s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
+            s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
+            GpuRenderer_FlushBatch();
+        }
+    }
+    s_currentTypePoly = (U32)GPU_SPRITE_TYPE;
+    s_currentColorPoly = 0;
+    s_batchAtlas = (const void *)s_spriteAtlasData;
+    s_batchCLUTGouraud = NULL;
+    s_batchZBuffer = 0;
+    s_batchNZW = 0;
+    s_batch3DPass = 0;
+    s_batchCLUTBaseRow = 0.0f;
+    s_batchClipX0 = ClipXMin;
+    s_batchClipY0 = ClipYMin;
+    s_batchClipX1 = ClipXMax;
+    s_batchClipY1 = ClipYMax;
+
+    if (s_batchVertCount + 6 > BATCH_MAX_VERTS) {
+        GpuRenderer_FlushBatch();
+    }
+    v = (GpuVertex *)(s_batchVerts + s_batchVertCount * 14);
+    v[0].XE = (S16)b.xMin;
+    v[0].YE = (S16)b.yMin;
+    v[0].MapU = (U16)rect.x;
+    v[0].MapV = (U16)rect.y;
+    v[1].XE = (S16)b.xMax;
+    v[1].YE = (S16)b.yMin;
+    v[1].MapU = (U16)(rect.x + rectW);
+    v[1].MapV = (U16)rect.y;
+    v[2].XE = (S16)b.xMax;
+    v[2].YE = (S16)b.yMax;
+    v[2].MapU = (U16)(rect.x + rectW);
+    v[2].MapV = (U16)(rect.y + rectH);
+    v[3].XE = (S16)b.xMin;
+    v[3].YE = (S16)b.yMin;
+    v[3].MapU = (U16)rect.x;
+    v[3].MapV = (U16)rect.y;
+    v[4].XE = (S16)b.xMax;
+    v[4].YE = (S16)b.yMax;
+    v[4].MapU = (U16)(rect.x + rectW);
+    v[4].MapV = (U16)(rect.y + rectH);
+    v[5].XE = (S16)b.xMin;
+    v[5].YE = (S16)b.yMax;
+    v[5].MapU = (U16)rect.x;
+    v[5].MapV = (U16)(rect.y + rectH);
+    {
+        U32 k;
+        for (k = 0; k < 6; k++) {
+            v[k].Light = 0;
+            v[k].ZO = zo;
+            v[k].RepMask = 0;
+        }
+    }
+    s_batchVertCount += 6;
+    s_batchTriCount += 2;
+
+    /* Punch only the texels the walk wrote non-zero: software leaves Log
+       alone where ScaleSprite skipped a transparent source texel, and index
+       0 is the present's transparent hole that shows the FBO quad. */
+    for (row = 0; row < (S32)rectH; row++) {
+        const U8 *srcRow =
+            s_scaleWalkIdx + (U32)(b.yMin + row) * s_resX + (U32)b.xMin;
+        U8 *logRow = (U8 *)Log + TabOffLine[b.yMin + row];
+        S32 col;
+        for (col = 0; col < (S32)rectW; col++) {
+            if (srcRow[col] != 0) {
+                logRow[b.xMin + col] = 0;
+            }
+        }
+    }
+
+    Log_Debug("[GPU] scaled sprite %ux%u at %d,%d f=%d,%d",
+              (unsigned)rectW, (unsigned)rectH, (int)b.xMin, (int)b.yMin,
+              (int)factorx, (int)factory);
+    return 1;
+}
+
+//──────────────────────────────────────────────────────────────────────────
+// Flow particles (GpuScene phase 3): BoxFlow's 2x2 dot as quads.
+//──────────────────────────────────────────────────────────────────────────
+// Each displayed flow dot becomes one sprite-page rect (R = dot colour,
+// G = colour != 0) and two quads — one per row — in the sprite batch, so
+// exterior terrain occlusion is the batch's GEQUAL test against each row's
+// interpolated depth instead of DrawRecover's later ZBufBoxOverWrite2 sweep
+// over the flow's bounding box. The rows are separate uniform-ZO quads
+// because the fragment shader interpolates depth across a quad while the
+// software test is row-constant. The clipped 2x2 footprint in Log is
+// punched unconditionally: BoxFlow wrote all four texels even at colour 0,
+// and index 0 is the present's hole either way.
+S32 GpuRenderer_DrawFlowDot(S32 x, S32 y, U8 coul, U16 zoTop, U16 zoBot) {
+    GpuBrickRect rect;
+    GpuVertex *v;
+    S32 row;
+
+    if (!s_active || !GpuScene || Log == NULL || TabOffLine == NULL) {
+        return 0;
+    }
+    /* BoxFlow's own clip test: a dot it would not touch is consumed here
+       too, so the caller does not fall back for nothing. */
+    if (x >= ClipXMax || x < ClipXMin || y >= ClipYMax || y < ClipYMin) {
+        return 1;
+    }
+    if (!Common_ShelfReserve(2, 2, &rect)) {
+        return 0;
+    }
+    for (row = 0; row < 2; row++) {
+        U8 *dstRow = s_spriteAtlasData +
+                     (((U32)rect.y + (U32)row) * GPU_SPRITE_ATLAS_W +
+                      (U32)rect.x) *
+                         2;
+        S32 col;
+        for (col = 0; col < 2; col++) {
+            dstRow[col * 2] = coul;
+            dstRow[col * 2 + 1] = (coul != 0) ? 1 : 0;
+        }
+    }
+    Common_ShelfCommit(2, 2);
+
+    Common_UploadPalette();
+    Common_UploadSprites();
+
+    if (s_batchVertCount > 0) {
+        if (s_currentTypePoly != (U32)GPU_SPRITE_TYPE ||
+            s_batchAtlas != (const void *)s_spriteAtlasData ||
+            s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
+            s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
+            GpuRenderer_FlushBatch();
+        }
+    }
+    s_currentTypePoly = (U32)GPU_SPRITE_TYPE;
+    s_currentColorPoly = 0;
+    s_batchAtlas = (const void *)s_spriteAtlasData;
+    s_batchCLUTGouraud = NULL;
+    s_batchZBuffer = 0;
+    s_batchNZW = 0;
+    s_batch3DPass = 0;
+    s_batchCLUTBaseRow = 0.0f;
+    s_batchClipX0 = ClipXMin;
+    s_batchClipY0 = ClipYMin;
+    s_batchClipX1 = ClipXMax;
+    s_batchClipY1 = ClipYMax;
+
+    if (s_batchVertCount + 12 > BATCH_MAX_VERTS) {
+        GpuRenderer_FlushBatch();
+    }
+    for (row = 0; row < 2; row++) {
+        S32 y0 = y + row;
+        S32 y1 = y0 + 1;
+        U16 zo = row ? zoBot : zoTop;
+
+        v = (GpuVertex *)(s_batchVerts + s_batchVertCount * 14);
+        v[0].XE = (S16)x;
+        v[0].YE = (S16)y0;
+        v[0].MapU = (U16)rect.x;
+        v[0].MapV = (U16)(rect.y + row);
+        v[1].XE = (S16)(x + 2);
+        v[1].YE = (S16)y0;
+        v[1].MapU = (U16)(rect.x + 2);
+        v[1].MapV = (U16)(rect.y + row);
+        v[2].XE = (S16)(x + 2);
+        v[2].YE = (S16)y1;
+        v[2].MapU = (U16)(rect.x + 2);
+        v[2].MapV = (U16)(rect.y + row + 1);
+        v[3] = v[0];
+        v[4] = v[2];
+        v[5].XE = (S16)x;
+        v[5].YE = (S16)y1;
+        v[5].MapU = (U16)rect.x;
+        v[5].MapV = (U16)(rect.y + row + 1);
+        {
+            U32 k;
+            for (k = 0; k < 6; k++) {
+                v[k].Light = 0;
+                v[k].ZO = zo;
+                v[k].RepMask = 0;
+            }
+        }
+        s_batchVertCount += 6;
+        s_batchTriCount += 2;
+    }
+
+    for (row = 0; row < 2; row++) {
+        U8 *logRow = (U8 *)Log + TabOffLine[y + row];
+        logRow[x] = 0;
+        logRow[x + 1] = 0;
+    }
+
+    return 1;
+}
+
+//──────────────────────────────────────────────────────────────────────────
+// Blend sprites (GpuScene phase 3): ScaleSpriteTransp's transpTable compose
+// on the GPU.
+//──────────────────────────────────────────────────────────────────────────
+// GpuBlend_Walk mirrors the software walk (host-tested byte for byte) and
+// emits each texel's source index into a screen-strided buffer, 0 where the
+// sprite skips. The pack below captures the live Log index beside it; the
+// backend then uploads source/Log pages, copies the scene colour rect (its
+// alpha byte = the destination palette index) and draws a quad whose shader
+// performs the table lookup. The Log footprint is punched to index 0 only
+// after that copy succeeds, so the present shows the FBO result through the
+// overlay hole — the same hole Common_PunchSpriteLog opens for opaque
+// sprites — and a failed copy falls back to software with Log untouched.
+// No depth test or write: ScaleSpriteTransp composes into Log
+// unconditionally, and DrawRecover3 never follows a blend sprite (its
+// sentinel bounds leave ClipXMin > ClipXMax after the caller's SetClip).
+S32 GpuRenderer_DrawBlendSprite(S32 x, S32 y, S32 factorx, S32 factory,
+                                const void *bank, const void *transPal) {
+    static U8 *s_walkIdx = NULL;
+    static U32 s_walkIdxBytes = 0;
+    static U8 *s_packRg = NULL;
+    static U32 s_packRgBytes = 0;
+    GpuBlendBounds b;
+    GpuDrawParams params;
+    GpuVertex v[6];
+    U32 need;
+    U32 rectW;
+    U32 rectH;
+    U32 rectBytes;
+    S32 walkOk;
+    S32 row;
+    S32 col;
+
+    if (!s_active || !GpuScene || bank == NULL || transPal == NULL ||
+        Log == NULL || TabOffLine == NULL) {
+        return 0;
+    }
+    if (s_backend->TexUpdateTransPal == NULL ||
+        s_backend->TexUpdateBlendLog == NULL ||
+        s_backend->TargetCopyColorRect == NULL) {
+        return 0;
+    }
+
+    need = s_resX * s_resY;
+    if (s_walkIdxBytes < need) {
+        free(s_walkIdx);
+        s_walkIdx = (U8 *)malloc(need);
+        s_walkIdxBytes = s_walkIdx ? need : 0;
+    }
+    if (s_walkIdx == NULL) {
+        return 0;
+    }
+
+    walkOk = GpuBlend_Walk(0, x, y, factorx, factory, bank, ClipXMin,
+                           ClipYMin, ClipXMax, ClipYMax, s_walkIdx, s_resX,
+                           &b);
+    /* Publish ScaleSpriteTransp's Screen* bounds either way: the caller's
+       SetClip and its sentinel-gated DrawRecover3 read them after either
+       blitter has run. */
+    ScreenXMin = b.xMin;
+    ScreenYMin = b.yMin;
+    ScreenXMax = b.xMax;
+    ScreenYMax = b.yMax;
+    if (!walkOk) {
+        return 1; /* sentinels: software would draw nothing either */
+    }
+
+    rectW = (U32)(b.xMax - b.xMin);
+    rectH = (U32)(b.yMax - b.yMin);
+    rectBytes = rectW * rectH * 2;
+    if (s_packRgBytes < rectBytes) {
+        free(s_packRg);
+        s_packRg = (U8 *)malloc(rectBytes);
+        s_packRgBytes = s_packRg ? rectBytes : 0;
+    }
+    if (s_packRg == NULL) {
+        return 0; /* Screen* stay valid: software re-walks and publishes */
+    }
+
+    for (row = 0; row < (S32)rectH; row++) {
+        const U8 *idxRow =
+            s_walkIdx + (U32)(b.yMin + row) * s_resX + (U32)b.xMin;
+        U8 *rgRow = s_packRg + (U32)row * rectW * 2;
+        const U8 *logRow = (const U8 *)Log + TabOffLine[b.yMin + row];
+        for (col = 0; col < (S32)rectW; col++) {
+            rgRow[col * 2] = idxRow[col];
+            rgRow[col * 2 + 1] = logRow[b.xMin + col];
+        }
+    }
+
+    /* Prior draws must reach the target before the copy reads the rect. */
+    GpuRenderer_FlushBatch();
+
+    s_backend->TexUpdateTransPal(transPal);
+    s_backend->TexUpdateBlendLog(s_packRg, rectW, rectH);
+    if (!s_backend->TargetCopyColorRect((U32)b.xMin, (U32)b.yMin, rectW,
+                                        rectH)) {
+        return 0;
+    }
+
+    /* Punch only texels the sprite writes (source != 0): software leaves
+       Log alone where the walk skips, and index 0 is the present's
+       transparent hole that lets the FBO result show through. */
+    for (row = 0; row < (S32)rectH; row++) {
+        const U8 *rgRow = s_packRg + (U32)row * rectW * 2;
+        U8 *logRow = (U8 *)Log + TabOffLine[b.yMin + row];
+        for (col = 0; col < (S32)rectW; col++) {
+            if (rgRow[col * 2] != 0) {
+                logRow[b.xMin + col] = 0;
+            }
+        }
+    }
+
+    memset(&params, 0, sizeof params);
+    params.polyMode = 8;
+    params.bilinear = 0;
+    params.depthTest = 0;
+    params.depthWrite = 0;
+    params.blend = 0; /* opaque replace: colour and alpha both carry the
+                         composed index, which is what chains sprites */
+    params.screenScale[0] = s_screenScale[0];
+    params.screenScale[1] = s_screenScale[1];
+    params.clipX0 = b.xMin;
+    params.clipY0 = b.yMin;
+    params.clipX1 = b.xMax - 1;
+    params.clipY1 = b.yMax - 1;
+    /* Both pages are rect-sized and hold rect-local pixel rows, so the
+       shader's (px + 0.5) / size lands on the right texel directly. */
+    params.blendLogW = (float)rectW;
+    params.blendLogH = (float)rectH;
+    params.blendDstW = (float)rectW;
+    params.blendDstH = (float)rectH;
+
+    /* Quad with GpuRenderer_DrawSprite's winding; MapU/MapV are local rect
+       pixel coordinates so floor(vTexCoord) is the packed rect position. */
+    v[0].XE = (S16)b.xMin;
+    v[0].YE = (S16)b.yMin;
+    v[0].MapU = 0;
+    v[0].MapV = 0;
+    v[1].XE = (S16)b.xMax;
+    v[1].YE = (S16)b.yMin;
+    v[1].MapU = (U16)rectW;
+    v[1].MapV = 0;
+    v[2].XE = (S16)b.xMax;
+    v[2].YE = (S16)b.yMax;
+    v[2].MapU = (U16)rectW;
+    v[2].MapV = (U16)rectH;
+    v[3].XE = (S16)b.xMin;
+    v[3].YE = (S16)b.yMin;
+    v[3].MapU = 0;
+    v[3].MapV = 0;
+    v[4].XE = (S16)b.xMax;
+    v[4].YE = (S16)b.yMax;
+    v[4].MapU = (U16)rectW;
+    v[4].MapV = (U16)rectH;
+    v[5].XE = (S16)b.xMin;
+    v[5].YE = (S16)b.yMax;
+    v[5].MapU = 0;
+    v[5].MapV = (U16)rectH;
+    {
+        S32 k;
+        for (k = 0; k < 6; k++) {
+            v[k].Light = 0;
+            v[k].ZO = 0;
+            v[k].RepMask = 0;
+        }
+    }
+    s_backend->DrawTriangles(v, 6, &params);
+    return 1;
+}
+
+//──────────────────────────────────────────────────────────────────────────
+// HUD/incrust text: Font()'s glyph run as one sprite-page quad.
+//──────────────────────────────────────────────────────────────────────────
+// Font draws last, over the finished scene, straight into Log — so the quad
+// takes the sprite batch's no-write depth rules at ZO 0: exterior GEQUAL
+// always passes at the nearest depth, interior takes no test. The walk,
+// glyph RLE, clip handling and Screen* publication mirror Font / AffMask /
+// ClippingMask pixel for pixel, so the punched Log hole plus the FBO glyph
+// composite to what the software run left in Log. Declines while a modal
+// overlay rect is pinned: the present's opaque-black rule inside that rect
+// would surface the punch as black instead of the glyph.
+S32 GpuRenderer_DrawHudText(S32 x, S32 y, const char *str) {
+    GpuBrickRect rect;
+    const U8 *font;
+    const U8 *s;
+    S32 cursor;
+    S32 ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;
+    S32 cx0, cy0, cx1, cy1;
+    S32 pubX0 = 0, pubY0 = 0, pubX1 = 0, pubY1 = 0;
+    S32 anyPub = 0;
+    S32 have = 0;
+    S32 rectW, rectH;
+    S32 u0, v0, u1, v1;
+    GpuVertex *v;
+    U32 row;
+
+    if (!s_active || !GpuScene || str == NULL || PtrFont == NULL ||
+        Log == NULL || TabOffLine == NULL) {
+        return 0;
+    }
+    if (s_overlayOpaqueX1 > s_overlayOpaqueX0 &&
+        s_overlayOpaqueY1 > s_overlayOpaqueY0) {
+        return 0;
+    }
+
+    font = (const U8 *)PtrFont;
+
+    /* Pass 1 mirrors Font()'s cursor walk (advance only): ink bounds for
+       the quad, plus the Screen* publication the last AffMask /
+       ClippingMask call would leave behind. */
+    cursor = x;
+    for (s = (const U8 *)str; *s != 0; s++) {
+        U8 c = *s;
+        const U8 *data;
+        S32 gx, gy, gw, gh;
+
+        if (c == 32) {
+            cursor += InterSpace;
+            continue;
+        }
+        data = font + ((const U32 *)font)[c];
+        gx = cursor + data[2];
+        gy = y + data[3];
+        gw = data[0];
+        gh = data[1];
+        cursor += InterLeave + gw;
+        if (gw == 0 || gh == 0) {
+            continue;
+        }
+        if (!have) {
+            ux0 = gx;
+            uy0 = gy;
+            ux1 = gx + gw - 1;
+            uy1 = gy + gh - 1;
+            have = 1;
+        } else {
+            if (gx < ux0) {
+                ux0 = gx;
+            }
+            if (gy < uy0) {
+                uy0 = gy;
+            }
+            if (gx + gw - 1 > ux1) {
+                ux1 = gx + gw - 1;
+            }
+            if (gy + gh - 1 > uy1) {
+                uy1 = gy + gh - 1;
+            }
+        }
+
+        /* AffMask publishes the unclipped glyph rect, ClippingMask the
+           clipped one, and a fully outside glyph returns before touching
+           Screen* — so only a visible glyph replaces the publication, which
+           is what this mirrors. */
+        if (gx > ClipXMax || gy > ClipYMax ||
+            gx + gw - 1 < ClipXMin || gy + gh - 1 < ClipYMin) {
+            /* fully outside: Screen* stays as the previous glyph left it */
+        } else if (gx < ClipXMin || gy < ClipYMin ||
+                   gx + gw - 1 > ClipXMax || gy + gh - 1 > ClipYMax) {
+            pubX0 = (gx < ClipXMin) ? ClipXMin : gx;
+            pubY0 = (gy < ClipYMin) ? ClipYMin : gy;
+            pubX1 = (gx + gw - 1 > ClipXMax) ? ClipXMax : gx + gw - 1;
+            pubY1 = (gy + gh - 1 > ClipYMax) ? ClipYMax : gy + gh - 1;
+            anyPub = 1;
+        } else {
+            pubX0 = gx;
+            pubY0 = gy;
+            pubX1 = gx + gw - 1;
+            pubY1 = gy + gh - 1;
+            anyPub = 1;
+        }
+    }
+
+    if (!have) {
+        return 1; /* spaces only: Font draws nothing and publishes nothing */
+    }
+
+    cx0 = (ux0 < ClipXMin) ? ClipXMin : ux0;
+    cy0 = (uy0 < ClipYMin) ? ClipYMin : uy0;
+    cx1 = (ux1 > ClipXMax) ? ClipXMax : ux1;
+    cy1 = (uy1 > ClipYMax) ? ClipYMax : uy1;
+    if (cx0 > cx1 || cy0 > cy1) {
+        if (anyPub) {
+            ScreenXMin = pubX0;
+            ScreenYMin = pubY0;
+            ScreenXMax = pubX1;
+            ScreenYMax = pubY1;
+        }
+        return 1; /* every glyph outside the window: AffMask drew nothing */
+    }
+
+    rectW = ux1 - ux0 + 1;
+    rectH = uy1 - uy0 + 1;
+    if (!Common_ShelfReserve((U32)rectW, (U32)rectH, &rect)) {
+        return 0;
+    }
+
+    /* A shelf slot is zeroed by the page reset; zero it again so a slot a
+       later failure left half-written can never leak stray G = 1 texels. */
+    for (row = 0; row < (U32)rectH; row++) {
+        memset(s_spriteAtlasData +
+                   (((U32)rect.y + row) * GPU_SPRITE_ATLAS_W + rect.x) * 2,
+               0, (U32)rectW * 2);
+    }
+
+    /* Pass 2: AffMask's per-line RLE decoded into the slot as R = colour,
+       G = 1 — the exact run of pixels software writes into Log. */
+    cursor = x;
+    for (s = (const U8 *)str; *s != 0; s++) {
+        U8 c = *s;
+        const U8 *data;
+        const U8 *gfx;
+        S32 gx, gy, gw, gh, i;
+
+        if (c == 32) {
+            cursor += InterSpace;
+            continue;
+        }
+        data = font + ((const U32 *)font)[c];
+        gx = cursor + data[2];
+        gy = y + data[3];
+        gw = data[0];
+        gh = data[1];
+        cursor += InterLeave + gw;
+        if (gw == 0 || gh == 0) {
+            continue;
+        }
+        gfx = data + 4;
+        for (i = 0; i < gh; i++) {
+            U8 nbBlock = gfx[0];
+            S32 px = 0;
+
+            gfx++;
+            while (nbBlock > 0) {
+                U8 toJump = gfx[0];
+
+                px += toJump;
+                nbBlock--;
+                if (nbBlock == 0) {
+                    gfx++;
+                    break;
+                }
+                {
+                    U8 toWrite = gfx[1];
+                    S32 k;
+
+                    gfx += 2;
+                    for (k = 0; k < toWrite; k++, px++) {
+                        if (px >= 0 && px < gw) {
+                            U8 *texel =
+                                s_spriteAtlasData +
+                                (((U32)rect.y + (U32)(gy + i - uy0)) *
+                                     GPU_SPRITE_ATLAS_W +
+                                 (U32)rect.x + (U32)(gx + px - ux0)) *
+                                    2;
+                            texel[0] = ColMask;
+                            texel[1] = 1;
+                        }
+                    }
+                }
+                nbBlock--;
+            }
+        }
+    }
+    Common_ShelfCommit((U32)rectW, (U32)rectH);
+
+    Common_UploadPalette();
+    Common_UploadSprites();
+
+    if (s_batchVertCount > 0) {
+        if (s_currentTypePoly != (U32)GPU_SPRITE_TYPE ||
+            s_batchAtlas != (const void *)s_spriteAtlasData ||
+            s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
+            s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
+            GpuRenderer_FlushBatch();
+        }
+    }
+    s_currentTypePoly = (U32)GPU_SPRITE_TYPE;
+    s_currentColorPoly = 0;
+    s_batchAtlas = (const void *)s_spriteAtlasData;
+    s_batchCLUTGouraud = NULL;
+    s_batchZBuffer = 0;
+    s_batchNZW = 0;
+    s_batch3DPass = 0;
+    s_batchCLUTBaseRow = 0.0f;
+    s_batchClipX0 = ClipXMin;
+    s_batchClipY0 = ClipYMin;
+    s_batchClipX1 = ClipXMax;
+    s_batchClipY1 = ClipYMax;
+
+    u0 = (S32)rect.x + (cx0 - ux0);
+    v0 = (S32)rect.y + (cy0 - uy0);
+    u1 = (S32)rect.x + (cx1 - ux0 + 1);
+    v1 = (S32)rect.y + (cy1 - uy0 + 1);
+
+    if (s_batchVertCount + 6 > BATCH_MAX_VERTS) {
+        GpuRenderer_FlushBatch();
+    }
+    v = (GpuVertex *)(s_batchVerts + s_batchVertCount * 14);
+    v[0].XE = (S16)cx0;
+    v[0].YE = (S16)cy0;
+    v[0].MapU = (U16)u0;
+    v[0].MapV = (U16)v0;
+    v[1].XE = (S16)(cx1 + 1);
+    v[1].YE = (S16)cy0;
+    v[1].MapU = (U16)u1;
+    v[1].MapV = (U16)v0;
+    v[2].XE = (S16)(cx1 + 1);
+    v[2].YE = (S16)(cy1 + 1);
+    v[2].MapU = (U16)u1;
+    v[2].MapV = (U16)v1;
+    v[3].XE = (S16)cx0;
+    v[3].YE = (S16)cy0;
+    v[3].MapU = (U16)u0;
+    v[3].MapV = (U16)v0;
+    v[4].XE = (S16)(cx1 + 1);
+    v[4].YE = (S16)(cy1 + 1);
+    v[4].MapU = (U16)u1;
+    v[4].MapV = (U16)v1;
+    v[5].XE = (S16)cx0;
+    v[5].YE = (S16)(cy1 + 1);
+    v[5].MapU = (U16)u0;
+    v[5].MapV = (U16)v1;
+    {
+        U32 k;
+        for (k = 0; k < 6; k++) {
+            v[k].Light = 0;
+            v[k].ZO = 0;
+            v[k].RepMask = 0;
+        }
+    }
+    s_batchVertCount += 6;
+    s_batchTriCount += 2;
+
+    if (anyPub) {
+        ScreenXMin = pubX0;
+        ScreenYMin = pubY0;
+        ScreenXMax = pubX1;
+        ScreenYMax = pubY1;
+    }
+    Common_PunchSpriteLog(&rect, ux0, uy0, cx0, cy0, cx1, cy1);
+    return 1;
+}
+
 static void Common_PackVertex(GpuVertex *dst, const Struc_Point *src,
                               U16 repMask) {
     /* XE, YE, MapU, MapV, Light, ZO are the first 12 bytes of both records;
@@ -1190,7 +1964,7 @@ static void Common_PackVertex(GpuVertex *dst, const Struc_Point *src,
 //──────────────────────────────────────────────────────────────────────────
 S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
                                    S32 nbPoints, Struc_Point *ptrPoints) {
-    if (!s_active) {
+    if (!s_active || s_forceSoftwarePolys) {
         return 0;
     }
 
@@ -1277,7 +2051,8 @@ S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
     s_batchCLUTBaseRow = 0.0f;
     if (PtrCLUTFog != NULL && PtrCLUTGouraud != NULL) {
         s_batchCLUTBaseRow = (float)(((const U8 *)PtrCLUTGouraud -
-                                      (const U8 *)PtrCLUTFog) / 256);
+                                      (const U8 *)PtrCLUTFog) /
+                                     256);
     }
 
     /* Fog-smooth constants: SetFog runs once per scene load, stable across
@@ -1344,6 +2119,14 @@ S32 GpuRenderer_IsSceneInterior(void) {
     return (s_active && GpuScene && s_sceneInterior) ? TRUE : FALSE;
 }
 
+void GpuRenderer_SetSoftwarePolys(S32 enabled) {
+    s_forceSoftwarePolys = enabled ? 1 : 0;
+}
+
+S32 GpuRenderer_GetSoftwarePolys(void) {
+    return s_forceSoftwarePolys;
+}
+
 void GpuRenderer_ClearFBO(void) {
     if (!s_active) {
         return;
@@ -1377,9 +2160,22 @@ void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
     s_overlayOpaqueY1 = y1;
 }
 
-void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
-                         U32 height, S32 filterLinear) {
-    if (!s_active || argbPixels == NULL) {
+S32 GpuRenderer_IsOverlayOpaque(void) {
+    /* Same test the present shader runs on uOpaqueRect. */
+    return s_overlayOpaqueX1 > s_overlayOpaqueX0 &&
+           s_overlayOpaqueY1 > s_overlayOpaqueY0;
+}
+
+/* Overlay upload rect state (GPUPRESENT_DIRTY.H): last frame's nonzero
+   bounds and the surface size they belong to. A size the plan has not seen
+   is what drops the history. */
+static GpuPresentRect s_presentDirtyPrev = {0, 0, 0, 0};
+static U32 s_presentDirtyW = 0;
+static U32 s_presentDirtyH = 0;
+
+void GpuRenderer_Present(const void *pixels, U32 pitch, U32 width,
+                         U32 height, S32 filterLinear, S32 indexed) {
+    if (!s_active || pixels == NULL) {
         return;
     }
 
@@ -1387,46 +2183,70 @@ void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
        DisplayTexFilter the CLUT sampling reads at BeginFrame — not the seam's
        filterLinear argument, whose only caller passes FALSE (the svg layer
        must not reference renderer-owned state). Bilinear here smooths the Log
-       layer — bodies, sprites, HUD — wherever the present scales it. */
+       layer — bodies, sprites, HUD — wherever the present scales it. R8's
+       bilinear is four index taps + four LUT lookups + mix, so it averages
+       the resolved colours rather than the index values and matches hardware
+       bilinear on the converted ARGB. */
     filterLinear = DisplayTexFilter;
 
     /* Flush any 3D geometry batched during the frame into the offscreen
        target before the composite reads it. */
     GpuRenderer_FlushBatch();
 
-    if (s_overlayOpaqueX1 > s_overlayOpaqueX0 &&
-        s_overlayOpaqueY1 > s_overlayOpaqueY0) {
-        /* Modal full-2D UI region: Log's palette index 0 (alpha 0) there
-           presents as opaque black like the software present. Texture
-           uploads copy immediately, so patch before the upload. */
-        U32 xEnd = (U32)s_overlayOpaqueX1;
-        U32 yEnd = (U32)s_overlayOpaqueY1;
-        if (xEnd > width) {
-            xEnd = width;
-        }
-        if (yEnd > height) {
-            yEnd = height;
-        }
-        for (U32 y = (U32)s_overlayOpaqueY0; y < yEnd; y++) {
-            U32 *px = (U32 *)((U8 *)argbPixels + (size_t)y * pitch);
-            for (U32 x = (U32)s_overlayOpaqueX0; x < xEnd; x++) {
-                if ((px[x] & 0xFF000000u) == 0) {
-                    px[x] = 0xFF000000u;
-                }
-            }
-        }
+    /* The R8 path resolves colour in the present shader through the palette
+       LUT, so the upload must see this frame's palette — batch draws update
+       it mid-frame, a pure-2D frame might not have run one. The ARGB path
+       already baked colour in with paletteLUT on the CPU. */
+    if (indexed) {
+        Common_UploadPalette();
     }
 
-    /* The 2D overlay (Log buffer as ARGB) is the topmost layer. */
-    s_backend->TexUpdatePresent(argbPixels, pitch, width, height, filterLinear);
+    /* Modal full-2D UI region is a shader uniform, not a CPU patch: the
+       software present's opaque-black-on-alpha-0 rule applies per sampled
+       texel for both the ARGB and R8 uploads, so neither staging buffer is
+       rewritten before upload. */
+    const S32 ox0 = s_overlayOpaqueX0;
+    const S32 oy0 = s_overlayOpaqueY0;
+    const S32 ox1 = s_overlayOpaqueX1;
+    const S32 oy1 = s_overlayOpaqueY1;
+
+    /* The 2D overlay (Log buffer: ARGB staging, or raw indices on R8) is the
+       topmost layer. Under GpuScene the indexed upload shrinks to the region
+       the Log carries: this frame's nonzero bounds unioned last frame's, so
+       content that vanished is rewritten with this frame's zeros instead of
+       ghosting on screen (GPUPRESENT_DIRTY.H). The ARGB staging uploads
+       whole — the pre-present callbacks write into it outside anything the
+       Log shows — as does every frame while the flag is off. A size the
+       plan has not seen drops the history; the backend recreated its
+       texture for the new size and uploads everything anyway. */
+    GpuPresentRect uploadRect;
+    if (indexed && GpuScene) {
+        GpuPresentRect bounds;
+        GpuPresentRect remember;
+        const S32 sizeChanged =
+            (s_presentDirtyW != width || s_presentDirtyH != height);
+
+        GpuPresent_DirtyBounds((const U8 *)pixels, pitch, width, height,
+                               &bounds);
+        GpuPresent_PlanUpload(&bounds, &s_presentDirtyPrev, sizeChanged,
+                              &uploadRect, &remember);
+        s_presentDirtyPrev = remember;
+        s_presentDirtyW = width;
+        s_presentDirtyH = height;
+    } else {
+        GpuPresent_RectFull(&uploadRect, (S32)width, (S32)height);
+    }
+    s_backend->TexUpdatePresent(pixels, pitch, width, height, uploadRect.x,
+                                uploadRect.y, uploadRect.w, uploadRect.h,
+                                filterLinear, indexed);
 
     /* ClearBackbuffer: window-level clear + letterbox viewport setup.
        DrawPresentQuad: 0 = offscreen colour into the window, then
        1 = the 2D overlay on top. The backend presents inside the last
        call (swap / submit). */
     s_backend->ClearBackbuffer();
-    s_backend->DrawPresentQuad(0, filterLinear);
-    s_backend->DrawPresentQuad(1, filterLinear);
+    s_backend->DrawPresentQuad(0, filterLinear, 0, 0, 0, 0);
+    s_backend->DrawPresentQuad(1, filterLinear, ox0, oy0, ox1, oy1);
 }
 
 // Refills PtrZBuffer from the GPU depth target (converted to the engine's aZ
@@ -1651,10 +2471,14 @@ S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
     s_fboHasTerrain = 0;
     s_fboHasRoom = 0;
     s_sceneInterior = 0;
+    s_forceSoftwarePolys = 0;
     /* Context recreate: the backend's brick/sprite textures are gone. */
     s_uploadedBrickAtlas = NULL;
     s_uploadedSpriteAtlas = NULL;
     s_spriteAtlasDirty = 1;
+    GpuPresent_RectEmpty(&s_presentDirtyPrev);
+    s_presentDirtyW = 0;
+    s_presentDirtyH = 0;
 
     if (!be->TargetCreate(resX * s_renderQuality, resY * s_renderQuality)) {
         Log_Warn("[GPU] backend '%s' TargetCreate failed", be->identifier);
@@ -1711,6 +2535,9 @@ void GpuRenderer_Shutdown(void) {
     s_uploadedBrickAtlas = NULL;
     s_uploadedSpriteAtlas = NULL;
     s_spriteAtlasDirty = 1;
+    GpuPresent_RectEmpty(&s_presentDirtyPrev);
+    s_presentDirtyW = 0;
+    s_presentDirtyH = 0;
     s_batchClipX0 = 0;
     s_batchClipY0 = 0;
     s_batchClipX1 = 0;
@@ -1793,9 +2620,12 @@ GpuRendererBackendId GpuRenderer_ActiveBackend(void) {
 
 const char *GpuRenderer_BackendName(GpuRendererBackendId id) {
     switch (id) {
-    case GPU_RENDERER_BACKEND_OPENGL: return "opengl";
-    case GPU_RENDERER_BACKEND_SDL3GPU: return "sdl3gpu";
-    default: return "none";
+    case GPU_RENDERER_BACKEND_OPENGL:
+        return "opengl";
+    case GPU_RENDERER_BACKEND_SDL3GPU:
+        return "sdl3gpu";
+    default:
+        return "none";
     }
 }
 
@@ -1807,12 +2637,15 @@ const char *GpuRenderer_BackendName(GpuRendererBackendId id) {
 #include <SYSTEM/ADELINE_TYPES.H>
 
 S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY) {
-    (void)backend; (void)resX; (void)resY;
+    (void)backend;
+    (void)resX;
+    (void)resY;
     return FALSE;
 }
 void GpuRenderer_Shutdown(void) {}
 void GpuRenderer_Resize(U32 resX, U32 resY) {
-    (void)resX; (void)resY;
+    (void)resX;
+    (void)resY;
 }
 S32 GpuRenderer_IsActive(void) { return FALSE; }
 GpuRendererBackendId GpuRenderer_ActiveBackend(void) {
@@ -1827,46 +2660,102 @@ void GpuRenderer_ClearFBO(void) {}
 void GpuRenderer_SetSceneClearIndex(U8 index) { (void)index; }
 void GpuRenderer_SetSceneInterior(S32 interior) { (void)interior; }
 S32 GpuRenderer_IsSceneInterior(void) { return FALSE; }
+void GpuRenderer_SetSoftwarePolys(S32 enabled) { (void)enabled; }
+S32 GpuRenderer_GetSoftwarePolys(void) { return FALSE; }
 void GpuRenderer_FlushBatch(void) {}
-void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
-                         U32 height, S32 filterLinear) {
-    (void)argbPixels; (void)pitch; (void)width; (void)height;
+void GpuRenderer_Present(const void *pixels, U32 pitch, U32 width,
+                         U32 height, S32 filterLinear, S32 indexed) {
+    (void)pixels;
+    (void)pitch;
+    (void)width;
+    (void)height;
     (void)filterLinear;
+    (void)indexed;
 }
 S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
                                    S32 nbPoints, Struc_Point *ptrPoints) {
-    (void)typePoly; (void)colorPoly; (void)nbPoints; (void)ptrPoints;
+    (void)typePoly;
+    (void)colorPoly;
+    (void)nbPoints;
+    (void)ptrPoints;
     return 0;
 }
 void GpuRenderer_SetRenderQuality(U32 quality) { (void)quality; }
 void GpuRenderer_ReadbackDepthBuffer(void) {}
 S32 GpuRenderer_ReadbackPresented(void *rgb, U32 width, U32 height) {
-    (void)rgb; (void)width; (void)height;
+    (void)rgb;
+    (void)width;
+    (void)height;
     return FALSE;
 }
 void GpuRenderer_SetVSync(S32 enabled) { (void)enabled; }
 void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1) {
-    (void)x0; (void)y0; (void)x1; (void)y1;
+    (void)x0;
+    (void)y0;
+    (void)x1;
+    (void)y1;
 }
 void GpuRenderer_ShadowBegin(S32 level, S32 zPlane) {
-    (void)level; (void)zPlane;
+    (void)level;
+    (void)zPlane;
 }
 void GpuRenderer_ShadowBeginFlat(S32 level) { (void)level; }
 void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1) {
-    (void)x0; (void)y; (void)x1;
+    (void)x0;
+    (void)y;
+    (void)x1;
 }
 void GpuRenderer_ShadowEnd(void) {}
 void GpuRenderer_SetBrickBank(const void *bank) { (void)bank; }
 S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
-    (void)brickIdx; (void)x; (void)y; (void)zo;
+    (void)brickIdx;
+    (void)x;
+    (void)y;
+    (void)zo;
+    return 0;
+}
+S32 GpuRenderer_DrawBrickOver(S32 brickIdx, S32 x, S32 y, U16 zo) {
+    (void)brickIdx;
+    (void)x;
+    (void)y;
+    (void)zo;
     return 0;
 }
 S32 GpuRenderer_DrawSprite(S32 spriteIdx, S32 x, S32 y, U16 zo,
                            const void *bank, S32 rawFormat) {
-    (void)spriteIdx; (void)x; (void)y; (void)zo;
-    (void)bank; (void)rawFormat;
+    (void)spriteIdx;
+    (void)x;
+    (void)y;
+    (void)zo;
+    (void)bank;
+    (void)rawFormat;
     return 0;
 }
+S32 GpuRenderer_DrawScaleSprite(S32 x, S32 y, S32 factorx, S32 factory,
+                                U16 zo, const void *bank) {
+    (void)x;
+    (void)y;
+    (void)factorx;
+    (void)factory;
+    (void)zo;
+    (void)bank;
+    return 0;
+}
+S32 GpuRenderer_DrawFlowDot(S32 x, S32 y, U8 coul, U16 zoTop, U16 zoBot) {
+    (void)x;
+    (void)y;
+    (void)coul;
+    (void)zoTop;
+    (void)zoBot;
+    return 0;
+}
+S32 GpuRenderer_DrawHudText(S32 x, S32 y, const char *str) {
+    (void)x;
+    (void)y;
+    (void)str;
+    return 0;
+}
+S32 GpuRenderer_IsOverlayOpaque(void) { return 0; }
 void GpuRenderer_SnapshotTerrain(void) {}
 void GpuRenderer_RestoreTerrain(void) {}
 void GpuRenderer_Begin3DPass(void) {}

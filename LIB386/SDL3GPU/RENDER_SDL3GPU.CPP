@@ -51,10 +51,10 @@ typedef struct S3ShaderBlob {
 #include "clut.vert.spv.h"
 #include "clut.frag.spv.h"
 static const S3ShaderBlob s3Spv[] = {
-    { "present.vert", PRESENT_VERT_SPV, sizeof(PRESENT_VERT_SPV) - 1 },
-    { "present.frag", PRESENT_FRAG_SPV, sizeof(PRESENT_FRAG_SPV) - 1 },
-    { "clut.vert", CLUT_VERT_SPV, sizeof(CLUT_VERT_SPV) - 1 },
-    { "clut.frag", CLUT_FRAG_SPV, sizeof(CLUT_FRAG_SPV) - 1 },
+    {"present.vert", PRESENT_VERT_SPV, sizeof(PRESENT_VERT_SPV) - 1},
+    {"present.frag", PRESENT_FRAG_SPV, sizeof(PRESENT_FRAG_SPV) - 1},
+    {"clut.vert", CLUT_VERT_SPV, sizeof(CLUT_VERT_SPV) - 1},
+    {"clut.frag", CLUT_FRAG_SPV, sizeof(CLUT_FRAG_SPV) - 1},
 };
 #endif
 
@@ -64,10 +64,10 @@ static const S3ShaderBlob s3Spv[] = {
 #include "clut.vert.metal.h"
 #include "clut.frag.metal.h"
 static const S3ShaderBlob s3Msl[] = {
-    { "present.vert", PRESENT_VERT_METAL, sizeof(PRESENT_VERT_METAL) - 1 },
-    { "present.frag", PRESENT_FRAG_METAL, sizeof(PRESENT_FRAG_METAL) - 1 },
-    { "clut.vert", CLUT_VERT_METAL, sizeof(CLUT_VERT_METAL) - 1 },
-    { "clut.frag", CLUT_FRAG_METAL, sizeof(CLUT_FRAG_METAL) - 1 },
+    {"present.vert", PRESENT_VERT_METAL, sizeof(PRESENT_VERT_METAL) - 1},
+    {"present.frag", PRESENT_FRAG_METAL, sizeof(PRESENT_FRAG_METAL) - 1},
+    {"clut.vert", CLUT_VERT_METAL, sizeof(CLUT_VERT_METAL) - 1},
+    {"clut.frag", CLUT_FRAG_METAL, sizeof(CLUT_FRAG_METAL) - 1},
 };
 #endif
 
@@ -77,10 +77,10 @@ static const S3ShaderBlob s3Msl[] = {
 #include "clut.vert.dxil.h"
 #include "clut.frag.dxil.h"
 static const S3ShaderBlob s3Dxil[] = {
-    { "present.vert", PRESENT_VERT_DXIL, sizeof(PRESENT_VERT_DXIL) - 1 },
-    { "present.frag", PRESENT_FRAG_DXIL, sizeof(PRESENT_FRAG_DXIL) - 1 },
-    { "clut.vert", CLUT_VERT_DXIL, sizeof(CLUT_VERT_DXIL) - 1 },
-    { "clut.frag", CLUT_FRAG_DXIL, sizeof(CLUT_FRAG_DXIL) - 1 },
+    {"present.vert", PRESENT_VERT_DXIL, sizeof(PRESENT_VERT_DXIL) - 1},
+    {"present.frag", PRESENT_FRAG_DXIL, sizeof(PRESENT_FRAG_DXIL) - 1},
+    {"clut.vert", CLUT_VERT_DXIL, sizeof(CLUT_VERT_DXIL) - 1},
+    {"clut.frag", CLUT_FRAG_DXIL, sizeof(CLUT_FRAG_DXIL) - 1},
 };
 #endif
 
@@ -112,7 +112,24 @@ typedef struct S3GpuParams {
     float brickW; /* mode 7: brick atlas page size (std140 match GLSL) */
     float brickH;
     float pad;
+    float blendLogW; /* mode 8: engine screen size the lookup pages resolve */
+    float blendLogH;
+    float blendDstW;
+    float blendDstH;
 } S3GpuParams;
+
+/* Present params. Must match the std140 PresentParams block in
+   present.frag.glsl: scalars 4-byte aligned, block padded to 16. */
+typedef struct S3PresentParams {
+    S32 indexed;    /* 0 = ARGB staging, 1 = R8 palette indices */
+    S32 linear;     /* 0 = nearest, 1 = bilinear (R8: four taps + LUT) */
+    float opaqueX0; /* modal full-2D UI rect, engine pixels */
+    float opaqueY0;
+    float opaqueX1; /* x1 <= x0 or y1 <= y0 → inactive */
+    float opaqueY1;
+    float sizeX; /* present texture size in engine pixels */
+    float sizeY;
+} S3PresentParams;
 
 //──────────────────────────────────────────────────────────────────────────
 // Backend state
@@ -149,6 +166,18 @@ static SDL_GPUTexture *s_terrainDepth = NULL;
 static SDL_GPUTexture *s_atlasTex = NULL;
 static SDL_GPUTexture *s_clutTex = NULL;
 static SDL_GPUTexture *s_paletteTex = NULL;
+/* Scene palette for the clut pass (mode 8): same colours as s_paletteTex
+   but alpha byte = palette index, which is how the target records the
+   destination index for blend sprites. The swapchain present pass keeps
+   s_paletteTex (alpha 0, index 0 transparent). */
+static SDL_GPUTexture *s_clutPaletteTex = NULL;
+static SDL_GPUTexture *s_transPalTex = NULL; /* 256×256 R8 blend table */
+static SDL_GPUTexture *s_blendLogTex = NULL; /* rect R8G8 src/Log page */
+static U32 s_blendLogW = 0;
+static U32 s_blendLogH = 0;
+static SDL_GPUTexture *s_blendDstTex = NULL; /* rect BGRA dst copy (SSAA×) */
+static U32 s_blendDstW = 0;
+static U32 s_blendDstH = 0;
 static SDL_GPUTexture *s_brickTex = NULL; /* RG8 brick atlas (GpuScene) */
 static U32 s_brickTexW = 0;
 static U32 s_brickTexH = 0;
@@ -158,6 +187,8 @@ static U32 s_spriteTexH = 0;
 static SDL_GPUTexture *s_overlayTex = NULL;
 static U32 s_overlayW = 0;
 static U32 s_overlayH = 0;
+static S32 s_overlayIndexed = 0;    /* 0 = ARGB, 1 = R8 indices */
+static S32 s_overlayFullUpload = 0; /* fresh texture: contents undefined */
 
 /* Samplers: nearest for the paletted lookups, linear for the composite. */
 static SDL_GPUSampler *s_samplerNearest = NULL;
@@ -248,9 +279,9 @@ static U32 s_drawCount = 0;
 static const float s_quadVerts[16] = {
     /* pos             texcoord */
     -1.0f, -1.0f, 0.0f, 1.0f, /* bottom-left  */
-     1.0f, -1.0f, 1.0f, 1.0f, /* bottom-right */
-    -1.0f,  1.0f, 0.0f, 0.0f, /* top-left     */
-     1.0f,  1.0f, 1.0f, 0.0f, /* top-right    */
+    1.0f, -1.0f, 1.0f, 1.0f,  /* bottom-right */
+    -1.0f, 1.0f, 0.0f, 0.0f,  /* top-left     */
+    1.0f, 1.0f, 1.0f, 0.0f,   /* top-right    */
 };
 
 static void S3_TargetDestroy(void);
@@ -385,6 +416,13 @@ static SDL_GPUGraphicsPipeline *S3_CreateClutPipeline(SDL_GPUShader *vs,
     vin.num_vertex_attributes = 5;
 
     S3_FillBlendState(&blendState, blend);
+    /* The color target's alpha carries the destination palette index (the
+       scene palette's alpha byte), so the alpha equation must keep it:
+       dst alpha = dst alpha, regardless of the fragment's own — same as the
+       GL backend's glBlendFuncSeparate. Present pipelines keep the colour
+       equation's alpha factors; only the clut pass reads that byte back. */
+    blendState.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ZERO;
+    blendState.dst_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
 
     SDL_zero(ctd);
     ctd.format = SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
@@ -515,9 +553,13 @@ static S32 S3_CreatePipelines(void) {
     S32 ok = TRUE;
 
     clutVS = S3_CreateShader("clut.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0, 1);
-    clutFS = S3_CreateShader("clut.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1);
+    /* Six samplers: atlas, CLUT, scene palette, and mode 8's blend src/Log,
+       dst rect and blend table pages. */
+    clutFS = S3_CreateShader("clut.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 6, 1);
     presVS = S3_CreateShader("present.vert", SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
-    presFS = S3_CreateShader("present.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
+    /* Two samplers (uTex + uPalette) and one uniform buffer (PresentParams),
+       matching the set/set decorations in present.frag.glsl. */
+    presFS = S3_CreateShader("present.frag", SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
     if (clutVS == NULL || clutFS == NULL || presVS == NULL || presFS == NULL) {
         ok = FALSE;
     }
@@ -543,10 +585,14 @@ static S32 S3_CreatePipelines(void) {
         }
     }
 
-    if (clutVS != NULL) SDL_ReleaseGPUShader(s_device, clutVS);
-    if (clutFS != NULL) SDL_ReleaseGPUShader(s_device, clutFS);
-    if (presVS != NULL) SDL_ReleaseGPUShader(s_device, presVS);
-    if (presFS != NULL) SDL_ReleaseGPUShader(s_device, presFS);
+    if (clutVS != NULL)
+        SDL_ReleaseGPUShader(s_device, clutVS);
+    if (clutFS != NULL)
+        SDL_ReleaseGPUShader(s_device, clutFS);
+    if (presVS != NULL)
+        SDL_ReleaseGPUShader(s_device, presVS);
+    if (presFS != NULL)
+        SDL_ReleaseGPUShader(s_device, presFS);
     return ok;
 }
 
@@ -603,7 +649,10 @@ static S32 S3_CreateTextures(void) {
     s_clutTex = S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_R8_UNORM, 256, 256);
     s_paletteTex =
         S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, 256, 1);
-    if (s_atlasTex == NULL || s_clutTex == NULL || s_paletteTex == NULL) {
+    s_clutPaletteTex =
+        S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, 256, 1);
+    if (s_atlasTex == NULL || s_clutTex == NULL || s_paletteTex == NULL ||
+        s_clutPaletteTex == NULL) {
         Log_Warn("[SDL3GPU] fixed texture create failed: %s", SDL_GetError());
         return FALSE;
     }
@@ -646,17 +695,23 @@ static void S3_UnmapStaging(void) {
 
 /* Uploads into the frame command buffer (a copy pass). The caller must not
    have a render pass open; the helper closes it defensively. */
-static S32 S3_UploadTextureData(SDL_GPUTexture *tex, const void *data, U32 width,
-                                U32 height, U32 bpp, U32 srcPitch) {
-    U32 rowBytes = width * bpp;
-    U32 size = rowBytes * height;
+/* Upload the (x, y, w, h) rect of `data` (rows pitch bytes apart, bpp bytes
+   per pixel) into `tex`. A zero pitch means tightly packed rows. */
+static S32 S3_UploadTextureRegion(SDL_GPUTexture *tex, const void *data,
+                                  U32 pitch, U32 bpp, U32 x, U32 y, U32 w,
+                                  U32 h) {
+    U32 rowBytes = w * bpp;
+    U32 size = rowBytes * h;
     U8 *mapped;
     SDL_GPUCopyPass *cp;
     SDL_GPUTextureTransferInfo src;
     SDL_GPUTextureRegion dst;
 
-    if (s_device == NULL || tex == NULL || data == NULL) {
+    if (s_device == NULL || tex == NULL || data == NULL || w == 0 || h == 0) {
         return FALSE;
+    }
+    if (pitch == 0) {
+        pitch = rowBytes;
     }
 
     /* Render the batches accumulated so far with the *current* texture before
@@ -682,12 +737,15 @@ static S32 S3_UploadTextureData(SDL_GPUTexture *tex, const void *data, U32 width
         Log_Warn("[SDL3GPU] transfer buffer create failed: %s", SDL_GetError());
         return FALSE;
     }
-    if (srcPitch == 0 || srcPitch == rowBytes) {
-        memcpy(mapped, data, size);
+    if (pitch == rowBytes) {
+        memcpy(mapped, (const U8 *)data + (size_t)y * pitch + (size_t)x * bpp,
+               size);
     } else {
-        U32 y;
-        for (y = 0; y < height; y++) {
-            memcpy(mapped + y * rowBytes, (const U8 *)data + y * srcPitch,
+        U32 row;
+        for (row = 0; row < h; row++) {
+            memcpy(mapped + row * rowBytes,
+                   (const U8 *)data + (size_t)(y + row) * pitch +
+                       (size_t)x * bpp,
                    rowBytes);
         }
     }
@@ -697,16 +755,24 @@ static S32 S3_UploadTextureData(SDL_GPUTexture *tex, const void *data, U32 width
     SDL_zero(src);
     src.transfer_buffer = s_staging;
     src.offset = 0;
-    src.pixels_per_row = width;
-    src.rows_per_layer = height;
+    src.pixels_per_row = w;
+    src.rows_per_layer = h;
     SDL_zero(dst);
     dst.texture = tex;
-    dst.w = width;
-    dst.h = height;
+    dst.x = x;
+    dst.y = y;
+    dst.w = w;
+    dst.h = h;
     dst.d = 1;
     SDL_UploadToGPUTexture(cp, &src, &dst, false);
     SDL_EndGPUCopyPass(cp);
     return TRUE;
+}
+
+static S32 S3_UploadTextureData(SDL_GPUTexture *tex, const void *data, U32 width,
+                                U32 height, U32 bpp, U32 srcPitch) {
+    return S3_UploadTextureRegion(tex, data, srcPitch, bpp, 0, 0, width,
+                                  height);
 }
 
 /* One-shot upload of a whole GPU buffer (used for the static quad). Runs on
@@ -996,7 +1062,8 @@ static S32 S3_TargetSnapshotTerrain(void) {
         s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
         if (s_frameCmd == NULL) {
             Log_Warn("[SDL3GPU] command buffer acquire failed (terrain "
-                     "snapshot): %s", SDL_GetError());
+                     "snapshot): %s",
+                     SDL_GetError());
             return FALSE;
         }
     }
@@ -1035,7 +1102,8 @@ static void S3_TargetRestoreTerrain(void) {
         s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
         if (s_frameCmd == NULL) {
             Log_Warn("[SDL3GPU] command buffer acquire failed (terrain "
-                     "restore): %s", SDL_GetError());
+                     "restore): %s",
+                     SDL_GetError());
             return;
         }
     }
@@ -1198,6 +1266,26 @@ static void S3_DestroyContext(void) {
         SDL_ReleaseGPUTexture(s_device, s_paletteTex);
         s_paletteTex = NULL;
     }
+    if (s_clutPaletteTex != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_clutPaletteTex);
+        s_clutPaletteTex = NULL;
+    }
+    if (s_transPalTex != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_transPalTex);
+        s_transPalTex = NULL;
+    }
+    if (s_blendLogTex != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_blendLogTex);
+        s_blendLogTex = NULL;
+        s_blendLogW = 0;
+        s_blendLogH = 0;
+    }
+    if (s_blendDstTex != NULL) {
+        SDL_ReleaseGPUTexture(s_device, s_blendDstTex);
+        s_blendDstTex = NULL;
+        s_blendDstW = 0;
+        s_blendDstH = 0;
+    }
     if (s_brickTex != NULL) {
         SDL_ReleaseGPUTexture(s_device, s_brickTex);
         s_brickTex = NULL;
@@ -1212,6 +1300,7 @@ static void S3_DestroyContext(void) {
     }
     s_overlayW = 0;
     s_overlayH = 0;
+    s_overlayIndexed = 0;
 
     if (s_samplerNearest != NULL) {
         SDL_ReleaseGPUSampler(s_device, s_samplerNearest);
@@ -1437,13 +1526,20 @@ static void S3_TexUpdateCLUT(const void *lum) {
 
 static void S3_TexUpdatePalette(const void *argb) {
     U32 paletteCopy[256];
+    U32 sceneCopy[256];
+    U32 i;
     if (argb == NULL) {
         return;
     }
     /* Palette index 0 is the transparent colour (sprites/UI chroma key), so
-       its alpha is forced to 0 exactly as the GL backend does. */
+       its alpha is forced to 0 exactly as the GL backend does. The scene
+       copy (clut pass, mode 8) instead carries alpha = palette index: the
+       target's alpha byte is the destination index blend sprites read. */
     memcpy(paletteCopy, argb, sizeof(paletteCopy));
     paletteCopy[0] &= 0x00FFFFFFu;
+    for (i = 0; i < 256; i++) {
+        sceneCopy[i] = (paletteCopy[i] & 0x00FFFFFFu) | (i << 24);
+    }
 
     if (s_paletteCacheValid &&
         memcmp(s_paletteCache, paletteCopy, sizeof(s_paletteCache)) == 0) {
@@ -1452,6 +1548,9 @@ static void S3_TexUpdatePalette(const void *argb) {
     if (S3_UploadTextureData(s_paletteTex, paletteCopy, 256, 1, 4, 0)) {
         memcpy(s_paletteCache, paletteCopy, sizeof(s_paletteCache));
         s_paletteCacheValid = TRUE;
+    }
+    if (s_clutPaletteTex != NULL) {
+        S3_UploadTextureData(s_clutPaletteTex, sceneCopy, 256, 1, 4, 0);
     }
 }
 
@@ -1508,36 +1607,192 @@ static void S3_TexUpdateSprites(const void *rg, U32 width, U32 height) {
     S3_UploadTextureData(s_spriteTex, rg, width, height, 2, width * 2);
 }
 
-static void S3_TexUpdatePresent(const void *argb, U32 pitch, U32 width,
-                                U32 height, S32 linear) {
-    (void)linear; /* chosen at composite bind time */
+/* Blend table (mode 8): the 64 KB transpTable as a 256×256 R8 page,
+   row = source index, column = destination index. */
+static void S3_TexUpdateTransPal(const void *lum) {
+    if (lum == NULL) {
+        return;
+    }
+    if (s_transPalTex == NULL) {
+        s_transPalTex =
+            S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_R8_UNORM, 256, 256);
+        if (s_transPalTex == NULL) {
+            Log_Warn("[SDL3GPU] blend table texture create failed: %s",
+                     SDL_GetError());
+            return;
+        }
+    }
+    S3_UploadTextureData(s_transPalTex, lum, 256, 256, 1, 256);
+}
 
-    if (s_device == NULL || argb == NULL || width == 0 || height == 0) {
+/* Blend source/Log page (mode 8): R8G8 rect at (0,0) — byte0 = walked
+   source index (.r), byte1 = Log index (.g). The page is the rect size,
+   which is also what GpuDrawParams.blendLogW/H carries, so the shader's
+   (px + 0.5) / blendLog lands on texel px for every sprite. */
+static void S3_TexUpdateBlendLog(const void *rg, U32 width, U32 height) {
+    if (rg == NULL || width == 0 || height == 0) {
+        return;
+    }
+    if (s_blendLogTex != NULL &&
+        (s_blendLogW != width || s_blendLogH != height)) {
+        SDL_ReleaseGPUTexture(s_device, s_blendLogTex);
+        s_blendLogTex = NULL;
+    }
+    if (s_blendLogTex == NULL) {
+        s_blendLogTex =
+            S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_R8G8_UNORM, width, height);
+        if (s_blendLogTex == NULL) {
+            Log_Warn("[SDL3GPU] blend log texture create failed: %s",
+                     SDL_GetError());
+            s_blendLogW = 0;
+            s_blendLogH = 0;
+            return;
+        }
+        s_blendLogW = width;
+        s_blendLogH = height;
+    }
+    S3_UploadTextureData(s_blendLogTex, rg, width, height, 2, width * 2);
+}
+
+/* Blend destination rect (mode 8): GPU→GPU copy of the offscreen colour
+   rect (engine coordinates, top-left origin — same as the target) into a
+   rect-sized BGRA page at (0,0), SSAA blocks included. The shader
+   normalises by engine pixels (blendDstW/H = rect), so (px + 0.5) / blendDst
+   lands mid-block. The copy must see every draw queued before the blend
+   sprite, so the render pass is flushed and the deferred clear applied
+   first. */
+static void S3_BeginTargetPass(void); /* defined with the pass machinery */
+static S32 S3_TargetCopyColorRect(U32 x, U32 y, U32 width, U32 height) {
+    SDL_GPUCopyPass *cp;
+    SDL_GPUTextureLocation src;
+    SDL_GPUTextureLocation dst;
+    U32 scale;
+    U32 tw;
+    U32 th;
+
+    if (s_device == NULL || s_targetColor == NULL || width == 0 ||
+        height == 0) {
+        return FALSE;
+    }
+    scale = (s_resX != 0) ? (s_targetW / s_resX) : 1;
+    if (scale == 0) {
+        scale = 1;
+    }
+    if (x * scale + width * scale > s_targetW ||
+        y * scale + height * scale > s_targetH) {
+        return FALSE;
+    }
+
+    S3_FlushDraws();
+    if (s_targetPass != NULL) {
+        SDL_EndGPURenderPass(s_targetPass);
+        s_targetPass = NULL;
+    }
+    if (s_targetNeedsClear) {
+        /* No draw has opened the target pass this frame: open and close one
+           so the deferred clear lands before the copy reads the rect. */
+        S3_BeginTargetPass();
+        if (s_targetPass != NULL) {
+            SDL_EndGPURenderPass(s_targetPass);
+            s_targetPass = NULL;
+        }
+    }
+    if (s_frameCmd == NULL) {
+        s_frameCmd = SDL_AcquireGPUCommandBuffer(s_device);
+        if (s_frameCmd == NULL) {
+            Log_Warn("[SDL3GPU] copy rect command buffer acquire failed: %s",
+                     SDL_GetError());
+            return FALSE;
+        }
+    }
+
+    tw = width * scale;
+    th = height * scale;
+    if (s_blendDstTex != NULL &&
+        (s_blendDstW != tw || s_blendDstH != th)) {
+        SDL_ReleaseGPUTexture(s_device, s_blendDstTex);
+        s_blendDstTex = NULL;
+    }
+    if (s_blendDstTex == NULL) {
+        s_blendDstTex =
+            S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM, tw, th);
+        if (s_blendDstTex == NULL) {
+            Log_Warn("[SDL3GPU] blend dst texture create failed: %s",
+                     SDL_GetError());
+            s_blendDstW = 0;
+            s_blendDstH = 0;
+            return FALSE;
+        }
+        s_blendDstW = tw;
+        s_blendDstH = th;
+    }
+
+    cp = SDL_BeginGPUCopyPass(s_frameCmd);
+    SDL_zero(src);
+    src.texture = s_targetColor;
+    src.x = x * scale;
+    src.y = y * scale;
+    SDL_zero(dst);
+    dst.texture = s_blendDstTex;
+    SDL_CopyGPUTextureToTexture(cp, &src, &dst, tw, th, 1, false);
+    SDL_EndGPUCopyPass(cp);
+    return TRUE;
+}
+
+static void S3_TexUpdatePresent(const void *pixels, U32 pitch, U32 width,
+                                U32 height, S32 rectX, S32 rectY, S32 rectW,
+                                S32 rectH, S32 linear, S32 indexed) {
+    (void)linear; /* chosen at composite bind time (ARGB) or via
+                     PresentParams.uLinear (R8) */
+
+    if (s_device == NULL || pixels == NULL || width == 0 || height == 0) {
         return;
     }
 
     s_presentW = width;
     s_presentH = height;
 
-    if (s_overlayTex == NULL || s_overlayW != width || s_overlayH != height) {
+    /* Format switch (R8 indices ↔ ARGB staging) recreates the overlay: the
+       format is part of the texture, not just its contents. */
+    if (s_overlayTex == NULL || s_overlayW != width || s_overlayH != height ||
+        s_overlayIndexed != indexed) {
         if (s_overlayTex != NULL) {
             SDL_ReleaseGPUTexture(s_device, s_overlayTex);
             s_overlayTex = NULL;
         }
-        s_overlayTex = S3_CreateTexture(SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
-                                        width, height);
+        s_overlayTex =
+            S3_CreateTexture(indexed ? SDL_GPU_TEXTUREFORMAT_R8_UNORM
+                                     : SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM,
+                             width, height);
         if (s_overlayTex == NULL) {
             Log_Warn("[SDL3GPU] overlay texture create failed: %s",
                      SDL_GetError());
             s_overlayW = 0;
             s_overlayH = 0;
+            s_overlayIndexed = 0;
             return;
         }
         s_overlayW = width;
         s_overlayH = height;
+        s_overlayIndexed = indexed;
+        /* A fresh texture's contents are undefined: this call uploads the
+           full surface whatever rect the caller planned. */
+        s_overlayFullUpload = 1;
     }
 
-    S3_UploadTextureData(s_overlayTex, argb, width, height, 4, pitch);
+    if (s_overlayFullUpload) {
+        rectX = 0;
+        rectY = 0;
+        rectW = (S32)width;
+        rectH = (S32)height;
+        s_overlayFullUpload = 0;
+    }
+    if (rectW <= 0 || rectH <= 0) {
+        return; /* texture already matches: nothing carries content */
+    }
+
+    S3_UploadTextureRegion(s_overlayTex, pixels, pitch, indexed ? 1 : 4,
+                           (U32)rectX, (U32)rectY, (U32)rectW, (U32)rectH);
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -1632,11 +1887,13 @@ static void S3_BeginTargetPass(void) {
     SDL_zero(cti);
     cti.texture = s_targetColor;
     /* Scene clear RGB (exterior FogCoul): sky gaps outside the drawn
-       horizon must match the software Cls fill, not black. */
+       horizon must match the software Cls fill, not black. Alpha clears to
+       index 0: the alpha byte is the destination palette index mode 8
+       blends against, and the software Log starts cleared too. */
     cti.clear_color.r = (float)((s_targetClearRgb >> 16) & 0xFF) / 255.0f;
     cti.clear_color.g = (float)((s_targetClearRgb >> 8) & 0xFF) / 255.0f;
     cti.clear_color.b = (float)(s_targetClearRgb & 0xFF) / 255.0f;
-    cti.clear_color.a = 1.0f;
+    cti.clear_color.a = 0.0f;
     cti.load_op = loadOp;
     cti.store_op = SDL_GPU_STOREOP_STORE;
 
@@ -1665,7 +1922,7 @@ static void S3_FlushDraws(void) {
     SDL_GPUViewport vp;
     SDL_Rect scissor;
     SDL_GPUBufferBinding vb;
-    SDL_GPUTextureSamplerBinding samplers[3];
+    SDL_GPUTextureSamplerBinding samplers[6];
 
     if (s_drawCount == 0) {
         return;
@@ -1738,13 +1995,24 @@ static void S3_FlushDraws(void) {
     vb.offset = 0;
     SDL_BindGPUVertexBuffers(s_targetPass, 0, &vb, 1);
 
+    /* Bindings 0..5 of the clut fragment shader. The mode 8 pages are
+       placeholders until the first blend sprite uploads them: the shader
+       only samples them in polyMode 8, but every binding must be valid
+       even when the texture has never been created. */
     samplers[0].texture = s_atlasTex;
     samplers[0].sampler = s_samplerNearest;
     samplers[1].texture = s_clutTex;
     samplers[1].sampler = s_samplerNearest;
-    samplers[2].texture = s_paletteTex;
+    samplers[2].texture = s_clutPaletteTex != NULL ? s_clutPaletteTex
+                                                   : s_paletteTex;
     samplers[2].sampler = s_samplerNearest;
-    SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 3);
+    samplers[3].texture = s_blendLogTex != NULL ? s_blendLogTex : s_atlasTex;
+    samplers[3].sampler = s_samplerNearest;
+    samplers[4].texture = s_blendDstTex != NULL ? s_blendDstTex : s_atlasTex;
+    samplers[4].sampler = s_samplerNearest;
+    samplers[5].texture = s_transPalTex != NULL ? s_transPalTex : s_clutTex;
+    samplers[5].sampler = s_samplerNearest;
+    SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 6);
 
     {
         /* Mode 7 samples the brick or sprite page through uAtlas; the bind
@@ -1770,7 +2038,7 @@ static void S3_FlushDraws(void) {
                     samplers[0].texture = s_atlasTex;
                 }
                 samplers[0].sampler = s_samplerNearest;
-                SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 3);
+                SDL_BindGPUFragmentSamplers(s_targetPass, 0, samplers, 6);
                 boundPage = wantPage;
             }
             /* Scissor to the software Fill_Poly clip window (engine pixels
@@ -1882,6 +2150,10 @@ static void S3_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     cmd->params.brickH =
         (float)(params->spriteAtlas ? s_spriteTexH : s_brickTexH);
     cmd->params.pad = 0.0f;
+    cmd->params.blendLogW = params->blendLogW;
+    cmd->params.blendLogH = params->blendLogH;
+    cmd->params.blendDstW = params->blendDstW;
+    cmd->params.blendDstH = params->blendDstH;
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -2024,14 +2296,19 @@ static void S3_ClearBackbuffer(void) {
     s_swapchainH = sh;
 }
 
-static void S3_DrawPresentQuad(S32 which, S32 linear) {
+static void S3_DrawPresentQuad(S32 which, S32 linear, S32 opaqueX0,
+                               S32 opaqueY0, S32 opaqueX1, S32 opaqueY1) {
     SDL_GPUGraphicsPipeline *pipe;
     SDL_GPUTexture *tex;
     SDL_GPUSampler *sampler;
     SDL_GPUViewport vp;
     SDL_Rect scissor;
     SDL_GPUBufferBinding vb;
-    SDL_GPUTextureSamplerBinding bind;
+    SDL_GPUTextureSamplerBinding binds[2];
+    S3PresentParams pp;
+    S32 indexed = 0;
+    S32 sizeX = (S32)s_presentW;
+    S32 sizeY = (S32)s_presentH;
 
     if (s_swapchainPass == NULL) {
         return;
@@ -2044,6 +2321,8 @@ static void S3_DrawPresentQuad(S32 which, S32 linear) {
         pipe = s_presentOpaque;
         tex = s_targetColor;
         sampler = s_samplerLinear; /* FBO source is always linear */
+        sizeX = (S32)s_targetW;
+        sizeY = (S32)s_targetH;
     } else {
         if (s_overlayTex == NULL) {
             S3_SubmitFrame();
@@ -2051,7 +2330,13 @@ static void S3_DrawPresentQuad(S32 which, S32 linear) {
         }
         pipe = s_presentBlend;
         tex = s_overlayTex;
-        sampler = linear ? s_samplerLinear : s_samplerNearest;
+        /* R8: always NEAREST on the index page — bilinear is four taps in
+           the shader (uLinear), matching hardware bilinear on converted ARGB. */
+        indexed = s_overlayIndexed;
+        sampler = indexed ? s_samplerNearest
+                          : (linear ? s_samplerLinear : s_samplerNearest);
+        sizeX = (S32)s_overlayW;
+        sizeY = (S32)s_overlayH;
     }
     if (pipe == NULL) {
         if (which != 0) {
@@ -2083,9 +2368,22 @@ static void S3_DrawPresentQuad(S32 which, S32 linear) {
     vb.offset = 0;
     SDL_BindGPUVertexBuffers(s_swapchainPass, 0, &vb, 1);
 
-    bind.texture = tex;
-    bind.sampler = sampler;
-    SDL_BindGPUFragmentSamplers(s_swapchainPass, 0, &bind, 1);
+    binds[0].texture = tex;
+    binds[0].sampler = sampler;
+    binds[1].texture = s_paletteTex;
+    binds[1].sampler = s_samplerNearest;
+    SDL_BindGPUFragmentSamplers(s_swapchainPass, 0, binds, 2);
+
+    SDL_zero(pp);
+    pp.indexed = indexed;
+    pp.linear = indexed ? linear : 0;
+    pp.opaqueX0 = (float)opaqueX0;
+    pp.opaqueY0 = (float)opaqueY0;
+    pp.opaqueX1 = (float)opaqueX1;
+    pp.opaqueY1 = (float)opaqueY1;
+    pp.sizeX = (float)sizeX;
+    pp.sizeY = (float)sizeY;
+    SDL_PushGPUFragmentUniformData(s_frameCmd, 0, &pp, sizeof(pp));
 
     SDL_DrawGPUPrimitives(s_swapchainPass, 4, 1, 0, 0);
 
@@ -2116,6 +2414,9 @@ const GpuRendererBackend GpuRendererBackendSDL3GPU = {
     S3_TexUpdatePalette,
     S3_TexUpdateBricks,
     S3_TexUpdateSprites,
+    S3_TexUpdateTransPal,
+    S3_TexUpdateBlendLog,
+    S3_TargetCopyColorRect,
     S3_DrawTriangles,
     S3_ClearBackbuffer,
     S3_DrawPresentQuad,

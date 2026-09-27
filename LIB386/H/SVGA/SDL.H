@@ -8,11 +8,15 @@ extern "C" {
 
 // GPU present seam. The GPU renderer (GPURenderer_Init in LIB386/COMMON)
 // registers itself here on init; the present path in SDL.CPP then hands its
-// Log ARGB overlay to the renderer instead of the software streaming texture.
+// Log overlay to the renderer instead of the software streaming texture.
+// indexed selects the pixel format: FALSE is 0xAARRGGBB staging (console /
+// touch / software callbacks ran and may have drawn into it); TRUE is Log's
+// raw 8-bit palette indices, pitch in bytes = width, with the LUT lookup in
+// the present shader — the CPU conversion is skipped on that path.
 // Both pointers stay NULL on the software path, which the ASM equivalence
 // tests link without any GPU dependency.
-typedef void (*GpuPresentFn)(const void *argbPixels, U32 pitch, U32 width,
-                             U32 height, S32 filterLinear);
+typedef void (*GpuPresentFn)(const void *pixels, U32 pitch, U32 width,
+                             U32 height, S32 filterLinear, S32 indexed);
 typedef S32 (*GpuIsActiveFn)(void);
 typedef void (*GpuVSyncFn)(S32 enabled);
 void SetGpuPresentHooks(GpuPresentFn present, GpuIsActiveFn isActive);

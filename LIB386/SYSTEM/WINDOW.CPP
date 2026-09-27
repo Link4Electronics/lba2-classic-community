@@ -683,23 +683,29 @@ void WindowToSurfaceCoords(S32 windowX, S32 windowY, S32 *surfaceX, S32 *surface
                 vpH = winH;
                 vpW = (int)((double)winH * contentAspect + 0.5);
                 vpW = (vpW + 1) & ~1;
-                if (vpW > winW) vpW = winW;
+                if (vpW > winW)
+                    vpW = winW;
                 vpX = (winW - vpW) / 2;
                 vpY = 0;
             } else {
                 vpW = winW;
                 vpH = (int)((double)winW / contentAspect + 0.5);
                 vpH = (vpH + 1) & ~1;
-                if (vpH > winH) vpH = winH;
+                if (vpH > winH)
+                    vpH = winH;
                 vpX = 0;
                 vpY = (winH - vpH) / 2;
             }
             S32 sx = (S32)((double)(windowX - vpX) * (double)ModeDesiredX / (double)vpW);
             S32 sy = (S32)((double)(windowY - vpY) * (double)ModeDesiredY / (double)vpH);
-            if (sx < 0) sx = 0;
-            else if (sx >= (S32)ModeDesiredX) sx = (S32)ModeDesiredX - 1;
-            if (sy < 0) sy = 0;
-            else if (sy >= (S32)ModeDesiredY) sy = (S32)ModeDesiredY - 1;
+            if (sx < 0)
+                sx = 0;
+            else if (sx >= (S32)ModeDesiredX)
+                sx = (S32)ModeDesiredX - 1;
+            if (sy < 0)
+                sy = 0;
+            else if (sy >= (S32)ModeDesiredY)
+                sy = (S32)ModeDesiredY - 1;
             *surfaceX = sx;
             *surfaceY = sy;
             return;

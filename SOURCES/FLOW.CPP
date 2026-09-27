@@ -1,6 +1,10 @@
 #include "C_EXTERN.H"
 #include "DIRECTORIES.H"
 
+#include <GPU/GPURENDERER.H> // GpuRenderer_DrawFlowDot
+#include <GL/RENDER_GL.H>    // GpuScene
+#include <POLYGON/POLY.H>    // GET_ZO
+
 /*══════════════════════════════════════════════════════════════════════════*
 	     █▀▀▀█ █▀▀▀█ █▀▀▀█ ▀▀█▀▀  █    █▀▀▀▀ █     █▀▀▀▀ ██▀▀▀
 	     ██▀▀▀ ██▀▀█ ██▀█▀   ██   ██   ██    ██    ██▀▀  ▀▀▀▀█
@@ -425,10 +429,29 @@ U32 CreateExtraParticleFlow(S32 type, S32 owner, S32 num, S32 num2,
 }
 
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+/* GpuScene exterior: ZBufBoxOverWrite2's depth test is row-constant across
+   the flow's bounding box — the clip the caller's DrawRecover gets after
+   SetClip of the bounds this function publishes — so the dots cannot be
+   stamped until every dot has projected. They collect here and draw after
+   the loop with that interpolated depth; one entry per displayed dot. */
+typedef struct {
+    S32 x;
+    S32 y;
+    U8 coul;
+} T_FLOW_GPUDOT;
+
+static T_FLOW_GPUDOT *ListFlowGpuDots = NULL;
+static S32 NbFlowGpuDotsCap = 0;
+
 S32 AffParticleFlow(S_PART_FLOW *ptrf) {
     S32 n;
     S32 flag = FALSE;
     S_ONE_DOT *ptrd;
+    S32 defer;
+    S32 dotN = 0;
+
+    defer = (GpuRenderer_IsActive() && GpuScene &&
+             CubeMode == CUBE_EXTERIEUR);
 
     ClearScreenMinMax();
     ptrd = ptrf->PtrListDot;
@@ -440,12 +463,39 @@ S32 AffParticleFlow(S_PART_FLOW *ptrf) {
 
             LongWorldRotatePoint(X0, Y0, Z0);
             if (LongProjectPoint(X0, Y0, Z0)) {
+                if (defer) {
+                    if (dotN >= NbFlowGpuDotsCap) {
+                        S32 newCap = NbFlowGpuDotsCap ? NbFlowGpuDotsCap * 2 : 64;
+                        T_FLOW_GPUDOT *grown =
+                            (T_FLOW_GPUDOT *)realloc(ListFlowGpuDots,
+                                                     newCap * sizeof(T_FLOW_GPUDOT));
+                        if (grown != NULL) {
+                            ListFlowGpuDots = grown;
+                            NbFlowGpuDotsCap = newCap;
+                        }
+                    }
+                    if (dotN < NbFlowGpuDotsCap) {
+                        ListFlowGpuDots[dotN].x = Xp;
+                        ListFlowGpuDots[dotN].y = Yp;
+                        ListFlowGpuDots[dotN].coul = (U8)ptrd->Couleur;
+                        dotN++;
+                    } else {
+                        /* No buffer: software draw; the caller's recovery
+                           re-applies terrain occlusion as it always did. */
+                        BoxFlow(Xp, Yp, ptrd->Couleur);
+                    }
+                } else {
 #ifdef LBA_EDITOR
-                if (!(FlagInfos & INFO_BOX_FLOW))
-                    Plot(Xp, Yp, ptrd->Couleur);
-                else
+                    if (!(FlagInfos & INFO_BOX_FLOW))
+                        Plot(Xp, Yp, ptrd->Couleur);
+                    else
 #endif
-                    BoxFlow(Xp, Yp, ptrd->Couleur);
+                        if (!GpuRenderer_DrawFlowDot(Xp, Yp,
+                                                     (U8)ptrd->Couleur, 0,
+                                                     0)) {
+                        BoxFlow(Xp, Yp, ptrd->Couleur);
+                    }
+                }
 
                 if (Xp < ScreenXMin)
                     ScreenXMin = Xp;
@@ -456,6 +506,42 @@ S32 AffParticleFlow(S_PART_FLOW *ptrf) {
                 if (Yp + 1 > ScreenYMax)
                     ScreenYMax = Yp + 1;
                 flag = TRUE;
+            }
+        }
+    }
+
+    if (defer && flag && dotN > 0) {
+        S32 z0;
+        S32 z1;
+        S32 scaledZ0;
+        S32 scaledZ1;
+        S32 incZ;
+        S32 deltaY;
+        S32 i;
+
+        GetRecoverDepth(ptrf->OrgX, ptrf->OrgY, ptrf->OrgZ, ptrf->YMax,
+                        ade_max((ptrf->XMax - ptrf->XMin) / 2,
+                                (ptrf->ZMax - ptrf->ZMin) / 2),
+                        &z0, &z1);
+
+        deltaY = ScreenYMax - ScreenYMin + 1;
+        scaledZ0 = Fill_ZBuffer_Factor * z0;
+        scaledZ1 = Fill_ZBuffer_Factor * z1;
+        incZ = (S32)((S64)(scaledZ0 - scaledZ1) / deltaY);
+
+        for (i = 0; i < dotN; i++) {
+            /* Row r's z0Int: same U32 accumulation and >>16 the software
+               sweep does, so GEQUAL and the ZBuf test decide alike. */
+            U32 r = (U32)(ListFlowGpuDots[i].y - ScreenYMin);
+            U16 zoTop = (U16)(((U32)scaledZ1 + (U32)incZ * r) >> 16);
+            U16 zoBot = (U16)(((U32)scaledZ1 + (U32)incZ * (r + 1)) >> 16);
+
+            if (!GpuRenderer_DrawFlowDot(ListFlowGpuDots[i].x,
+                                         ListFlowGpuDots[i].y,
+                                         ListFlowGpuDots[i].coul, zoTop,
+                                         zoBot)) {
+                BoxFlow(ListFlowGpuDots[i].x, ListFlowGpuDots[i].y,
+                        ListFlowGpuDots[i].coul);
             }
         }
     }

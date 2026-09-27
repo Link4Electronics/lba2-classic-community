@@ -90,14 +90,16 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   and every other `ObjectDisplay` caller — menus' spinning models, holomap,
   credits — keep the software Log path).
 - **Present seam** — `PresentFrame` (`../LIB386/SVGA/SDL.CPP`) hands its Log
-  ARGB overlay to the renderer (`SetGpuPresentHooks`, default NULL) instead of
-  the SDL streaming texture while a backend is active; the renderer composites
-  it over its 3D framebuffer and swaps. The overlay is staged into a
-  present-owned buffer (`STAGING_BUFFER.CPP`) before the hand-off, because a
-  GPU window is recreated without the SDL renderer/streaming texture (see the
-  switch below), so the lock-texture path could not produce a frame there.
-  `GL_GetPaletteLUT` exports the same 256-entry ARGB table so GPU-drawn
-  content and Log always agree.
+  overlay to the renderer (`SetGpuPresentHooks`, default NULL) instead of the
+  SDL streaming texture while a backend is active. With a GPU backend the
+  hand-off is R8 palette indices (`GpuRenderer_Present(indexed=TRUE)`): the
+  present shader resolves colour through the LUT, so the CPU no longer converts
+  Log to ARGB. The overlay is staged into a present-owned buffer
+  (`STAGING_BUFFER.CPP`) before the hand-off, because a GPU window is recreated
+  without the SDL renderer/streaming texture (see the switch below), so the
+  lock-texture path could not produce a frame there. `GL_GetPaletteLUT`
+  exports the same 256-entry ARGB table so GPU-drawn content and Log always
+  agree.
 - **Atlas signal** — `AtlasTextureDirty` is raised by `DoTextureAnimation`
   (`../SOURCES/ANIMTEX.CPP`) whenever animated texture pages are baked in
   place, so the renderer re-uploads the atlas page it mirrored.
@@ -109,7 +111,7 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   (`../SOURCES/3DEXT/BOXZBUF.CPP`), which reads that depth; without the readback
   it holds nothing from the GPU-drawn terrain. Where terrain is in front,
   `ZBufBoxOverWrite2` writes colour 0, which the present composite blends
-  transparent over the same target's terrain, so no colour readback is needed.
+  transparent over the same target's terrain, so no colour readback is needed. (With `GpuScene`, world sprites and exterior flow particles are in the offscreen target and test its depth directly, so they drop out of this consumer list; `LineRain` still reads the readback depth directly.)
   Bodies in the 3D pass skip that step: the GPU `GEQUAL` test against the
   target's own depth does their terrain occlusion directly.
   The call is gated on `CubeMode == CUBE_EXTERIEUR`: interior cubes reuse
@@ -124,12 +126,37 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   target, and only palette index 0 is transparent in the present composite:
   a `FogCoul` fill of `Log` would paint an opaque overlay over that target and
   hide the 3D scene. The same routine therefore clears `Log` to index 0 while a
-  backend is live, so the composite shows the GPU frame (HUD and sprites drawn
-  into `Log` afterward still paint over it). The offscreen target itself is
-  cleared to the scene `FogCoul` RGB (`GpuRenderer_SetSceneClearIndex` from
-  `RefreshGrille`, `../SOURCES/INTEXT.CPP`) so pixels the GPU never covers —
-  outside the drawn horizon, above the sky strip — match the software fill
-  rather than black. Interior passes palette index 0, the software default.
+  backend is live (unless `GpuRenderer_GetSoftwarePolys()` is set — a
+  one-shot Screen-plate pass, which takes the `FogCoul` fill so the plate starts
+  from the fog colour, not zeros), so the composite shows the GPU frame (HUD
+  and sprites drawn into `Log` afterward still paint over it). The offscreen
+  target itself is cleared to the scene `FogCoul` RGB
+  (`GpuRenderer_SetSceneClearIndex` from `RefreshGrille`,
+  `../SOURCES/INTEXT.CPP`) so pixels the GPU never covers — outside the drawn
+  horizon, above the sky strip — match the software fill rather than black.
+  Interior passes palette index 0, the software default.
+- **Software-plate pass** — `GpuRenderer_SetSoftwarePolys(enabled)`
+  (`../LIB386/H/GPU/GPURENDERER.H`) forces `Fill_Poly`'s hook to yield so a
+  one-shot pass rasterizes into Log palette indices while the backend stays
+  active (resets on Init/Shutdown). Used by the exterior inventory plate
+  (`AffGrilleExt_BuildScreenPlate`, `../SOURCES/EXTFUNC.CPP`): after exterior
+  `AFF_ALL` ends with `CopyScreen(Log, Screen)` while Log was cleared for the
+  FBO composite, Screen holds zeros and `OpenInventory`'s
+  `CopyScreen(Screen, Log)` would feed `ShadeBoxBlk` empty indices — the wheel
+  would darken to a flat shade instead of the scene. The plate rebuilds Screen
+  once (gated on backend active, exterior cube, not the cleanroom
+  `--black-bg` golden), clears Log for the present composite, then the modal
+  shades the real plate. The interior room plate
+  (`AffGrille_BuildScreenPlate`, `../SOURCES/GRILLE.CPP`) needs no yield
+  of its own — `s_swPlateBricks` forces AffGraph, which never enters
+  `Fill_Poly` — and neither plate is built per frame any more: the
+  inventory wheel and the behaviour (CTRL) modal (`MenuComportement`,
+  `../SOURCES/COMPORTE.CPP`) each rebuild into `Screen` on open
+  (exterior terrain plate, interior room plate under
+  `GpuRenderer_IsSceneInterior()`, both skipped for the cleanroom
+  `--black-bg` golden) then `CopyScreen(Screen, Log)`, so
+  `BackupScreen(TRUE)` cannot paste zeros over the plate before the shade
+  runs.
 - **Clip-window scissor** — software `Fill_Poly` rasterizes only inside
   `ClipXMin..ClipYMax` (cinema bars, dialogue windows, `AFF_ALL_FLIP`
   unsetting the clip window). The GPU intake runs before that screen-space
@@ -209,9 +236,10 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   (set from `CubeMode` in `RefreshGrille` beside the scene clear index),
   those quads depth-test `GEQUAL` and depth-write, so the nearer brick
   wins regardless of grid draw order and later sprites can test against
-  the nearest room surface. Interior body/NZW batches under the same mark
-  force depth-test and depth-write off (`TYPE_ISO` leaves `Pt_ZO`
-  untouched; front-wall Log re-blits remain the only body occlusion).
+  the nearest room surface. Interior body/NZW batches under the same
+  mark force depth-test and depth-write off (`TYPE_ISO` leaves `Pt_ZO`
+  untouched; the front-wall re-blit remains the only body occlusion,
+  submitted as a no-depth quad by `GpuRenderer_DrawBrickOver`).
   Exterior keeps the terrain-only depth scheme and never draws brick
   quads. `InitGrille` calls `GpuRenderer_SetBrickBank` after
   `LoadUsedBrick`; `FreeGrille` passes NULL. Successful enqueues arm
@@ -219,22 +247,38 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   resets), the interior half of the body/NZW intake gate. With the flag
   off, or on the software path, every hook falls through to `AffGraph`
   unchanged. With the flag on, interior bodies and the 3D pass join the
-  FBO (see 3D pass above); `DrawOverBrick`, `CopyMask`, Z-masks, HUD and
-  blend/scaled sprites stay in the Log.
+  FBO (see 3D pass above); `DrawOverBrick`'s front-wall re-blits join them
+  as no-depth brick quads (`GpuRenderer_DrawBrickOver`), while `CopyMask`
+  — the fallback whenever the backend declines — plus Z-masks and HUD stay
+  in the Log.
 
-  Two Log/Screen rules keep that split correct. `CopyMask` re-blits wall
-  pixels **from `Screen`**, but with the flag on `Cls` leaves `Log` empty
-  and `RefreshGrille` paints only the FBO — so on `AFF_ALL` frames
-  `GpuRenderer_IsSceneInterior()` (`AffGrille_BuildScreenPlate` in
-  `../SOURCES/GRILLE.CPP`) runs one software `AffGraph` pass into `Log`
-  (forcing `s_swPlateBricks` so no second FBO batch is submitted),
-  snapshots it to `Screen`, then clears `Log` to 0 for the overlay.
-  And `BoxClean` / `DefaultBoxOneClean` restores `Screen`→`Log` by
-  default, which would paint the room plate over FBO bodies in the dirty
-  regions — `AffScene` sets `BoxOneClean` to `DefaultBoxOneClear`
-  (clear to 0) under the same interior rule, back to the default
-  otherwise, so mid-dialog `BoxClean` callers inherit it. Both rules
-  are dead with the flag off.
+  Two Log/Screen rules keep that split correct. The re-blit no longer
+  needs a plate: `CopyMask` copies wall pixels **from `Screen`** into
+  `Log` over the body, and with the flag on `Cls` leaves `Log` empty while
+  `RefreshGrille` paints only the FBO, so `AFF_ALL` used to rebuild a
+  software plate every frame
+  ([`AffGrille_BuildScreenPlate`](../SOURCES/GRILLE.CPP), one forced
+  `AffGraph` pass under `GpuRenderer_IsSceneInterior()`). `DrawOverBrick`,
+  `DrawOverBrick3` and `DrawOverBrickCage` now call
+  [`GpuRenderer_DrawBrickOver`](../LIB386/COMMON/GPURENDERER_COMMON.CPP),
+  which re-submits the brick's own quad —
+  batched as `GPU_BRICKOVER_TYPE`: no depth test or write, so it lands
+  over the body in batch order exactly as the mask-gated copy did — and
+  returns FALSE, leaving `CopyMask` in charge, when the flag is off, no
+  backend is live, or the pack fails. The mask bank is redundant for the
+  quad: `CalcGraphMsk` derives it from the brick's own RLE spans, which
+  the atlas valid channel already encodes in G, so the fragment's
+  `G == 0` discard is the same gate. With the re-blit off `Screen`,
+  `AFF_ALL` mirrors the empty `Log` into `Screen` (`CopyScreen(Log,
+  Screen)`, the exterior contract), and the two 2D modals that shade
+  through `Screen` rebuild a plate on demand: `AffGrille_BuildScreenPlate`
+  from the inventory wheel and the behaviour modal, each gated on
+  `GpuRenderer_IsSceneInterior()`. And `BoxClean` / `DefaultBoxOneClean`
+  restores `Screen`→`Log` by default, which would paint that plate over
+  FBO bodies in the dirty regions — `AffScene` sets `BoxOneClean` to
+  `DefaultBoxOneClear` (clear to 0) under the same interior rule, back to
+  the default otherwise, so mid-dialog `BoxClean` callers inherit it. Both
+  rules are dead with the flag off.
 
 - **`GpuScene` and opaque world sprites.** With the flag on, the three
   world-sprite sites in `AffOneObject` (`../SOURCES/OBJECT.CPP` —
@@ -251,8 +295,107 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   stamp `GET_ZO(CameraZr - Z0)`). On success the clipped
   opaque footprint in Log is punched to palette index 0 so the present
   composite shows the FBO quad; interior still runs `DrawRecover3` for the
-  front-wall re-blit. HUD sites, `ScaleSpriteTransp` / `EXTRA_TRANSPARENT`
-  (blend table), and any `ScaleFactorSprite != 65536` stay software.
+  front-wall re-blit. Scaled raw draws — `ScaleFactorSprite != 65536`, which
+  is what `CalculeScaleFactorSprite` (`../SOURCES/EXTFUNC.CPP`) hands every
+  exterior raw world sprite and most opaque `TYPE_EXTRA` sprites — take
+  `GpuRenderer_DrawScaleSprite` instead of declining: `GpuBlend_Walk`
+  reproduces `ScaleSprite`'s 16.16 sampling and `Screen*` publication into a
+  scratch buffer (the walk is the software walk's line-for-line mirror,
+  host-tested byte for byte against `ScaleSpriteTransp` in
+  `tests/gpu_blend_walk`, which is ASM-anchored; `ScaleSprite` itself is
+  ASM-anchored by `tests/SVGA/test_scalespi`), the walked rect is
+  shelf-packed into the sprite page (R = walked source index, G = index != 0),
+  and the quad batches exactly like `DrawSprite`'s — same interior/exterior
+  depth rules — so terrain occlusion is the FBO `GEQUAL` test rather than a
+  `ZBufBoxOverWrite2` pass over the Log footprint, which is punched only
+  where the walk wrote a non-zero texel. HUD sites stay software; the
+  `EXTRA_TRANSPARENT` branch takes the GPU path below.
+
+- **`GpuScene` and blend sprites.** The `EXTRA_TRANSPARENT` branch of
+  `AffOneObject` (`../SOURCES/OBJECT.CPP`) tries `GpuRenderer_DrawBlendSprite`
+  first and falls back to software with `Log` untouched when it declines
+  (no backend, no walk, or a failed scene copy). `GpuBlend_Walk` — host-tested
+  byte-for-byte against the software walk (`tests/gpu_blend_walk`) —
+  reproduces the source indices `ScaleSpriteTransp` would read, and the pack
+  captures each rect texel's live `Log` index beside it. The backend uploads
+  a rect-sized source/Log page (GL: `GL_LUMINANCE_ALPHA`, with unpack
+  alignment forced to 1 so odd rect widths keep their rows; SDL3 GPU:
+  tightly packed `R8G8`), the 256×256 `PtrTransPal` table, and a rect copy of
+  the scene colour whose alpha byte is the destination palette index; only
+  after that copy succeeds is the rect's `Log` footprint punched to index 0
+  where the sprite writes, so the present shows the FBO result through the
+  same overlay hole `Common_PunchSpriteLog` opens for opaque sprites. The
+  mode-8 fragment (`clut.frag.glsl`) discards source index 0, lets the `Log`
+  byte win over the scene alpha where the software path reads `Log`, looks
+  the table up as row = source / column = destination, and writes the result
+  index into the colour's alpha so the next blend sprite composes on top of
+  it. Draws replace colour and alpha outright (`blend = 0`) with no
+  depth-test or depth-write: software composes into `Log` unconditionally,
+  and `DrawRecover3` never follows a blend sprite (the sentinel bounds leave
+  the clip window empty after the caller's `SetClip`). The GL clip scissor
+  floors its low edge and ceils its high edge when it maps an engine clip
+  window through `screenScale`: a truncated edge dropped the top device row
+  of any window whose mapped height landed off-integer, which is every blend
+  rect — the topmost row of every blend sprite went undrawn until the
+  rounding was fixed.
+
+- **`GpuScene` and flow particles.** With the flag on and a backend live,
+  `AffParticleFlow` (`../SOURCES/FLOW.CPP`) defers its exterior dots: each
+  projected dot collects its screen position and colour, and after the loop
+  the batch draws them one `GpuRenderer_DrawFlowDot` at a time. The depth
+  each dot faces is `ZBufBoxOverWrite2`'s row-constant test over the flow's
+  bounding box — `GetRecoverDepth` (the z0/z1 prelude `DrawRecover` already
+  had, now its own function in `../SOURCES/INTEXT.CPP`) expanded with the
+  software sweep's `Fill_ZBuffer_Factor`, `IncZ` across the published
+  `ScreenYMin..ScreenYMax` bounds and `>>16` — so every dot row carries its
+  own `zoTop`/`zoBot` and the dot is submitted as two row quads: a single
+  quad would interpolate depth diagonally where the software test is
+  constant per scanline row, and the two disagree at the box edge. Each dot
+  shelf-packs a 2×2 texel pair into the sprite page (R = palette index,
+  G = index != 0, so colour 0 still punches as a hole), batches as an
+  opaque sprite (exterior `GEQUAL` against terrain depth, no depth-write)
+  and punches the same 2×2 `Log` footprint `BoxFlow` would, so the present
+  shows the FBO dot through the overlay hole. The object's `DrawRecover`
+  box still runs — its `BoxMovingAdd` dirty-box contract does not depend on
+  the dots. A dot `BoxFlow`'s clip would have rejected is consumed at that
+  same test; an atlas shelf with no room falls back to software `BoxFlow`.
+  Interior cubes under the flag draw immediately (`GpuRenderer_DrawFlowDot`
+  with `zo` 0, which passes every `GEQUAL` test, same fallback), and with
+  the flag off the hook declines so the dot takes `BoxFlow` exactly as
+  before.
+
+- **`GpuScene` and HUD text.** With the flag on and a backend live, the
+  `AffScene` incrust loop's text sites (`INCRUST_NUM`, `INCRUST_TEXT`'s
+  shadow + colour, `INCRUST_SYS_TEXT`, `INCRUST_CMPT` in
+  `../SOURCES/OBJECT.CPP`) and `DrawBulle` (`../SOURCES/INCRUST.CPP`) try
+  `TryGpuIncrustText` first and fall back to `Font` when it returns 0;
+  `GpuRenderer_DrawHudText` (`../LIB386/COMMON/GPURENDERER_COMMON.CPP`)
+  mirrors `Font` / `AffMask` / `ClippingMask` — a cursor walk for ink
+  bounds and the `Screen*` publication a visible glyph leaves behind (a
+  fully outside glyph leaves the previous publication, spaces advance by
+  `InterSpace`), then each glyph's RLE decoded into one shelf-reserved
+  sprite page (R = `ColMask`, G = 1 on written texels; the slot is zeroed
+  first so a stale texel can never punch) and batched as an opaque sprite
+  at `ZO` 0: exterior `GEQUAL` passes at the nearest depth with no
+  depth-write, interior takes no test, so terrain and room never
+  Z-occlude a HUD glyph. Only G = 1 texels inside clip ∩ bounds punch the
+  `Log`, so the present shows the FBO glyph through the same hole
+  software left. It returns 1 when consumed — spaces-only and fully
+  clipped strings count, where `Font` would have drawn nothing — and 0
+  otherwise (an atlas shelf with no room is one such 0), which is the
+  fallback signal. The `INCRUST_SPRITE` `PtrAffGraph` site and `DrawBulle`
+  take `TryGpuIncrustSprite` the same way: `sprite >= 100` reads the
+  goodies bank (`HQRPtrSprite`, AffGraph RLE) and anything else the raw
+  bank, exactly as `PtrAffGraph` splits them, with
+  `ScaleFactorSprite != DEF_SCALE_FACTOR` routing through
+  `GpuRenderer_DrawScaleSprite`. Both helpers decline with the flag off,
+  with no backend live, or while a modal overlay rect is pinned
+  (`GpuRenderer_IsOverlayOpaque` mirrors the present shader's
+  `uOpaqueRect` test — the index-0-as-opaque-black rule inside the pinned
+  rect would surface the punch as black instead of the glyph). Text that
+  never passes through the incrust loop — the game menu's rows, the
+  dialogue, the pause menu, the inventory and behaviour plates — stays in
+  the Log.
 
 Init (`GpuRenderer_Init` after `InitGraphics` in `../SOURCES/INITADEL.C`,
 through `Renderer_InitBootBackend` in `../SOURCES/RENDER_SWITCH.CPP`) and
@@ -320,10 +463,15 @@ only overlay mapping is `palette index 0 = opaque black`:
   over walls; heavier occlusion still writes depth, and coplanar NZW polys
   cannot fight one another because the batch never writes depth.
 - **Opaque overlay regions.** A modal UI that paints index-0 black (the
-  inventory slots) pins its rectangle with `GpuRenderer_SetOverlayOpaqueRect`
-  (`../SOURCES/INVENT.CPP`, set at `MenuInventory` entry and cleared at exit);
-  inside it the composite maps index 0 to opaque black, outside it the frozen
-  3D scene still shows through the overlay's holes.
+  inventory slots; the behaviour modal's cadre strokes and empty life/magic
+  bars) pins its rectangle with `GpuRenderer_SetOverlayOpaqueRect`
+  (`../SOURCES/INVENT.CPP` at `MenuInventory` entry, `../SOURCES/COMPORTE.CPP`
+  at `MenuComportement` entry; each clears at exit); inside it the present
+  shader maps index 0 to opaque black (`indexedTexel` in
+  `present.frag.glsl`), outside it the frozen 3D scene still shows through the
+  overlay's holes. The inventory wheel and name box, and the behaviour box plus
+  its info bar, are inside those rects; the plate above keeps the shaded
+  content non-zero so the shade maps real scene indices through the CLUT.
 
 Remaining work, in order:
 

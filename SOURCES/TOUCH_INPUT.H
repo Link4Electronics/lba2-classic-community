@@ -58,6 +58,11 @@ S32 TouchOverlay_HandleEvent(const void *sdlEvent);
 void TouchOverlay_Render(U32 *frameBuffer, U32 pitch, U32 width, U32 height,
                          const U8 *palette_rgb);
 
+/* TRUE when TouchOverlay_Render will draw into the ARGB buffer this frame
+ * (overlay level not OVL_OFF). FALSE on desktop / with no active level, so
+ * PresentFrame can take the R8 path without a CPU conversion. */
+S32 TouchOverlay_PrePresentNeedsArgb(void);
+
 /* Whether this device gets an overlay at all: false off Android and on a
  * leanback (TV) device. Settled once by TouchOverlay_Init. Distinct from
  * whether anything is drawn this frame, which the policy above decides. */

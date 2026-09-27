@@ -1,5 +1,9 @@
 #include "C_EXTERN.H"
 
+#include <GL/RENDER_GL.H> /* GpuScene: the HUD quad gates below */
+#include <GPU/GPURENDERER.H>
+#include <SYSTEM/HQFILE.H> /* HQR_Get: sprite banks behind TryGpuIncrustSprite */
+
 /*══════════════════════════════════════════════════════════════════════════*
      █    ██▄ █ █▀▀▀▀ █▀▀▀█ █   █ ██▀▀▀ ▀▀█▀▀       █▀▀▀▄  █    ██▀▀▀ █▀▀▀█
      ██   ██▀██ ██    ██▀█▀ ██  █ ▀▀▀▀█   ██        ██  █  ██   ▀▀▀▀█ ██▀▀▀
@@ -120,6 +124,45 @@ void ClearIncrusts(S32 type) {
 
 /*──────────────────────────────────────────────────────────────────────────*/
 
+// GpuScene HUD hooks (phase 3). A HUD overlay draws over the finished scene
+// whatever the terrain depth says, so the quad carries ZO 0: exterior
+// GEQUAL passes at the nearest depth and the sprite batch never writes
+// depth; interior takes no test. Both hooks decline under a pinned modal
+// overlay rect (present would surface the Log punch as black), for the flag
+// being off, or with no backend — the caller then stays on Font /
+// PtrAffGraph unchanged.
+S32 TryGpuIncrustText(S32 x, S32 y, const char *str) {
+    if (!GpuScene || !GpuRenderer_IsActive()) {
+        return 0;
+    }
+    return GpuRenderer_DrawHudText(x, y, str);
+}
+
+S32 TryGpuIncrustSprite(S32 xp, S32 yp, S32 sprite) {
+    const void *bank;
+    S32 rawFormat;
+
+    if (!GpuScene || !GpuRenderer_IsActive() ||
+        GpuRenderer_IsOverlayOpaque()) {
+        return 0;
+    }
+    if (sprite >= 100) { /* PtrAffGraph: goodies bank, AffGraph RLE */
+        bank = HQR_Get(HQRPtrSprite, sprite);
+        rawFormat = 0;
+    } else {
+        bank = HQR_Get(HQRPtrSpriteRaw, sprite);
+        rawFormat = 1;
+    }
+    if (bank == NULL) {
+        return 0;
+    }
+    if (rawFormat && ScaleFactorSprite != DEF_SCALE_FACTOR) {
+        return GpuRenderer_DrawScaleSprite(xp, yp, ScaleFactorSprite,
+                                           ScaleFactorSprite, 0, bank);
+    }
+    return GpuRenderer_DrawSprite(0, xp, yp, 0, bank, rawFormat);
+}
+
 S32 LastNumBulle = -1;
 S32 SpriteBulle = SPRITE_BULLE_RIGHT;
 
@@ -142,7 +185,9 @@ void DrawBulle(S32 numobj) {
 
     SpriteY = Yp - 20;
 
-    PtrAffGraph(SpriteX, SpriteY, SpriteBulle);
+    if (!TryGpuIncrustSprite(SpriteX, SpriteY, SpriteBulle)) {
+        PtrAffGraph(SpriteX, SpriteY, SpriteBulle);
+    }
     SetClip(ScreenXMin, ScreenYMin, ScreenXMax, ScreenYMax);
 
     if (ClipXMin <= ClipXMax

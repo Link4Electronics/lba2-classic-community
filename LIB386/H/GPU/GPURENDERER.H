@@ -23,8 +23,8 @@ extern "C" {
 
 //──────────────────────────────────────────────────────────────────────────
 typedef enum GpuRendererBackendId {
-    GPU_RENDERER_BACKEND_NONE = 0,  ///< Software rasterizer (always available)
-    GPU_RENDERER_BACKEND_OPENGL = 1, ///< OpenGL / GLES 2.0 (LIB386/GL)
+    GPU_RENDERER_BACKEND_NONE = 0,    ///< Software rasterizer (always available)
+    GPU_RENDERER_BACKEND_OPENGL = 1,  ///< OpenGL / GLES 2.0 (LIB386/GL)
     GPU_RENDERER_BACKEND_SDL3GPU = 2, ///< SDL3 GPU (LIB386/SDL3GPU)
     GPU_RENDERER_BACKEND_COUNT
 } GpuRendererBackendId;
@@ -34,12 +34,12 @@ typedef enum GpuRendererBackendId {
 // returns TRUE when the backend is live; the engine decides to keep using
 // the software path when it fails. Shutdown tears the renderer down, leaving
 // the window (and software path) intact.
-S32  GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY);
+S32 GpuRenderer_Init(GpuRendererBackendId backend, U32 resX, U32 resY);
 void GpuRenderer_Shutdown(void);
 void GpuRenderer_Resize(U32 resX, U32 resY);
 
 // Runtime state queries.
-S32  GpuRenderer_IsActive(void);
+S32 GpuRenderer_IsActive(void);
 GpuRendererBackendId GpuRenderer_ActiveBackend(void);
 const char *GpuRenderer_BackendName(GpuRendererBackendId id);
 
@@ -64,12 +64,23 @@ void GpuRenderer_SetSceneInterior(S32 interior);
 // transparent overlay under this rule (BoxClean clears rather than restores
 // Screen) and rebuild the Screen re-blit plate AffGraph/CopyMask expect on
 // AFF_ALL frames. Always false with the flag off or no backend.
-S32  GpuRenderer_IsSceneInterior(void);
+S32 GpuRenderer_IsSceneInterior(void);
+// Force subsequent Fill_Poly calls onto the software rasterizer while the
+// backend stays active. Used for one-shot Screen-plate passes that must leave
+// palette indices in Log (the inventory shade maps those indices through the
+// CLUT; FBO colour cannot be mapped back). Save/restore around a plate pass;
+// nested set is not supported. Resets on Init/Shutdown.
+void GpuRenderer_SetSoftwarePolys(S32 enabled);
+S32 GpuRenderer_GetSoftwarePolys(void);
 void GpuRenderer_FlushBatch(void);
-void GpuRenderer_Present(const void *argbPixels, U32 pitch, U32 width,
-                         U32 height, S32 filterLinear);
-S32  GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
-                                    S32 nbPoints, Struc_Point *ptrPoints);
+// Present the 2D overlay over the offscreen target and swap. pixels is either
+// 0xAARRGGBB staging (indexed FALSE — console/touch may have drawn into it)
+// or Log's raw palette indices (indexed TRUE, pitch = width): the R8 path
+// skips the CPU Log→ARGB conversion and resolves colour in the present shader.
+void GpuRenderer_Present(const void *pixels, U32 pitch, U32 width,
+                         U32 height, S32 filterLinear, S32 indexed);
+S32 GpuRenderer_RenderTriangleList(S32 typePoly, S32 colorPoly,
+                                   S32 nbPoints, Struc_Point *ptrPoints);
 void GpuRenderer_SetRenderQuality(U32 quality);
 
 // Depth readback. Called after the exterior terrain pass so the object pass's
@@ -131,23 +142,95 @@ void GpuRenderer_ShadowEnd(void);
 // (GpuRenderer_IsoWorldZO) stamped on all six vertices; it is written even
 // when the interior mark is off, so the vertex layout stays constant.
 void GpuRenderer_SetBrickBank(const void *bank);
-S32  GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo);
+S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo);
+
+// Front-wall re-blit (DrawOverBrick*, GpuScene interiors): the very same
+// brick quad the room pass drew, submitted again after the body so it paints
+// over it, which is CopyMask's job without the Screen plate. The mask bank
+// is redundant here — CalcGraphMsk derives it from the same RLE spans the
+// atlas valid channel (G) encodes, so the fragment's G == 0 discard is
+// already CopyMask's gate. Only consumes under the interior mark (the caller
+// keeps CopyMask otherwise, and always when the flag is off); returns TRUE
+// when consumed. Unlike DrawBrick it never publishes ScreenXMin/Max — the
+// caller has just drawn a sprite and reads its rect back.
+S32 GpuRenderer_DrawBrickOver(S32 brickIdx, S32 x, S32 y, U16 zo);
 
 // Opaque world sprites (GpuScene phase 3). DrawSprite packs one sprite from
 // bank into the sprite RG8 atlas (R = palette index, G = valid; transparent
 // pixels and AffGraph RLE skips leave G = 0 so the shader discards) and
 // submits a screen-space quad. rawFormat 0 is the AffGraph/SPRITES.HQR RLE
-// layout; 1 is the ScaleSprite/SPRIRAW.HQR raw-pixel layout (1:1 only —
-// callers with factor != 65536 stay on the software blitter). zo is stamped
-// on all six vertices and only exterior depth-tests it (GET_ZO of the
-// camera-relative clip-Z); interior takes no depth-test — AffGraph never
+// layout; 1 is the ScaleSprite/SPRIRAW.HQR raw-pixel layout at 1:1 — scaled
+// raw blits (factor != 65536) go through DrawScaleSprite instead. zo is
+// stamped on all six vertices and only exterior depth-tests it (GET_ZO of
+// the camera-relative clip-Z); interior takes no depth-test — AffGraph never
 // Z-tests and DrawRecover3 owns front-wall occlusion. Returns TRUE when
 // consumed — FALSE leaves the caller on the software AffGraph / ScaleSprite
 // path (flag off, no backend, pack failure, out-of-range index). On success
 // the clipped sprite rect in Log is punched to palette index 0 so the
 // present composite shows the FBO quad through the overlay hole.
-S32  GpuRenderer_DrawSprite(S32 spriteIdx, S32 x, S32 y, U16 zo,
-                            const void *bank, S32 rawFormat);
+S32 GpuRenderer_DrawSprite(S32 spriteIdx, S32 x, S32 y, U16 zo,
+                           const void *bank, S32 rawFormat);
+
+// Scaled opaque world sprites (GpuScene phase 3): ScaleSprite's 16.16 blit
+// with the quad depth-test. GpuBlend_Walk reproduces ScaleSprite's sampling
+// and Screen* publication byte for byte (it mirrors the software walk line
+// for line); the walked rect is packed into the sprite atlas (R = walked
+// source index, G = index != 0), the clipped footprint in Log is punched
+// where the walk wrote a non-zero texel — same hole Common_PunchSpriteLog
+// opens — and a screen-space quad batches like DrawSprite's, so the depth
+// rules are the batch's: exterior GEQUAL against terrain, interior none.
+// factorx/factory are 16.16. Returns TRUE when consumed (Screen* published
+// either way, sentinels included) — FALSE leaves the caller on the software
+// ScaleSprite (flag off, no backend, allocation failure).
+S32 GpuRenderer_DrawScaleSprite(S32 x, S32 y, S32 factorx, S32 factory,
+                                U16 zo, const void *bank);
+
+// Flow particles (GpuScene phase 3): one DOT_DISPLAY dot's 2x2 BoxFlow block
+// as sprite-page quads. The dot's palette index packs as R with G = colour
+// != 0, so a colour-0 dot discards in the mode-7 fragment and the FBO keeps
+// what was behind it — BoxFlow's colour-0 write is a hole too. Each of the
+// two rows is its own uniform-ZO quad: ZBufBoxOverWrite2 tests depth
+// row-constant across the flow's bounding box, while the fragment shader
+// interpolates depth across a quad, so a single quad cannot reproduce the
+// software test. zoTop/zoBot are that interpolated z at the dot's two rows
+// (GetRecoverDepth's z0/z1 through the ZBufBoxOverWrite2 IncZ math); the
+// caller passes 0/0 where no depth-test runs (interior). BoxFlow publishes
+// no Screen* (AffParticleFlow does that itself), so neither does this.
+// Returns TRUE when consumed — including the fully-outside clip BoxFlow
+// skips too — FALSE leaves the caller on BoxFlow (flag off, no backend, page
+// exhausted). On success the clipped 2x2 Log footprint is punched to palette
+// index 0 unconditionally: BoxFlow wrote all four texels even at colour 0.
+S32 GpuRenderer_DrawFlowDot(S32 x, S32 y, U8 coul, U16 zoTop, U16 zoBot);
+
+// Blend sprites (GpuScene phase 3): ScaleSpriteTransp's transpTable compose
+// on the GPU. GpuBlend_Walk (GPUBLEND_WALK.H) reproduces the software
+// walk's sampling and Screen* publication; the backend uploads the walk's
+// source indices beside the live Log index, copies the scene colour rect
+// (alpha byte = destination palette index) and draws a quad whose shader
+// performs the table lookup per texel — chained sprites see the previous
+// result as their destination, as composing into Log would. factorx/factory
+// are 16.16; unlike DrawSprite the scaled walk is supported. The sprite
+// footprint in Log is punched to palette index 0 so the present shows the
+// FBO result through the overlay hole. Returns TRUE when consumed (Screen*
+// published either way, sentinels included) — FALSE leaves the caller on
+// ScaleSpriteTransp (flag off, no backend, no bank or table).
+S32 GpuRenderer_DrawBlendSprite(S32 x, S32 y, S32 factorx, S32 factory,
+                                const void *bank, const void *transPal);
+
+// HUD/incrust text (GpuScene phase 3): one Font() glyph run as a single
+// sprite-page quad. The string packs as R = ColMask with G = 1 exactly on
+// the pixels AffMask would write — the cursor walk, glyph RLE, clip and
+// Screen* publication mirror Font / AffMask / ClippingMask — the clipped
+// footprint in Log is punched where G = 1, and the quad batches like
+// DrawSprite's with ZO 0: exterior GEQUAL passes at the nearest depth and
+// the sprite batch never depth-writes, interior takes no test, so a HUD
+// overlay is never Z-occluded (Font draws over the finished scene). Two
+// Font calls (shadow then colour) interleave like the software run because
+// each call packs and submits in order. Returns TRUE when consumed — FALSE
+// leaves the caller on software Font: flag off, no backend, no font, a
+// pinned modal overlay rect (the present's index-0-as-opaque-black rule
+// inside it would surface the punch as black), or page exhausted.
+S32 GpuRenderer_DrawHudText(S32 x, S32 y, const char *str);
 
 // Interior iso view depth. Map2Screen's ground axis is (x+z): larger is
 // nearer on screen, so invert into aZ (smaller is nearer under GEQUAL with
@@ -198,6 +281,11 @@ void GpuRenderer_SetVSync(S32 enabled);
 // the frozen 3D scene still shows through. Pin (0,0,0,0) to restore the
 // transparent rule when the modal exits.
 void GpuRenderer_SetOverlayOpaqueRect(S32 x0, S32 y0, S32 x1, S32 y1);
+
+// TRUE while a modal rect is pinned (present treats Log's index 0 as opaque
+// black inside it). Hooks that punch Log to expose an FBO quad ask this
+// first: the punch would surface as black inside the pinned frame.
+S32 GpuRenderer_IsOverlayOpaque(void);
 
 #ifdef __cplusplus
 }

@@ -67,6 +67,24 @@ void PtrInit3DGame() {
 		   ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀▀ ▀▀▀▀▀   ▀▀  ▀▀▀▀▀
  *══════════════════════════════════════════════════════════════════════════*/
 
+// Exterior recover depth for a ZV: rotate the feet point, then the head
+// point, applying the same half-extent margin to both. DrawRecover feeds
+// the result to ZBufBoxOverWrite2, and AffParticleFlow's GPU flow dots
+// stamp the same interpolated rows so the two occlusion tests agree.
+void GetRecoverDepth(S32 xw, S32 yw, S32 zw, S32 ymax, S32 zvmax,
+                     S32 *z0, S32 *z1) {
+    LongWorldRotatePoint(xw, yw, zw);
+
+    //		z0 = CameraZr-Z0-256 ;	// calculer par rapport à la zv
+    *z0 = CameraZr - Z0 - zvmax; // calculer par rapport à la zv
+
+    LongWorldRotatePoint(xw, yw + ymax, zw);
+
+    // ~ max [ (xmax-xmin)/2, (zmax-zmin)/2 ]
+    //		z1 = CameraZr-Z0-256 ;	// calculer par rapport à la zv
+    *z1 = CameraZr - Z0 - zvmax; // calculer par rapport à la zv
+}
+
 // Routine de recouvrement: trouver le moyen de passer les mêmes paramètres
 // en extérieur et en intérieur pour optimiser avec un pointeur de fonction
 S32 DrawRecover(S32 xw, S32 yw, S32 zw, S32 ymax, S32 zvmax) {
@@ -83,16 +101,7 @@ S32 DrawRecover(S32 xw, S32 yw, S32 zw, S32 ymax, S32 zvmax) {
     } else {
         S32 z0, z1;
 
-        LongWorldRotatePoint(xw, yw, zw);
-
-        //		z0 = CameraZr-Z0-256 ;	// calculer par rapport à la zv
-        z0 = CameraZr - Z0 - zvmax; // calculer par rapport à la zv
-
-        LongWorldRotatePoint(xw, yw + ymax, zw);
-
-        // ~ max [ (xmax-xmin)/2, (zmax-zmin)/2 ]
-        //		z1 = CameraZr-Z0-256 ;	// calculer par rapport à la zv
-        z1 = CameraZr - Z0 - zvmax; // calculer par rapport à la zv
+        GetRecoverDepth(xw, yw, zw, ymax, zvmax, &z0, &z1);
 
         flagbox = ZBufBoxOverWrite2(z0, z1, ClipXMin, ClipYMin, ClipXMax, ClipYMax);
 

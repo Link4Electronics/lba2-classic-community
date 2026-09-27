@@ -33,6 +33,13 @@ extern Func_InitGrille InitGrilleExt;
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 extern void AffGrilleExt(void);
 
+// Rebuild Screen as the exterior software plate under a GPU backend (the
+// terrain lives only in the FBO, so OpenInventory's CopyScreen(Screen, Log)
+// would otherwise shade zeros). Forces the software fillers for one
+// AffGrilleExt pass, then clears Log for the overlay present. Call only when
+// GpuRenderer_IsActive() && CubeMode == CUBE_EXTERIEUR.
+extern void AffGrilleExt_BuildScreenPlate(void);
+
 /*──────────────────────────────────────────────────────────────────────────*/
 // Graph
 /*--------------------------------------------------------------------------*/

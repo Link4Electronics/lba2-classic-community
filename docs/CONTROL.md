@@ -538,7 +538,7 @@ whole savegame baseline corpus) are byte-identical to the merged behaviour. See
 
 ## UI capture
 
-Six console verbs drive each modal UI surface from the harness, render a settled frame,
+Seven console verbs drive each modal UI surface from the harness, render a settled frame,
 write a PNG via `SavePNG`, then exit cleanly. The world-space `--dump-state` is the
 guardrail for *simulation* state; these are the guardrail for *UI* rendering — what
 widescreen, font, palette, or layout changes are most likely to disturb.
@@ -546,6 +546,7 @@ widescreen, font, palette, or layout changes are most likely to disturb.
 | Verb | Captures |
 |---|---|
 | `ui inventory <path>` | The inventory wheel + items + scene background |
+| `ui comportement <path>` | The behaviour (CTRL) wheel + info bar + scene background |
 | `ui holomap <path>` | The rotating planet globe + island name strip |
 | `ui dialog <text-id> <path>` | The dialogue bubble + portrait + typewriter text for that text-id |
 | `ui menu-options <path>` | The in-game ESC menu (Volume / Language / Advanced / Controls) over the shaded scene |
@@ -991,9 +992,9 @@ Done (independent of the above): `--polyrec <path>` triggers the existing polygo
 recording (`tests/SNAPSHOT/`, previously a manual Alt+F9) at a scripted `--load X --tick N`
 state, making ASM↔CPP captures reproducible. Requires an `ENABLE_POLY_RECORDING` build.
 
-Done (UI side of the regression net): six `ui <surface>` console verbs (see "UI capture"
-above) cover every modal UI surface — inventory wheel, planet globe, dialogue bubble,
-options menu, main menu, found-object cinematic — with byte-identical PNG goldens
-committed under `tests/savegame/corpus/baselines/ui/`. Pairs with (1)'s world-space
+Done (UI side of the regression net): seven `ui <surface>` console verbs (see "UI capture"
+above) cover every modal UI surface — inventory wheel, behaviour wheel, planet globe,
+dialogue bubble, options menu, main menu, found-object cinematic — with byte-identical
+PNG goldens committed under `tests/savegame/corpus/baselines/ui/`. Pairs with (1)'s world-space
 guardrail: that one catches simulation perturbations from rendering changes; this one
 catches UI rendering changes directly. Most useful for the widescreen work.

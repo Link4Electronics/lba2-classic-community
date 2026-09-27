@@ -16,6 +16,8 @@
 #include <SYSTEM/WINDOW.H>
 #include <GPU/GPURENDERER_BACKEND.H>
 
+#include <stdio.h>
+
 /* ── Renderer state shared with the engine (C linkage) ─────────────────────
    Owned by the GL renderer even in software builds (gly is always built, as
    stubs when GPURENDERER is off) so every consumer links against one
@@ -45,6 +47,7 @@ S32 AtlasTextureDirty = 0;
 #endif
 
 #include <SDL3/SDL.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -78,12 +81,58 @@ static const char *s_vertSrc =
     "    vTexCoord = aTexCoord;\n"
     "}\n";
 
+/* Present composite: samples the FBO colour (ARGB path) or the Log overlay
+   (either format) and, on the R8 path, resolves colour through the palette
+   LUT. uIndexed/uLinear/uOpaqueRect/uSize mirror present.frag.glsl so both
+   backends implement the same modal-rect and bilinear rules. */
 static const char *s_fragSrc =
     GLSL_FRAG_HEADER
     "uniform sampler2D uTex;\n"
+    "uniform sampler2D uPalette;\n"
+    "uniform int uIndexed;\n"
+    "uniform int uLinear;\n"
+    "uniform vec4 uOpaqueRect;\n" /* x0, y0, x1, y1 — x1<=x0 inactive */
+    "uniform vec2 uSize;\n"
     "varying vec2 vTexCoord;\n"
+    "vec4 paletteLookup(float idx) {\n"
+    "    return texture2D(uPalette, vec2((idx + 0.5) / 256.0, 0.5));\n"
+    "}\n"
+    /* One texel of the R8 index page, resolved through the LUT, then the
+       modal full-2D UI rule (patch-then-filter: each source texel is fixed
+       up before the four-tap mix, matching a CPU patch of ARGB staging
+       before hardware bilinear). */
+    "vec4 indexedTexel(vec2 p) {\n"
+    "    p = clamp(p, vec2(0.0), uSize - 1.0);\n"
+    "    float idx = texture2D(uTex, (p + 0.5) / uSize).r * 255.0;\n"
+    "    vec4 color = paletteLookup(idx);\n"
+    "    if (uOpaqueRect.z > uOpaqueRect.x && uOpaqueRect.w > uOpaqueRect.y &&\n"
+    "        p.x >= uOpaqueRect.x && p.x < uOpaqueRect.z &&\n"
+    "        p.y >= uOpaqueRect.y && p.y < uOpaqueRect.w && color.a == 0.0)\n"
+    "        return vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "    return color;\n"
+    "}\n"
     "void main() {\n"
-    "    gl_FragColor = texture2D(uTex, vTexCoord);\n"
+    "    vec4 color;\n"
+    "    if (uIndexed == 0) {\n"
+    "        color = texture2D(uTex, vTexCoord);\n"
+    "        vec2 pixel = vTexCoord * uSize;\n"
+    "        if (uOpaqueRect.z > uOpaqueRect.x && uOpaqueRect.w > uOpaqueRect.y &&\n"
+    "            pixel.x >= uOpaqueRect.x && pixel.x < uOpaqueRect.z &&\n"
+    "            pixel.y >= uOpaqueRect.y && pixel.y < uOpaqueRect.w && color.a == 0.0)\n"
+    "            color = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "    } else if (uLinear != 0) {\n"
+    "        vec2 texel = vTexCoord * uSize - 0.5;\n"
+    "        vec2 base = floor(texel);\n"
+    "        vec2 f = texel - base;\n"
+    "        vec4 c00 = indexedTexel(base);\n"
+    "        vec4 c10 = indexedTexel(base + vec2(1.0, 0.0));\n"
+    "        vec4 c01 = indexedTexel(base + vec2(0.0, 1.0));\n"
+    "        vec4 c11 = indexedTexel(base + vec2(1.0, 1.0));\n"
+    "        color = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);\n"
+    "    } else {\n"
+    "        color = indexedTexel(floor(vTexCoord * uSize));\n"
+    "    }\n"
+    "    gl_FragColor = color;\n"
     "}\n";
 
 /* ── CLUT shader (3D Gouraud-textured polygons) ─────────────────────────── */
@@ -134,19 +183,26 @@ static const char *s_clutVertSrc =
 
 static const char *s_clutFragSrc =
     GLSL_FRAG_HEADER
-    "uniform sampler2D uAtlas;\n"   /* 256×256 LUMINANCE */
-    "uniform sampler2D uCLUT;\n"    /* 256×256 LUMINANCE (fog table) */
-    "uniform sampler2D uPalette;\n" /* 256×1 BGRA (paletteLUT) */
-    "uniform int uPolyMode;\n"      /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow */
-    "uniform float uFlatColor;\n"   /* palette index (mode 1) / CLUT column (mode 3) */
-    "uniform float uCLUTBaseRow;\n" /* CLUT row offset for gouraud table (mode 3) */
-    "uniform float uScaledFogNear;\n" /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
-    "uniform float uFogRowScale;\n"   /* Fill_Fog_Factor / 65536 (fog-smooth distance, mode 5) */
-    "uniform int uAlphaMode;\n"     /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
-    "uniform int uBilinear;\n"      /* 0=nearest 1=bilinear CLUT sampling */
-    "uniform int uChromaKey;\n"     /* 0=no chroma key 1=discard index 0 */
-    "uniform int uPerspCorrect;\n"  /* 1=perspective-correct UV/Z (types 16-24) */
-    "uniform vec2 uBrickSize;\n"    /* brick atlas page size (mode 7) */
+    "uniform sampler2D uAtlas;\n"       /* 256×256 LUMINANCE */
+    "uniform sampler2D uCLUT;\n"        /* 256×256 LUMINANCE (fog table) */
+    "uniform sampler2D uPalette;\n"     /* 256×1 BGRA (scene palette, alpha = index) */
+    "uniform sampler2D uBlendSrcLog;\n" /* LUMINANCE_ALPHA: .r = walked source index, .a = Log index */
+    "uniform sampler2D uBlendDst;\n"    /* per-sprite FBO rect copy, A = destination index */
+    "uniform sampler2D uTransPal;\n"    /* 256×256 LUMINANCE blend table: row = source, column = destination */
+    "uniform int uPolyMode;\n"          /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow 7=brickQuad 8=blendSprite */
+    "uniform float uFlatColor;\n"       /* palette index (mode 1) / CLUT column (mode 3) */
+    "uniform float uCLUTBaseRow;\n"     /* CLUT row offset for gouraud table (mode 3) */
+    "uniform float uScaledFogNear;\n"   /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
+    "uniform float uFogRowScale;\n"     /* Fill_Fog_Factor / 65536 (fog-smooth distance, mode 5) */
+    "uniform int uAlphaMode;\n"         /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
+    "uniform int uBilinear;\n"          /* 0=nearest 1=bilinear CLUT sampling */
+    "uniform int uChromaKey;\n"         /* 0=no chroma key 1=discard index 0 */
+    "uniform int uPerspCorrect;\n"      /* 1=perspective-correct UV/Z (types 16-24) */
+    "uniform vec2 uBrickSize;\n"        /* brick atlas page size (mode 7) */
+    "uniform float uBlendLogW;\n"       /* blend page width in pixels (mode 8) */
+    "uniform float uBlendLogH;\n"       /* blend page height in pixels (mode 8) */
+    "uniform float uBlendDstW;\n"       /* dst rect width in pixels (mode 8) */
+    "uniform float uBlendDstH;\n"       /* dst rect height in pixels (mode 8) */
     "varying vec2 vTexCoord;\n"
     "varying vec2 vTexCoordOverW;\n"
     "varying float vInvW;\n"
@@ -206,15 +262,15 @@ static const char *s_clutFragSrc =
        (SW POLYTEXT/POLYGTEX) interpolate affinely. */
     "    vec2 tc = mix(vTexCoord, vTexCoordOverW / vInvW, float(uPerspCorrect));\n"
     "    float vZsel = mix(vZ, vZOverW / vInvW, float(uPerspCorrect));\n"
-     "    if (uPolyMode == 0) {\n"
-     /* Textured: atlas → CLUT → palette */
-     "        tc = tc / 256.0;\n"
-     "        float widthMask = mod(vRepMask, 256.0);\n"
-     "        float heightMask = floor(vRepMask / 256.0);\n"
-     /* SW init: Fill_CurGouraudMin = (Pt_Light << 8) + 0x8000.
+    "    if (uPolyMode == 0) {\n"
+    /* Textured: atlas → CLUT → palette */
+    "        tc = tc / 256.0;\n"
+    "        float widthMask = mod(vRepMask, 256.0);\n"
+    "        float heightMask = floor(vRepMask / 256.0);\n"
+    /* SW init: Fill_CurGouraudMin = (Pt_Light << 8) + 0x8000.
         The +128 (0x80) rounding bias shifts the CLUT row by 1 in some
         cases — same bias applied in polyMode 2. */
-     "        float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;\n"
+    "        float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;\n"
     "        if (uBilinear != 0) {\n"
     "            color = bilinearCLUT(tc, widthMask, heightMask, gouraudRow);\n"
     "        } else {\n"
@@ -275,8 +331,8 @@ static const char *s_clutFragSrc =
        fogRow/256 = ((fogDist * Fill_Fog_Factor) >> 16) & 0xF0.
        uFogRowScale = Fill_Fog_Factor / 65536, so
         floor(zDist * uFogRowScale) = (fogDist * Fill_Fog_Factor) >> 16. */
-     "        tc = tc / 256.0;\n"
-     "        float widthMask = mod(vRepMask, 256.0);\n"
+    "        tc = tc / 256.0;\n"
+    "        float widthMask = mod(vRepMask, 256.0);\n"
     "        float heightMask = floor(vRepMask / 256.0);\n"
     "        float wrappedU = mod(tc.x, widthMask + 1.0);\n"
     "        float wrappedV = mod(tc.y, heightMask + 1.0);\n"
@@ -285,7 +341,7 @@ static const char *s_clutFragSrc =
     "        float texel = texture2D(uAtlas, atlasUV).r * 255.0;\n"
     /* Chroma key: type 24 is non-INCRUST (bit 2 clear), so index 0 is
        written unconditionally — no discard here. */
-     "        float fogDist = max(vZsel - uScaledFogNear, 0.0);\n"
+    "        float fogDist = max(vZsel - uScaledFogNear, 0.0);\n"
     "        float fogRow16 = floor(fogDist * uFogRowScale);\n"
     "        float clutRow = 12.0 + floor(mod(fogRow16, 256.0) / 16.0) * 16.0;\n"
     "        color = clutLookup(texel, clutRow);\n"
@@ -304,6 +360,32 @@ static const char *s_clutFragSrc =
     "        vec2 t = texture2D(uAtlas, uv).ra;\n"
     "        if (t.y < (0.5 / 255.0)) discard;\n"
     "        color = texture2D(uPalette, vec2((t.x * 255.0 + 0.5) / 256.0, 0.5));\n"
+    "    } else if (uPolyMode == 8) {\n"
+    /* Blend sprite (EXTRA_TRANSPARENT): integer ScaleSpriteTransp
+       equivalent. vTexCoord is the local rect pixel coordinate; the CPU
+       walk put the sampled source index (.r) and the live Log index (.a)
+       in uBlendSrcLog, the scene's pre-draw destination index sits in
+       uBlendDst.a (Log wins where the software path read Log), and
+       uTransPal is the 64 KB transpTable (row = source, column =
+       destination). Palette index 0 is skipped by the software walk —
+       discard reproduces that. The result color's alpha carries the
+       result index so a chained blend sprite sees it as destination. */
+    "        vec2 px = floor(vTexCoord);\n"
+    "        vec2 sl = texture2D(uBlendSrcLog,\n"
+    "                            (px + 0.5) / vec2(uBlendLogW, uBlendLogH)).ra;\n"
+    "        float srcIdx = floor(sl.x * 255.0 + 0.5);\n"
+    "        if (srcIdx < 0.5) discard;\n"
+    "        float logIdx = floor(sl.y * 255.0 + 0.5);\n"
+    "        float dstIdx = floor(texture2D(uBlendDst,\n"
+    "                                       (px + 0.5) / vec2(uBlendDstW, uBlendDstH))\n"
+    "                              .a * 255.0 + 0.5);\n"
+    "        if (logIdx >= 0.5) dstIdx = logIdx;\n"
+    "        float result = floor(texture2D(uTransPal,\n"
+    "                                       vec2((dstIdx + 0.5) / 256.0,\n"
+    "                                            (srcIdx + 0.5) / 256.0))\n"
+    "                                 .r * 255.0 + 0.5);\n"
+    "        color = texture2D(uPalette, vec2((result + 0.5) / 256.0, 0.5));\n"
+    "        color.a = result / 255.0;\n"
     "    } else {\n"
     /* Gouraud table (types 6/7): CLUT lookup, color = column.
        Same +128 rounding bias as polyMode 0. */
@@ -329,12 +411,19 @@ static const char *s_clutFragSrc =
 
 static GLuint s_program = 0;
 static GLuint s_vbo = 0;
-static GLuint s_fboVbo = 0; /* non-flipped UV quad for FBO→screen draw */
-static GLuint s_overlayTex = 0; /* present texture (Log buffer ARGB) */
+static GLuint s_fboVbo = 0;         /* non-flipped UV quad for FBO→screen draw */
+static GLuint s_overlayTex = 0;     /* present texture (Log: ARGB or R8 indices) */
+static S32 s_overlayIndexed = 0;    /* format of s_overlayTex (recreate on switch) */
+static S32 s_overlayFullUpload = 0; /* fresh texture: contents undefined */
 static GLint s_uTexLoc = -1;
+static GLint s_uPaletteLoc = -1;
+static GLint s_uIndexedLoc = -1;
+static GLint s_uLinearLoc = -1;
+static GLint s_uOpaqueRectLoc = -1;
+static GLint s_uSizeLoc = -1;
 static GLint s_aPosLoc = -1;
 static GLint s_aTexCoordLoc = -1;
-static U32 s_texWidth = 0;  /* present surface size (engine pixel space) */
+static U32 s_texWidth = 0; /* present surface size (engine pixel space) */
 static U32 s_texHeight = 0;
 static S32 s_initialized = 0;
 
@@ -360,18 +449,35 @@ static GLint s_clut_uBilinear = -1;
 static GLint s_clut_uChromaKey = -1;
 static GLint s_clut_uPerspCorrect = -1;
 static GLint s_clut_uBrickSize = -1;
+static GLint s_clut_uBlendSrcLog = -1;
+static GLint s_clut_uBlendDst = -1;
+static GLint s_clut_uTransPal = -1;
+static GLint s_clut_uBlendLogW = -1;
+static GLint s_clut_uBlendLogH = -1;
+static GLint s_clut_uBlendDstW = -1;
+static GLint s_clut_uBlendDstH = -1;
 
 /* ── GL state — textures ────────────────────────────────────────────────── */
 
-static GLuint s_atlasTex = 0;   /* 256×256 LUMINANCE */
-static GLuint s_clutTex = 0;    /* 256×256 LUMINANCE (full fog table) */
-static GLuint s_paletteTex = 0; /* 256×1 BGRA */
-static GLuint s_brickTex = 0;   /* brick atlas, LUMINANCE_ALPHA (GpuScene) */
+static GLuint s_atlasTex = 0;       /* 256×256 LUMINANCE */
+static GLuint s_clutTex = 0;        /* 256×256 LUMINANCE (full fog table) */
+static GLuint s_paletteTex = 0;     /* 256×1 BGRA, alpha 0xFF except index 0 (present) */
+static GLuint s_clutPaletteTex = 0; /* 256×1 BGRA, alpha = palette index (scene FBO) */
+static GLuint s_brickTex = 0;       /* brick atlas, LUMINANCE_ALPHA (GpuScene) */
 static U32 s_brickTexW = 0;
 static U32 s_brickTexH = 0;
-static GLuint s_spriteTex = 0;  /* sprite atlas, LUMINANCE_ALPHA (GpuScene) */
+static GLuint s_spriteTex = 0; /* sprite atlas, LUMINANCE_ALPHA (GpuScene) */
 static U32 s_spriteTexW = 0;
 static U32 s_spriteTexH = 0;
+static GLuint s_transPalTex = 0; /* 256×256 LUMINANCE blend table (mode 8) */
+static GLuint s_blendLogTex = 0; /* full-screen LUMINANCE_ALPHA src/Log (mode 8) */
+static U32 s_blendLogW = 0;
+static U32 s_blendLogH = 0;
+static GLuint s_blendDstTex = 0; /* full-screen BGRA dst rect copy (mode 8) */
+static U32 s_blendDstW = 0;
+static U32 s_blendDstH = 0;
+static U8 *s_blendReadback = NULL; /* rect staging for TargetCopyColorRect */
+static U32 s_blendReadbackBytes = 0;
 
 /* ── GL state — batch VBO ───────────────────────────────────────────────── */
 
@@ -401,10 +507,10 @@ static GLuint s_terrainDepthTex = 0;
    here maps game Y=0 → screen top. */
 static const GLfloat s_quadVerts[] = {
     /* pos       texcoord */
-    -1.0f, -1.0f,  0.0f, 1.0f,  /* bottom-left  (flip Y: texcoord 1.0) */
-     1.0f, -1.0f,  1.0f, 1.0f,  /* bottom-right */
-    -1.0f,  1.0f,  0.0f, 0.0f,  /* top-left      (flip Y: texcoord 0.0) */
-     1.0f,  1.0f,  1.0f, 0.0f,  /* top-right */
+    -1.0f, -1.0f, 0.0f, 1.0f, /* bottom-left  (flip Y: texcoord 1.0) */
+    1.0f, -1.0f, 1.0f, 1.0f,  /* bottom-right */
+    -1.0f, 1.0f, 0.0f, 0.0f,  /* top-left      (flip Y: texcoord 0.0) */
+    1.0f, 1.0f, 1.0f, 0.0f,   /* top-right */
 };
 
 /* FBO quad — V is NOT flipped. The CLUT vertex shader already maps game
@@ -412,10 +518,10 @@ static const GLfloat s_quadVerts[] = {
    correctly without an extra flip. */
 static const GLfloat s_fboQuadVerts[] = {
     /* pos       texcoord */
-    -1.0f, -1.0f,  0.0f, 0.0f,  /* bottom-left  (V=0.0 = FBO bottom) */
-     1.0f, -1.0f,  1.0f, 0.0f,  /* bottom-right */
-    -1.0f,  1.0f,  0.0f, 1.0f,  /* top-left      (V=1.0 = FBO top) */
-     1.0f,  1.0f,  1.0f, 1.0f,  /* top-right */
+    -1.0f, -1.0f, 0.0f, 0.0f, /* bottom-left  (V=0.0 = FBO bottom) */
+    1.0f, -1.0f, 1.0f, 0.0f,  /* bottom-right */
+    -1.0f, 1.0f, 0.0f, 1.0f,  /* top-left      (V=1.0 = FBO top) */
+    1.0f, 1.0f, 1.0f, 1.0f,   /* top-right */
 };
 
 /* ── Shader helpers ─────────────────────────────────────────────────────── */
@@ -578,6 +684,11 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     }
 
     s_uTexLoc = glGetUniformLocation(s_program, "uTex");
+    s_uPaletteLoc = glGetUniformLocation(s_program, "uPalette");
+    s_uIndexedLoc = glGetUniformLocation(s_program, "uIndexed");
+    s_uLinearLoc = glGetUniformLocation(s_program, "uLinear");
+    s_uOpaqueRectLoc = glGetUniformLocation(s_program, "uOpaqueRect");
+    s_uSizeLoc = glGetUniformLocation(s_program, "uSize");
     s_aPosLoc = glGetAttribLocation(s_program, "aPos");
     s_aTexCoordLoc = glGetAttribLocation(s_program, "aTexCoord");
 
@@ -614,6 +725,13 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     s_clut_uBilinear = glGetUniformLocation(s_clutProgram, "uBilinear");
     s_clut_uChromaKey = glGetUniformLocation(s_clutProgram, "uChromaKey");
     s_clut_uBrickSize = glGetUniformLocation(s_clutProgram, "uBrickSize");
+    s_clut_uBlendSrcLog = glGetUniformLocation(s_clutProgram, "uBlendSrcLog");
+    s_clut_uBlendDst = glGetUniformLocation(s_clutProgram, "uBlendDst");
+    s_clut_uTransPal = glGetUniformLocation(s_clutProgram, "uTransPal");
+    s_clut_uBlendLogW = glGetUniformLocation(s_clutProgram, "uBlendLogW");
+    s_clut_uBlendLogH = glGetUniformLocation(s_clutProgram, "uBlendLogH");
+    s_clut_uBlendDstW = glGetUniformLocation(s_clutProgram, "uBlendDstW");
+    s_clut_uBlendDstH = glGetUniformLocation(s_clutProgram, "uBlendDstH");
 
     Log_Info("[GL] CLUT shader compiled OK (aPos=%d aTexCoord=%d aLight=%d "
              "aZ=%d aRepMask=%d uAtlas=%d uCLUT=%d uPalette=%d uScreenScale=%d).",
@@ -666,7 +784,8 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
                  GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    /* Palette texture (256×1, BGRA — paletteLUT) */
+    /* Palette texture (256×1, BGRA — paletteLUT). Present overlay: alpha
+       0xFF except index 0 (the Log transparency hole). */
     glGenTextures(1, &s_paletteTex);
     glBindTexture(GL_TEXTURE_2D, s_paletteTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -676,6 +795,23 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, FMT_BGRA,
                  GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
+
+    /* Scene palette (256×1, BGRA — alpha byte = palette index). The clut
+       program resolves every opaque mode through this copy so the FBO's
+       alpha channel carries the destination index mode 8 blends against;
+       present keeps the copy above because its overlay blend treats
+       alpha 0 as the Log transparency hole. */
+    glGenTextures(1, &s_clutPaletteTex);
+    glBindTexture(GL_TEXTURE_2D, s_clutPaletteTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, FMT_BGRA,
+                 GL_UNSIGNED_BYTE, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    /* TransPal blend table (256×256 LUMINANCE): created on first upload. */
 
     /* Brick atlas: created on first TexUpdateBricks (size varies). */
 
@@ -714,6 +850,7 @@ static void GL_DestroyContext(void) {
         glDeleteTextures(1, &s_overlayTex);
         s_overlayTex = 0;
     }
+    s_overlayIndexed = 0;
     if (s_atlasTex) {
         glDeleteTextures(1, &s_atlasTex);
         s_atlasTex = 0;
@@ -725,6 +862,31 @@ static void GL_DestroyContext(void) {
     if (s_paletteTex) {
         glDeleteTextures(1, &s_paletteTex);
         s_paletteTex = 0;
+    }
+    if (s_clutPaletteTex) {
+        glDeleteTextures(1, &s_clutPaletteTex);
+        s_clutPaletteTex = 0;
+    }
+    if (s_transPalTex) {
+        glDeleteTextures(1, &s_transPalTex);
+        s_transPalTex = 0;
+    }
+    if (s_blendLogTex) {
+        glDeleteTextures(1, &s_blendLogTex);
+        s_blendLogTex = 0;
+        s_blendLogW = 0;
+        s_blendLogH = 0;
+    }
+    if (s_blendDstTex) {
+        glDeleteTextures(1, &s_blendDstTex);
+        s_blendDstTex = 0;
+        s_blendDstW = 0;
+        s_blendDstH = 0;
+    }
+    if (s_blendReadback) {
+        free(s_blendReadback);
+        s_blendReadback = NULL;
+        s_blendReadbackBytes = 0;
     }
     if (s_brickTex) {
         glDeleteTextures(1, &s_brickTex);
@@ -799,10 +961,12 @@ static void GL_TargetBindClear(U32 rgb) {
     }
 
     /* Scene clear RGB (exterior FogCoul): sky gaps outside the drawn
-       horizon must match the software Cls fill, not black. */
+       horizon must match the software Cls fill, not black. Alpha clears to
+       0 = palette index 0, the same value the software Cls leaves in Log
+       and the value a blend sprite blends against over sky. */
     glClearColor((float)((rgb >> 16) & 0xFF) / 255.0f,
                  (float)((rgb >> 8) & 0xFF) / 255.0f,
-                 (float)(rgb & 0xFF) / 255.0f, 1.0f);
+                 (float)(rgb & 0xFF) / 255.0f, 0.0f);
     /* Depth clear to 0.0 matches GL_GEQUAL (closer objects higher). */
 #ifdef USE_GLES2
     glClearDepthf(0.0f);
@@ -920,6 +1084,10 @@ static void GL_TargetRestoreTerrain(void) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_terrainColorTex);
     glUniform1i(s_uTexLoc, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, s_paletteTex);
+    glUniform1i(s_uPaletteLoc, 1);
+    glUniform1i(s_uIndexedLoc, 0); /* terrain colour is already ARGB */
 
     glBindBuffer(GL_ARRAY_BUFFER, s_fboVbo);
     glEnableVertexAttribArray(s_aPosLoc);
@@ -978,18 +1146,32 @@ static void GL_TexUpdateCLUT(const void *lum) {
 }
 
 static void GL_TexUpdatePalette(const void *argb) {
+    const U32 *lut;
+    U32 paletteCopy[256];
+    U32 sceneCopy[256];
+    S32 i;
+
     if (argb == NULL) {
         return;
     }
-    /* Copy palette and set alpha=0 for palette index 0 (transparent colour
-       in the Log buffer — sprites/UI use colour 0 as chroma key). */
-    U32 paletteCopy[256];
-    memcpy(paletteCopy, argb, sizeof(paletteCopy));
+    /* Present copy: alpha 0xFF everywhere except palette index 0 (the
+       transparent colour in the Log buffer — sprites/UI use colour 0 as
+       chroma key, and the overlay's blend lets the scene show through
+       those pixels). Scene copy: the alpha byte carries the palette index,
+       which is how the FBO records the destination index for mode 8. */
+    lut = (const U32 *)argb;
+    memcpy(paletteCopy, lut, sizeof(paletteCopy));
     paletteCopy[0] &= 0x00FFFFFF; /* alpha → 0 */
+    for (i = 0; i < 256; i++) {
+        sceneCopy[i] = (lut[i] & 0x00FFFFFFu) | ((U32)i << 24);
+    }
 
     glBindTexture(GL_TEXTURE_2D, s_paletteTex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, FMT_BGRA,
                     GL_UNSIGNED_BYTE, paletteCopy);
+    glBindTexture(GL_TEXTURE_2D, s_clutPaletteTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, FMT_BGRA,
+                    GL_UNSIGNED_BYTE, sceneCopy);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -1058,9 +1240,160 @@ static void GL_TexUpdateSprites(const void *rg, U32 width, U32 height) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-static void GL_TexUpdatePresent(const void *argb, U32 pitch, U32 width,
-                                U32 height, S32 linear) {
-    if (argb == NULL) {
+/* Blend table (mode 8): the 64 KB transpTable as a 256×256 LUMINANCE page,
+   row = source index, column = destination index. */
+static void GL_TexUpdateTransPal(const void *lum) {
+    if (lum == NULL) {
+        return;
+    }
+    if (!Window_GLMakeCurrent()) {
+        Log_Warn("[GL] TexUpdateTransPal: no context");
+        return;
+    }
+    if (s_transPalTex == 0) {
+        glGenTextures(1, &s_transPalTex);
+        glBindTexture(GL_TEXTURE_2D, s_transPalTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 256, 256, 0,
+                     GL_LUMINANCE, GL_UNSIGNED_BYTE, lum);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, s_transPalTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 256, GL_LUMINANCE,
+                        GL_UNSIGNED_BYTE, lum);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+/* Blend source/Log page (mode 8): LUMINANCE_ALPHA rect at (0,0) — byte0 =
+   walked source index (.r), byte1 = Log index (.a). The page is the rect
+   size, which is also what GpuDrawParams.blendLogW/H carries, so the
+   shader's (px + 0.5) / blendLog lands on texel px for every sprite. */
+static void GL_TexUpdateBlendLog(const void *rg, U32 width, U32 height) {
+    if (rg == NULL || width == 0 || height == 0) {
+        return;
+    }
+    if (!Window_GLMakeCurrent()) {
+        Log_Warn("[GL] TexUpdateBlendLog: no context");
+        return;
+    }
+    if (s_blendLogTex == 0) {
+        glGenTextures(1, &s_blendLogTex);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_blendLogTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (s_blendLogW != width || s_blendLogH != height) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE_ALPHA, (GLsizei)width,
+                     (GLsizei)height, 0, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE,
+                     NULL);
+        s_blendLogW = width;
+        s_blendLogH = height;
+    }
+    /* Rows are width*2 bytes; an odd width is not 4-byte aligned, so the
+       default unpack stride would shift every row after the first. */
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height,
+                    GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, rg);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+/* Blend destination rect (mode 8): read the offscreen colour rect (engine
+   coordinates, top-down) and store it at (0,0) of the dst page with
+   engine-top-down rows. GL framebuffer rows run bottom-up, so the rect is
+   read at the flipped origin and the rows are reversed on the CPU. The
+   SSAA scale between the present surface and the FBO is applied to both
+   the source rect and the flip origin; the shader normalises by engine
+   pixels and lands on each block's centre texel. */
+static S32 GL_TargetCopyColorRect(U32 x, U32 y, U32 width, U32 height) {
+    U32 scale, needW, needH, rowBytes, row;
+    U8 *tmp;
+
+    if (!s_initialized || !s_fbo || width == 0 || height == 0) {
+        return FALSE;
+    }
+    if (!Window_GLMakeCurrent()) {
+        return FALSE;
+    }
+    scale = (s_texWidth != 0) ? (s_fboWidth / s_texWidth) : 1;
+    if (scale == 0) {
+        scale = 1;
+    }
+    if (x * scale + width * scale > s_fboWidth ||
+        y * scale + height * scale > s_fboHeight) {
+        return FALSE;
+    }
+
+    rowBytes = width * scale * 4;
+    needW = width * scale;
+    needH = height * scale;
+    if (s_blendDstTex == 0) {
+        glGenTextures(1, &s_blendDstTex);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_blendDstTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    if (s_blendDstW != needW || s_blendDstH != needH) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)needW,
+                     (GLsizei)needH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        s_blendDstW = needW;
+        s_blendDstH = needH;
+    }
+
+    {
+        const U32 need = rowBytes * (height * scale);
+        if (s_blendReadbackBytes < need) {
+            free(s_blendReadback);
+            s_blendReadback = (U8 *)malloc(need);
+            s_blendReadbackBytes = s_blendReadback ? need : 0;
+        }
+        if (s_blendReadback == NULL) {
+            glBindTexture(GL_TEXTURE_2D, 0);
+            return FALSE;
+        }
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, s_fbo);
+    glReadPixels((GLint)(x * scale),
+                 (GLint)(s_fboHeight - ((y + height) * scale)),
+                 (GLsizei)(width * scale), (GLsizei)(height * scale),
+                 GL_RGBA, GL_UNSIGNED_BYTE, s_blendReadback);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    /* Rows came up from the flipped origin: row 0 is the rect's bottom
+       engine row. Reverse them so the page reads top-down. */
+    tmp = (U8 *)malloc(rowBytes);
+    if (tmp == NULL) {
+        glBindTexture(GL_TEXTURE_2D, 0);
+        return FALSE;
+    }
+    for (row = 0; row < (height * scale) / 2; row++) {
+        U8 *a = s_blendReadback + row * rowBytes;
+        U8 *b = s_blendReadback + ((height * scale) - 1 - row) * rowBytes;
+        memcpy(tmp, a, rowBytes);
+        memcpy(a, b, rowBytes);
+        memcpy(b, tmp, rowBytes);
+    }
+    free(tmp);
+
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)(width * scale),
+                    (GLsizei)(height * scale), GL_RGBA, GL_UNSIGNED_BYTE,
+                    s_blendReadback);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return TRUE;
+}
+
+static void GL_TexUpdatePresent(const void *pixels, U32 pitch, U32 width,
+                                U32 height, S32 rectX, S32 rectY, S32 rectW,
+                                S32 rectH, S32 linear, S32 indexed) {
+    if (pixels == NULL) {
         return;
     }
     if (!Window_GLMakeCurrent()) {
@@ -1068,35 +1401,88 @@ static void GL_TexUpdatePresent(const void *argb, U32 pitch, U32 width,
     }
 
     /* Allocate the overlay texture at the present size (it changes on
-       video-mode switches); a new size or a dirty flag resizes. */
-    if (s_overlayTex == 0 || s_texWidth != width || s_texHeight != height) {
+       video-mode switches); a new size or a format switch recreates. The R8
+       path stores raw palette indices (1 byte/pixel); the ARGB path keeps the
+       console/touch staging surface. Always NEAREST on the index page so a
+       texel fetch is one LUT input — bilinear is four taps in the shader. */
+    if (s_overlayTex == 0 || s_texWidth != width || s_texHeight != height ||
+        s_overlayIndexed != indexed) {
         if (s_overlayTex == 0) {
+            glGenTextures(1, &s_overlayTex);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, s_overlayTex);
+            glDeleteTextures(1, &s_overlayTex);
             glGenTextures(1, &s_overlayTex);
         }
         glBindTexture(GL_TEXTURE_2D, s_overlayTex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
-                        linear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
-                        linear ? GL_LINEAR : GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width, (GLsizei)height,
-                     0, FMT_BGRA, GL_UNSIGNED_BYTE, NULL);
+        if (indexed) {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                            GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                            GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, (GLsizei)width,
+                         (GLsizei)height, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE,
+                         NULL);
+        } else {
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                            linear ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                            linear ? GL_LINEAR : GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width,
+                         (GLsizei)height, 0, FMT_BGRA, GL_UNSIGNED_BYTE,
+                         NULL);
+        }
         s_texWidth = width;
         s_texHeight = height;
+        s_overlayIndexed = indexed;
+        /* glTexImage2D's NULL data left the contents undefined: this call
+           uploads the full surface whatever rect the caller planned. */
+        s_overlayFullUpload = 1;
     } else {
         glBindTexture(GL_TEXTURE_2D, s_overlayTex);
     }
 
-    /* Set filter mode (bilinear vs nearest) */
-    GLenum filter = linear ? GL_LINEAR : GL_NEAREST;
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    /* ARGB: hardware bilinear on the converted pixels. R8: NEAREST always —
+       the shader's four-tap path replaces it when DisplayTexFilter is on. */
+    if (!indexed) {
+        GLenum filter = linear ? GL_LINEAR : GL_NEAREST;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+    }
 
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4));
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)width, (GLsizei)height,
-                    FMT_BGRA, GL_UNSIGNED_BYTE, argb);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    if (s_overlayFullUpload) {
+        rectX = 0;
+        rectY = 0;
+        rectW = (S32)width;
+        rectH = (S32)height;
+        s_overlayFullUpload = 0;
+    }
+
+    if (rectW > 0 && rectH > 0) {
+        /* Rows of the source are pitch apart and the rect's x origin is
+           arbitrary, so no row start is guaranteed 4-byte aligned: upload
+           byte-aligned and restore the GL default afterwards (same pairing
+           the atlas uploads use). */
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        if (indexed) {
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)pitch);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, rectX, rectY, rectW, rectH,
+                            GL_LUMINANCE, GL_UNSIGNED_BYTE,
+                            (const U8 *)pixels + (size_t)rectY * pitch +
+                                (size_t)rectX);
+        } else {
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4));
+            glTexSubImage2D(GL_TEXTURE_2D, 0, rectX, rectY, rectW, rectH,
+                            FMT_BGRA, GL_UNSIGNED_BYTE,
+                            (const U8 *)pixels + (size_t)rectY * pitch +
+                                (size_t)rectX * 4);
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    }
+
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -1151,19 +1537,31 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
                         (float)s_brickTexH);
         }
     }
+    if (params->polyMode == 8) {
+        glUniform1f(s_clut_uBlendLogW, params->blendLogW);
+        glUniform1f(s_clut_uBlendLogH, params->blendLogH);
+        glUniform1f(s_clut_uBlendDstW, params->blendDstW);
+        glUniform1f(s_clut_uBlendDstH, params->blendDstH);
+    }
 
     /* TRANS/TRAME (blend) batches alpha-blend; everything else is opaque.
        INCRUST chroma-keying is a shader discard, not blending, so Z-write
-       stays enabled there (the common layer already resolved that). */
+       stays enabled there (the common layer already resolved that).
+       The alpha channel of the target carries the destination palette
+       index (the scene palette's alpha byte), so the alpha equation must
+       keep it: dst alpha = dst alpha, regardless of the fragment's own. */
     if (params->blend) {
         glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO,
+                            GL_ONE);
     } else {
         glDisable(GL_BLEND);
     }
 
     /* Bind textures to units 0/1/2. Mode 7 samples the brick or sprite
-       RG8 page through uAtlas; every other mode samples the 256×256 page. */
+       RG8 page through uAtlas; every other mode samples the 256×256 page.
+       Mode 8 additionally binds its three lookup pages on units 3/4/5
+       (LUMINANCE_ALPHA src/Log, BGRA dst rect, LUMINANCE table). */
     glActiveTexture(GL_TEXTURE0);
     if (params->polyMode == 7) {
         glBindTexture(GL_TEXTURE_2D,
@@ -1178,8 +1576,20 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     glUniform1i(s_clut_uCLUT, 1);
 
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, s_paletteTex);
+    glBindTexture(GL_TEXTURE_2D, s_clutPaletteTex);
     glUniform1i(s_clut_uPalette, 2);
+
+    if (params->polyMode == 8) {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, s_blendLogTex);
+        glUniform1i(s_clut_uBlendSrcLog, 3);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, s_blendDstTex);
+        glUniform1i(s_clut_uBlendDst, 4);
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D, s_transPalTex);
+        glUniform1i(s_clut_uTransPal, 5);
+    }
 
     glActiveTexture(GL_TEXTURE0); /* restore default */
 
@@ -1229,23 +1639,30 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
 
     /* Scissor to the software Fill_Poly clip window (engine pixels mapped
        through screenScale into target pixels). GL's origin is bottom-left,
-       so the rect's top-down engine Y is flipped against the target height. */
+       so the rect's top-down engine Y is flipped against the target height.
+       The mapped edges are not integers (screenScale is a float ratio), and
+       a truncated edge loses the top or right pixel row of the clip window —
+       visible as the topmost row of every clip-scissored batch never
+       drawing.
+       Floor the low edge and ceil the high edge so the scissor covers the
+       whole window; the rasterizer still bounds the draw to the quad. */
     {
         const float engW = 2.0f / params->screenScale[0];
         const float engH = 2.0f / params->screenScale[1];
         const float sx = (float)s_fboWidth / engW;
         const float sy = (float)s_fboHeight / engH;
-        const float x0 = (float)params->clipX0 * sx;
-        const float yTop = (float)params->clipY0 * sy;
-        const float yBot = (float)(params->clipY1 + 1) * sy;
-        const float w = (float)(params->clipX1 - params->clipX0 + 1) * sx;
-        const float h = yBot - yTop;
-        const float gy = (float)s_fboHeight - yBot;
+        const float devX0 = floorf((float)params->clipX0 * sx);
+        const float devX1 = ceilf((float)(params->clipX1 + 1) * sx);
+        const float devY0 = floorf((float)s_fboHeight -
+                                   (float)(params->clipY1 + 1) * sy);
+        const float devY1 = ceilf((float)s_fboHeight -
+                                  (float)params->clipY0 * sy);
         glEnable(GL_SCISSOR_TEST);
-        if (w <= 0.0f || h <= 0.0f) {
+        if (devX1 <= devX0 || devY1 <= devY0) {
             glScissor(0, 0, 0, 0);
         } else {
-            glScissor((int)x0, (int)gy, (int)w, (int)h);
+            glScissor((GLint)devX0, (GLint)devY0, (GLsizei)(devX1 - devX0),
+                      (GLsizei)(devY1 - devY0));
         }
     }
 
@@ -1313,7 +1730,8 @@ static void GL_ClearBackbuffer(void) {
             vpH = winH;
             vpW = (int)((double)winH * contentAspect + 0.5);
             vpW = (vpW + 1) & ~1;
-            if (vpW > winW) vpW = winW;
+            if (vpW > winW)
+                vpW = winW;
             vpX = (winW - vpW) / 2;
             vpY = 0;
         } else {
@@ -1321,7 +1739,8 @@ static void GL_ClearBackbuffer(void) {
             vpW = winW;
             vpH = (int)((double)winW / contentAspect + 0.5);
             vpH = (vpH + 1) & ~1;
-            if (vpH > winH) vpH = winH;
+            if (vpH > winH)
+                vpH = winH;
             vpX = 0;
             vpY = (winH - vpH) / 2;
         }
@@ -1329,7 +1748,8 @@ static void GL_ClearBackbuffer(void) {
     glViewport(vpX, vpY, vpW, vpH);
 }
 
-static void GL_DrawPresentQuad(S32 which, S32 linear) {
+static void GL_DrawPresentQuad(S32 which, S32 linear, S32 opaqueX0,
+                               S32 opaqueY0, S32 opaqueX1, S32 opaqueY1) {
     if (!s_initialized) {
         return;
     }
@@ -1337,13 +1757,14 @@ static void GL_DrawPresentQuad(S32 which, S32 linear) {
         return;
     }
 
-    /* The sampler filter for the overlay was applied at TexUpdatePresent; the
-       FBO source is always LINEAR, matching the reference driver. */
+    /* The FBO source is always LINEAR, matching the reference driver. The
+       overlay's effective filter was applied at TexUpdatePresent (ARGB) or
+       is selected by uLinear (R8 four-tap path). */
     (void)linear;
 
     if (which == 0) {
         /* Offscreen target colour → window. The letterbox viewport set by
-           ClearBackbuffer stays active. */
+            ClearBackbuffer stays active. */
         if (!s_fbo) {
             return;
         }
@@ -1354,6 +1775,13 @@ static void GL_DrawPresentQuad(S32 which, S32 linear) {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glUniform1i(s_uTexLoc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, s_paletteTex);
+        glUniform1i(s_uPaletteLoc, 1);
+        glUniform1i(s_uIndexedLoc, 0);
+        glUniform1i(s_uLinearLoc, 0);
+        glUniform4f(s_uOpaqueRectLoc, 0.0f, 0.0f, 0.0f, 0.0f);
+        glUniform2f(s_uSizeLoc, (float)s_texWidth, (float)s_texHeight);
 
         glBindBuffer(GL_ARRAY_BUFFER, s_fboVbo);
         glEnableVertexAttribArray(s_aPosLoc);
@@ -1371,9 +1799,11 @@ static void GL_DrawPresentQuad(S32 which, S32 linear) {
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glUseProgram(0);
     } else {
-        /* 2D overlay (the Log buffer as ARGB, uploaded by TexUpdatePresent).
-           Alpha blending lets palette index 0 (alpha=0) be transparent so
-           the 3D scene shows through underneath. Swap inside this call. */
+        /* 2D overlay (Log as ARGB staging, or raw indices on R8 resolved
+           through uPalette). Alpha blending lets palette index 0 (alpha=0)
+           be transparent so the 3D scene shows through underneath; inside
+           uOpaqueRect it presents opaque black like the software present.
+           Swap inside this call. */
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
@@ -1381,6 +1811,14 @@ static void GL_DrawPresentQuad(S32 which, S32 linear) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, s_overlayTex);
         glUniform1i(s_uTexLoc, 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, s_paletteTex);
+        glUniform1i(s_uPaletteLoc, 1);
+        glUniform1i(s_uIndexedLoc, s_overlayIndexed);
+        glUniform1i(s_uLinearLoc, linear);
+        glUniform4f(s_uOpaqueRectLoc, (float)opaqueX0, (float)opaqueY0,
+                    (float)opaqueX1, (float)opaqueY1);
+        glUniform2f(s_uSizeLoc, (float)s_texWidth, (float)s_texHeight);
 
         glBindBuffer(GL_ARRAY_BUFFER, s_vbo);
         glEnableVertexAttribArray(s_aPosLoc);
@@ -1427,6 +1865,9 @@ const GpuRendererBackend GpuRendererBackendGL = {
     GL_TexUpdatePalette,
     GL_TexUpdateBricks,
     GL_TexUpdateSprites,
+    GL_TexUpdateTransPal,
+    GL_TexUpdateBlendLog,
+    GL_TargetCopyColorRect,
     GL_DrawTriangles,
     GL_ClearBackbuffer,
     GL_DrawPresentQuad,

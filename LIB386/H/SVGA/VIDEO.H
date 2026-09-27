@@ -53,6 +53,16 @@ void SetPrePresentCallback(PrePresentFn fn);
  *  overlay. Same signature as PrePresentFn. */
 void SetOverlayPrePresentCallback(PrePresentFn fn);
 
+/** TRUE when this pre-present callback will read or write the ARGB frame
+ *  buffer this frame (console open, PPM screenshot pending, touch overlay
+ *  up). When every registered query returns FALSE and a GPU backend owns the
+ *  present, PresentFrame skips the CPU Log→ARGB conversion and hands Log's
+ *  palette indices straight to the renderer (R8 present). Control_ServiceListen
+ *  ignores the buffer and needs no query. Unregistered queries count as FALSE. */
+typedef S32 (*PrePresentNeedsArgbFn)(void);
+void SetPrePresentNeedsArgb(PrePresentNeedsArgbFn fn);
+void SetOverlayPrePresentNeedsArgb(PrePresentNeedsArgbFn fn);
+
 /** Optional timing taps around the present path (palette LUT scan + texture upload + GL submit + vsync wait).
     Both callbacks must be set together (or both NULL); called at most once per UnlockVideoSurface. */
 typedef void (*PresentTimingFn)(void);

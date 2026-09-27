@@ -17,6 +17,7 @@
 #include <SYSTEM/KEYBOARD_KEYS.H>
 #include <SYSTEM/MOUSE.H>
 #include <SYSTEM/WINDOW.H>
+#include <GPU/GPURENDERER.H> /* SetSoftwarePolys: exterior Screen plate */
 #include "FOLLOWCAM.H"
 #include "FOLLOWCAM_CFG.H"
 #include "FOLLOWCAM_MATH.H"
@@ -359,6 +360,20 @@ void AffGrilleExt() {
         DrawCameraInfos();
     }
 #endif
+}
+
+void AffGrilleExt_BuildScreenPlate(void) {
+    /* Terrain lives only in the FBO under a GPU backend, so after AFF_ALL
+       CopyScreen(Log, Screen) the exterior Screen plate is zeros. 2D modals
+       (OpenInventory) shade Screen through the CLUT and would darken holes
+       instead of scene colours. One software AffGrilleExt pass rebuilds the
+       plate; forcing the fillers keeps the backend from re-batching into the
+       FBO it must not disturb. Log is cleared afterward so the present
+       composite still shows the GPU frame under the overlay. */
+    GpuRenderer_SetSoftwarePolys(1);
+    AffGrilleExt();
+    GpuRenderer_SetSoftwarePolys(0);
+    memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
 }
 
 /*══════════════════════════════════════════════════════════════════════════*

@@ -12,5 +12,11 @@ extern void ClearIncrusts(S32 type);
 /*--------------------------------------------------------------------------*/
 extern void DrawBulle(S32 numobj);
 /*--------------------------------------------------------------------------*/
+/* GpuScene HUD hooks used by the AffScene incrust loop and DrawBulle. Both
+   return TRUE when the quad landed in the FBO (Log's footprint punched);
+   FALSE leaves the caller on Font / PtrAffGraph. */
+extern S32 TryGpuIncrustText(S32 x, S32 y, const char *str);
+extern S32 TryGpuIncrustSprite(S32 xp, S32 yp, S32 sprite);
+/*--------------------------------------------------------------------------*/
 
 #endif // INCRUST_H

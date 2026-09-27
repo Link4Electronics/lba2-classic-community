@@ -74,6 +74,8 @@ History note: the C++ port shipped `factorx`/`factory`-ignoring code from commit
 
 Both paths report the on-screen bounding box back through `Screen{X,Y}{Min,Max}` and bail out via `set_exit_bounds()` when the sprite is fully outside the clip rect.
 
+With `GpuScene` on, the `EXTRA_TRANSPARENT` branch in `AffOneObject` (`SOURCES/OBJECT.CPP`) asks `GpuRenderer_DrawBlendSprite` first and falls back to this function when it declines; the GPU path reproduces this walk and table lookup — see [RENDERER.md](../RENDERER.md).
+
 ## Per-frame scale factor
 
 `ScaleFactorSprite` (`SOURCES/GLOBAL.CPP:207`, default `DEF_SCALE_FACTOR = 65536` from `COMMON.H:420`) is the 16.16 zoom factor handed to the scaled blitter. There are two ways it gets set:
