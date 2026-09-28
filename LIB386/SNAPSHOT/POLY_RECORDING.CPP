@@ -351,16 +351,27 @@ static void check_state_changes(void) {
     }
 }
 
+void polyrec_pack_point(U8 *dst, const Struc_Point *src) {
+    memcpy(dst, src, POLYREC_POINT_SIZE);
+}
+
+void polyrec_unpack_point(Struc_Point *dst, const U8 *src) {
+    memcpy(dst, src, POLYREC_POINT_SIZE);
+    dst->Pt_RepMask = 0; /* never serialized; keep replay state deterministic */
+}
+
 void polyrec_record_fill_poly(S32 type_poly, S32 color_poly, S32 nb_points,
                               const void *ptr_points) {
     U32 points_size;
+    S32 i;
     if (!g_recording)
         return;
 
     check_state_changes();
 
-    /* 1 (type byte) + 4 (type_poly) + 4 (color_poly) + 4 (nb_points) + 16*nb_points */
-    points_size = (U32)nb_points * 16;
+    /* 1 (type byte) + 4 (type_poly) + 4 (color_poly) + 4 (nb_points)
+     * + POLYREC_POINT_SIZE*nb_points, packed one vertex at a time */
+    points_size = (U32)nb_points * POLYREC_POINT_SIZE;
     if (ensure_space(13 + points_size) != 0)
         return;
 
@@ -368,7 +379,11 @@ void polyrec_record_fill_poly(S32 type_poly, S32 color_poly, S32 nb_points,
     emit_s32(type_poly);
     emit_s32(color_poly);
     emit_s32(nb_points);
-    emit_bytes(ptr_points, points_size);
+    for (i = 0; i < nb_points; i++) {
+        U8 packed[POLYREC_POINT_SIZE];
+        polyrec_pack_point(packed, (const Struc_Point *)ptr_points + i);
+        emit_bytes(packed, POLYREC_POINT_SIZE);
+    }
     g_rec.num_events++;
 }
 

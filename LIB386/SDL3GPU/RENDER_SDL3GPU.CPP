@@ -116,6 +116,8 @@ typedef struct S3GpuParams {
     float blendLogH;
     float blendDstW;
     float blendDstH;
+    float flatRow;   /* mode 0: >= 0 pins the CLUT row, -1 = light-derived */
+    float padEnd[3]; /* struct size stays a 16-byte multiple for SDL */
 } S3GpuParams;
 
 /* Present params. Must match the std140 PresentParams block in
@@ -2154,6 +2156,10 @@ static void S3_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     cmd->params.blendLogH = params->blendLogH;
     cmd->params.blendDstW = params->blendDstW;
     cmd->params.blendDstH = params->blendDstH;
+    cmd->params.flatRow = params->flatRow;
+    cmd->params.padEnd[0] = 0.0f;
+    cmd->params.padEnd[1] = 0.0f;
+    cmd->params.padEnd[2] = 0.0f;
 }
 
 //──────────────────────────────────────────────────────────────────────────

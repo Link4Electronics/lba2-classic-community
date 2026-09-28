@@ -192,6 +192,7 @@ static const char *s_clutFragSrc =
     "uniform int uPolyMode;\n"          /* 0=texture 1=flat 2=gouraud 3=gouraudTable 4=textureNoCLUT 5=fogSmooth 6=sceneShadow 7=brickQuad 8=blendSprite */
     "uniform float uFlatColor;\n"       /* palette index (mode 1) / CLUT column (mode 3) */
     "uniform float uCLUTBaseRow;\n"     /* CLUT row offset for gouraud table (mode 3) */
+    "uniform float uFlatRow;\n"         /* mode 0: >= 0 pins the CLUT row, -1 = light-derived */
     "uniform float uScaledFogNear;\n"   /* Fill_ScaledFogNear (fog-smooth distance, mode 5) */
     "uniform float uFogRowScale;\n"     /* Fill_Fog_Factor / 65536 (fog-smooth distance, mode 5) */
     "uniform int uAlphaMode;\n"         /* 0=opaque 1=TRANS(semi) 2=TRAME(stipple) */
@@ -271,6 +272,12 @@ static const char *s_clutFragSrc =
         The +128 (0x80) rounding bias shifts the CLUT row by 1 in some
         cases — same bias applied in polyMode 2. */
     "        float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;\n"
+    /* SW flat-textured fillers (Filler_TextureFlat / Filler_TextureZFlat)
+       index the CLUT at the batch base row and never read Pt_Light, so
+       uFlatRow >= 0 pins the row for those types. */
+    "        if (uFlatRow >= 0.0) {\n"
+    "            gouraudRow = uFlatRow;\n"
+    "        }\n"
     "        if (uBilinear != 0) {\n"
     "            color = bilinearCLUT(tc, widthMask, heightMask, gouraudRow);\n"
     "        } else {\n"
@@ -442,6 +449,7 @@ static GLint s_clut_uScreenScale = -1;
 static GLint s_clut_uPolyMode = -1;
 static GLint s_clut_uFlatColor = -1;
 static GLint s_clut_uCLUTBaseRow = -1;
+static GLint s_clut_uFlatRow = -1;
 static GLint s_clut_uScaledFogNear = -1;
 static GLint s_clut_uFogRowScale = -1;
 static GLint s_clut_uAlphaMode = -1;
@@ -719,6 +727,7 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     s_clut_uPolyMode = glGetUniformLocation(s_clutProgram, "uPolyMode");
     s_clut_uFlatColor = glGetUniformLocation(s_clutProgram, "uFlatColor");
     s_clut_uCLUTBaseRow = glGetUniformLocation(s_clutProgram, "uCLUTBaseRow");
+    s_clut_uFlatRow = glGetUniformLocation(s_clutProgram, "uFlatRow");
     s_clut_uScaledFogNear = glGetUniformLocation(s_clutProgram, "uScaledFogNear");
     s_clut_uFogRowScale = glGetUniformLocation(s_clutProgram, "uFogRowScale");
     s_clut_uAlphaMode = glGetUniformLocation(s_clutProgram, "uAlphaMode");
@@ -1526,6 +1535,7 @@ static void GL_DrawTriangles(const GpuVertex *verts, U32 vertexCount,
     glUniform1i(s_clut_uPerspCorrect, params->perspCorrect);
     glUniform1i(s_clut_uChromaKey, params->chromaKey);
     glUniform1f(s_clut_uCLUTBaseRow, params->clutBaseRow);
+    glUniform1f(s_clut_uFlatRow, params->flatRow);
     glUniform1f(s_clut_uScaledFogNear, params->scaledFogNear);
     glUniform1f(s_clut_uFogRowScale, params->fogRowScale);
     if (params->polyMode == 7) {

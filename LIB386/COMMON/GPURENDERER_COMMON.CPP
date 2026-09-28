@@ -271,8 +271,8 @@ static void Common_UploadAtlas(void) {
 
 static void Common_UploadCLUT(void) {
     /* Re-upload every enqueue: the game edits the fog table in place between
-       scenes (same PtrCLUTFog pointer, different data). Cheap relative to the
-       per-poly draw that follows. */
+       scenes (same PtrCLUTFog pointer, different data). Cheap relative to
+       the per-poly draw that follows. */
     if (PtrCLUTFog != NULL) {
         s_backend->TexUpdateCLUT(PtrCLUTFog);
     }
@@ -615,6 +615,7 @@ static void Common_PunchSpriteLog(const GpuBrickRect *rect, S32 x0, S32 y0,
 //──────────────────────────────────────────────────────────────────────────
 static void Common_BuildDrawParams(GpuDrawParams *out) {
     memset(out, 0, sizeof *out);
+    out->flatRow = -1.0f;
     out->clipX0 = s_batchClipX0;
     out->clipY0 = s_batchClipY0;
     out->clipX1 = s_batchClipX1;
@@ -716,6 +717,32 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
     out->scaledFogNear = s_batchScaledFogNear;
     out->fogRowScale = s_batchFogRowScale;
     out->bilinear = s_bilinearCLUT;
+
+    /* SW parity: Filler_TextureFlat (types 9/13) reads the CLUT only at the
+       batch base row, and Filler_TextureZFlat (17/21) at base + the poly's
+       colour byte — neither ever looks at Pt_Light, so a light-derived row
+       repaints them with fog steps the software path never applies and with
+       rows that sweep as the interpolated vertex light moves. Pin those
+       rows; mode 0 keeps the light-derived row for every other textured
+       type. LBA2_GPU_FLAT_PARITY=0 restores the light-derived row for all
+       types (A/B comparison against the pre-parity GPU output). */
+    if (out->polyMode == 0) {
+        static S32 sFlatParity = -1;
+        if (sFlatParity < 0) {
+            const char *env = getenv("LBA2_GPU_FLAT_PARITY");
+            sFlatParity = (env != NULL && env[0] == '0') ? 0 : 1;
+        }
+        if (sFlatParity) {
+            if (s_currentTypePoly == POLY_TEXTURE_FLAT ||
+                s_currentTypePoly == POLY_TEXTURE_INCRUST_FLAT) {
+                out->flatRow = out->clutBaseRow;
+            } else if (s_currentTypePoly == POLY_TEXTURE_Z_FLAT ||
+                       s_currentTypePoly == POLY_TEXTURE_Z_INCRUST_FLAT) {
+                out->flatRow =
+                    out->clutBaseRow + (float)(s_currentColorPoly & 0xFF);
+            }
+        }
+    }
 
     /* Depth rules (see the reference driver's flush for the reasoning):
        - types 0-24 depth-test GEQUAL, the mirror of the SW fillers'

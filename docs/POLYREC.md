@@ -79,17 +79,12 @@ The event stream interleaves state-change events and draw events:
 | `SET_REPMASK` | `0x07` | rep_mask (u32) |
 | `SET_FILL_PATCH` | `0x08` | fill_patch (u32) |
 | `SET_CLUT_OFFSET` | `0x09` | byte offset of `PtrCLUTGouraud` into the fog table (u32) |
-| `FILL_POLY` | `0x10` | type, color, nb_points (s32), then `nb_points × 16` bytes of `Struc_Point` |
+| `FILL_POLY` | `0x10` | type, color, nb_points (s32), then `nb_points × 16` bytes: each vertex's leading 16 bytes of `Struc_Point` |
 | `FILL_SPHERE` | `0x11` | type, color, centre_x, centre_y, radius, zbuf_value (s32) |
 | `LINE_A` | `0x12` | x0, y0, x1, y1, col, z1, z2 (s32) |
 | `EOF` | `0xFF` | — |
 
-A `FILL_POLY` event stores each vertex as the engine's 16-byte
-[`Struc_Point`](../LIB386/H/POLYGON/POLY.H) verbatim: screen X/Y (`Pt_XE`,
-`Pt_YE`, both `S16`), texture U/V, light, normalized Z, and `Pt_W`. These are
-**already-projected screen-space coordinates** — projection has happened
-upstream by the time `Fill_Poly` is called. This is the single most important
-fact about the harness's scope (see [Current scope and limitations](#current-scope-and-limitations)).
+A `FILL_POLY` event stores each vertex as the leading 16 bytes of [`Struc_Point`](../LIB386/H/POLYGON/POLY.H) (`Pt_XE`, `Pt_YE`, both `S16`, texture U/V, light, normalized Z, and `Pt_W`); `Pt_RepMask` lies past that boundary and is not part of the on-disk record. In memory `Struc_Point` is wider than 16 bytes, so vertices are converted one at a time (`polyrec_pack_point` / `polyrec_unpack_point`) — a flat copy of the array would let vertex N's record start inside vertex N-1's trailing bytes. These are **already-projected screen-space coordinates** — projection has happened upstream by the time `Fill_Poly` is called. This is the single most important fact about the harness's scope (see [Current scope and limitations](#current-scope-and-limitations)).
 
 ### What gets compared
 

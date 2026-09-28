@@ -75,6 +75,7 @@ add_subdirectory(iso_world_zo)
 add_subdirectory(sprite_decode)
 add_subdirectory(gpu_blend_walk)
 add_subdirectory(gpu_present_dirty)
+add_subdirectory(polyrec_points)
 
 if(LBA2_BUILD_ASM_EQUIV_TESTS)
 include(cmake/asm_test_helpers.cmake)

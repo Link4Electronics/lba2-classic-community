@@ -16,6 +16,7 @@
 #pragma once
 
 #include <SYSTEM/ADELINE_TYPES.H>
+#include <POLYGON/POLY.H>
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +46,10 @@ extern int g_polyrec_recording;
 #define POLYREC_CLUT_SIZE 65536 /* 256 * 256 bytes */
 #define POLYREC_PALETTE_SIZE 256
 #define POLYREC_RGB_PALETTE_SIZE 768 /* 256 entries × 3 bytes (R,G,B) */
+
+/* On-disk size of one serialized vertex: the leading bytes of Struc_Point
+ * (Pt_XE..Pt_W). Pt_RepMask lies past that boundary and is never serialized. */
+#define POLYREC_POINT_SIZE 16
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
 /*  EVENT TYPES                                                               */
@@ -270,6 +275,13 @@ int polyrec_is_recording(void);
  * @param rgb_palette  768 bytes (256 entries × 3 bytes R,G,B)
  */
 void polyrec_set_rgb_palette(const U8 *rgb_palette);
+
+/* Vertices are converted one at a time because Struc_Point's in-memory stride
+ * is wider than POLYREC_POINT_SIZE: serializing or parsing a vertex array as a
+ * flat byte block would let vertex N's record start inside vertex N-1's
+ * trailing bytes, silently shifting every field after vertex 0. */
+void polyrec_pack_point(U8 *dst, const Struc_Point *src);
+void polyrec_unpack_point(Struc_Point *dst, const U8 *src);
 
 /**
  * Record a Fill_Poly call.

@@ -73,6 +73,10 @@ typedef struct GpuDrawParams {
     float blendLogH;
     float blendDstW;
     float blendDstH;
+    // Mode-0 CLUT row override: >= 0 pins the gouraud row to this value
+    // (the SW flat-textured fillers never look at Pt_Light); -1 keeps the
+    // light-derived row. Appended last so the std140 block matches.
+    float flatRow;
 } GpuDrawParams;
 
 //──────────────────────────────────────────────────────────────────────────

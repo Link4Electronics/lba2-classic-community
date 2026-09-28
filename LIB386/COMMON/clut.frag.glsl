@@ -39,6 +39,7 @@ layout(std140, set = 3, binding = 0) uniform GpuParams {
     float uBlendLogH;     /* blend page height in pixels (mode 8) */
     float uBlendDstW;     /* dst rect width in pixels (mode 8) */
     float uBlendDstH;     /* dst rect height in pixels (mode 8) */
+    float uFlatRow;       /* mode 0: >= 0 pins the CLUT row, -1 = light-derived */
 };
 layout(location = 0) in vec2 vTexCoord;
 layout(location = 1) in vec2 vTexCoordOverW;
@@ -110,6 +111,12 @@ void main() {
            The +128 (0x80) rounding bias shifts the CLUT row by 1 in some
            cases — same bias applied in polyMode 2. */
         float gouraudRow = floor((vLight + 128.0) / 256.0) + uCLUTBaseRow;
+        /* SW flat-textured fillers (Filler_TextureFlat / Filler_TextureZFlat)
+           index the CLUT at the batch base row and never read Pt_Light, so
+           uFlatRow >= 0 pins the row for those types. */
+        if (uFlatRow >= 0.0) {
+            gouraudRow = uFlatRow;
+        }
         if (uBilinear != 0) {
             color = bilinearCLUT(tc, widthMask, heightMask, gouraudRow);
         } else {

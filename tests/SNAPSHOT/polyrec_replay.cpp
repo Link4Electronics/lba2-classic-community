@@ -300,7 +300,7 @@ int polyrec_replay_run(const char *polyrec_file, const char *output_file,
             S32 type_poly = read_s32(&reader);
             S32 color_poly = read_s32(&reader);
             S32 nb_points = read_s32(&reader);
-            U32 points_size = (U32)nb_points * 16;
+            U32 points_size = (U32)nb_points * POLYREC_POINT_SIZE;
             const U8 *points_data = read_bytes(&reader, points_size);
 
             if (points_data && nb_points > 0 && (start_after < 0 || (int)draw_count >= start_after)) {
@@ -309,7 +309,8 @@ int polyrec_replay_run(const char *polyrec_file, const char *output_file,
                 U32 copy_count = (U32)nb_points;
                 if (copy_count > 64)
                     copy_count = 64;
-                memcpy(local_points, points_data, copy_count * 16);
+                for (U32 k = 0; k < copy_count; k++)
+                    polyrec_unpack_point(&local_points[k], points_data + k * POLYREC_POINT_SIZE);
 
                 /* Debug: dump input data before Fill_Poly */
                 if (debug_slopes && (int)draw_count + 1 >= debug_slopes_from && (int)draw_count + 1 <= debug_slopes_to) {
