@@ -56,10 +56,20 @@ static void SetLogicalPresentation(U32 resX, U32 resY) {
    SDL reads these when a window flagged SDL_WINDOW_OPENGL is created, so they
    must be set before every such creation (boot and runtime toggle alike). */
 static void SetGLContextAttributes(void) {
+#ifdef USE_GLES2
+    /* The ES profile is the whole request: on Android a desktop compatibility
+       profile has no EGL config behind it, so window creation fails and the
+       engine drops to the software renderer. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
+                        SDL_GL_CONTEXT_PROFILE_ES);
+#else
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,
                         SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16);
     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);

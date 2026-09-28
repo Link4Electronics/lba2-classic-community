@@ -35,7 +35,22 @@ per-API blocks with `##ifdef GL_ES` / `##ifdef GL_CORE` / `##ifdef SDL3GPU` /
   carries its shaders inline and picks the dialect at build time: `USE_GLES2`
   (defined by CMake for Android) selects the `#version 100` GLES header set,
   desktop keeps the `#version 110` GL 2.1 one. The source itself names no
-  platform, so desktop and Android share the draw code.
+  platform, so desktop and Android share the draw code. Under the GLES
+  dialect the window asks SDL for an ES 2.0 context
+  (`../LIB386/SYSTEM/WINDOW.CPP`) — a desktop compatibility profile has no
+  EGL config behind it on Android, so the request itself is what makes the
+  backend creatable there — and the fragment shaders take `highp` where the
+  driver offers it, because mediump is fp16 on real mobile GPUs and fp16
+  atlas coordinates quantise to whole texels. Two GLES 2.0 gaps are probed
+  per context and each has a CPU-side substitute rather than a failed frame:
+  a driver with no BGRA texel source (`GL_EXT_texture_format_BGRA8888`)
+  swizzles the palette and present rows to RGBA, and one with no unpack row
+  stride (`GL_EXT_unpack_subimage`) repacks them tight. Two more have none —
+  GLES `glReadPixels` and `glCopyTexSubImage2D` read colour only — so the
+  backend offers no depth readback (the engine keeps the software Z-buffer)
+  and allocates no terrain depth snapshot (restore never sampled it). The
+  same dialect builds on a desktop host with `-DLBA2_GLES2=ON`, where an EGL
+  context runs the exact code Android does.
 - **SDL3 GPU** (`../LIB386/SDL3GPU/`) filters the shared sources and
   cross-compiles them to SPIR-V and (with shadercross/spirv-cross + dxc)
   MSL/DXIL at build time; a device selects its format at runtime and builds
@@ -166,9 +181,10 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   shades the real plate. The interior room plate
   (`AffGrille_BuildScreenPlate`, `../SOURCES/GRILLE.CPP`) needs no yield
   of its own — `s_swPlateBricks` forces AffGraph, which never enters
-  `Fill_Poly` — and neither plate is built per frame any more: the
+  `Fill_Poly` — and `AFF_ALL` builds it in place of mirroring `Log` (see
+  the `GpuScene` Log/Screen rules below), so beyond that frame only the
   inventory wheel and the behaviour (CTRL) modal (`MenuComportement`,
-  `../SOURCES/COMPORTE.CPP`) each rebuild into `Screen` on open
+  `../SOURCES/COMPORTE.CPP`) rebuild into `Screen`, each on open
   (exterior terrain plate, interior room plate under
   `GpuRenderer_IsSceneInterior()`, both skipped for the cleanroom
   `--black-bg` golden) then `CopyScreen(Screen, Log)`, so
@@ -255,8 +271,8 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   wins regardless of grid draw order and later sprites can test against
   the nearest room surface. Interior body/NZW batches under the same
   mark force depth-test and depth-write off (`TYPE_ISO` leaves `Pt_ZO`
-  untouched; the front-wall re-blit remains the only body occlusion,
-  submitted as a no-depth quad by `GpuRenderer_DrawBrickOver`).
+  untouched; the front-wall re-blit pasted into the `Log` above them
+  remains the body occlusion).
   Exterior keeps the terrain-only depth scheme and never draws brick
   quads. `InitGrille` calls `GpuRenderer_SetBrickBank` after
   `LoadUsedBrick`; `FreeGrille` passes NULL. Successful enqueues arm
@@ -264,38 +280,35 @@ path untouched and the ASM equivalence tests free of GPU dependencies:
   resets), the interior half of the body/NZW intake gate. With the flag
   off, or on the software path, every hook falls through to `AffGraph`
   unchanged. With the flag on, interior bodies and the 3D pass join the
-  FBO (see 3D pass above); `DrawOverBrick`'s front-wall re-blits join them
-  as no-depth brick quads (`GpuRenderer_DrawBrickOver`), while `CopyMask`
-  — the fallback whenever the backend declines — plus Z-masks and HUD stay
-  in the Log.
+  FBO (see 3D pass above), while the front-wall re-blit, Z-masks and HUD
+  stay in the Log.
 
-  Two Log/Screen rules keep that split correct. The re-blit no longer
-  needs a plate: `CopyMask` copies wall pixels **from `Screen`** into
-  `Log` over the body, and with the flag on `Cls` leaves `Log` empty while
-  `RefreshGrille` paints only the FBO, so `AFF_ALL` used to rebuild a
-  software plate every frame
-  ([`AffGrille_BuildScreenPlate`](../SOURCES/GRILLE.CPP), one forced
-  `AffGraph` pass under `GpuRenderer_IsSceneInterior()`). `DrawOverBrick`,
-  `DrawOverBrick3` and `DrawOverBrickCage` now call
-  [`GpuRenderer_DrawBrickOver`](../LIB386/COMMON/GPURENDERER_COMMON.CPP),
-  which re-submits the brick's own quad —
-  batched as `GPU_BRICKOVER_TYPE`: no depth test or write, so it lands
-  over the body in batch order exactly as the mask-gated copy did — and
-  returns FALSE, leaving `CopyMask` in charge, when the flag is off, no
-  backend is live, or the pack fails. The mask bank is redundant for the
-  quad: `CalcGraphMsk` derives it from the brick's own RLE spans, which
-  the atlas valid channel already encodes in G, so the fragment's
-  `G == 0` discard is the same gate. With the re-blit off `Screen`,
-  `AFF_ALL` mirrors the empty `Log` into `Screen` (`CopyScreen(Log,
-  Screen)`, the exterior contract), and the two 2D modals that shade
-  through `Screen` rebuild a plate on demand: `AffGrille_BuildScreenPlate`
-  from the inventory wheel and the behaviour modal, each gated on
-  `GpuRenderer_IsSceneInterior()`. And `BoxClean` / `DefaultBoxOneClean`
-  restores `Screen`→`Log` by default, which would paint that plate over
-  FBO bodies in the dirty regions — `AffScene` sets `BoxOneClean` to
-  `DefaultBoxOneClear` (clear to 0) under the same interior rule, back to
-  the default otherwise, so mid-dialog `BoxClean` callers inherit it. Both
-  rules are dead with the flag off.
+  Two Log/Screen rules keep that split correct. The re-blit is a
+  `CopyMask` paste: `DrawOverBrick`, `DrawOverBrick3` and
+  `DrawOverBrickCage` all funnel through `ReBlitOverActorBrick`
+  (`../SOURCES/GRILLE.CPP`), which copies wall pixels **from `Screen`**
+  into `Log` over the body — and over any sprite the same frames drew
+  there, so the wall sits in front of both, exactly as in software. `BufferMaskBrick` gates which texels the paste writes and
+  `Screen` supplies the composited room, so where two bricks overlap on
+  screen the plate holds the depth-winning neighbour rather than the
+  re-blit brick's own spans. `Screen` therefore has to hold that plate:
+  with the flag on `Cls` leaves `Log` empty while `RefreshGrille` paints
+  only the FBO, so `AFF_ALL` calls
+  [`AffGrille_BuildScreenPlate`](../SOURCES/GRILLE.CPP) — one forced
+  `AffGraph` pass under `GpuRenderer_IsSceneInterior()` — instead of the
+  `CopyScreen(Log, Screen)` mirror the exterior path runs, and the two 2D
+  modals that shade through `Screen` rebuild a plate on demand
+  (`AffGrille_BuildScreenPlate` from the inventory wheel and the behaviour
+  modal, each gated on the same interior rule). And `BoxClean` /
+  `DefaultBoxOneClean` restores `Screen`→`Log` by default, which would
+  paint that plate over FBO bodies in the dirty regions — `AffScene` sets
+  `BoxOneClean` to `DefaultBoxOneClear` (clear to 0) under the same
+  interior rule, back to the default otherwise, so mid-dialog `BoxClean`
+  callers inherit it. The clear costs `OBJ_BACKGROUND` objects their
+  baked copy — `AFF_OBJETS` skips them in software because `BoxClean`
+  restores what `AFF_ALL` baked — so under the same interior rule
+  `AffScene` draws them like any other object. All of it is dead with the
+  flag off.
 
 - **`GpuScene` and opaque world sprites.** With the flag on, the three
   world-sprite sites in `AffOneObject` (`../SOURCES/OBJECT.CPP` —

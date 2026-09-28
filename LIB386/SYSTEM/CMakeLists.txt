@@ -10,6 +10,14 @@ set(SOURCES_FILES_ASM CPU.CPP FASTCPYF.CPP LZ.CPP MOUSEDAT.CPP)
 add_library(sys ${SOURCES_FILES} ${SOURCES_FILES_ASM})
 target_link_libraries(sys svg)
 
+if(ANDROID OR LBA2_GLES2)
+    # WINDOW.CPP asks for the context profile the GL dialect compiles against,
+    # so it is built under the same dialect macro LIB386/GL/CMakeLists.txt
+    # defines: the selection stays a build decision in CMake (arch-check
+    # rule 3), never a platform test in the source.
+    target_compile_definitions(sys PRIVATE USE_GLES2)
+endif()
+
 # Configure all ASM files to be recognized as such (workaround for bug where .ASM uppercase extension is not recognized)
 # foreach (FILE_ASM IN LISTS SOURCES_FILES_ASM)
 #     set_source_files_properties(${FILE_ASM} PROPERTIES LANGUAGE ASM_MASM)

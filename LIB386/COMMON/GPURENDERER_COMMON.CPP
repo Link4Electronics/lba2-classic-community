@@ -191,11 +191,6 @@ static const void *s_uploadedAtlas = NULL;
    poly intake never sees it, and Common_BuildDrawParams maps it to
    polyMode 7. */
 #define GPU_BRICK_TYPE 0x7FFF
-/* Same quad and atlas as GPU_BRICK_TYPE, batched separately because it takes
-   no depth: CopyMask, the software re-blit it replaces, overwrites Log
-   unconditionally, and a GEQUAL test against the room's own depth would drop
-   a wall in front of a body whenever a nearer brick owns that texel. */
-#define GPU_BRICKOVER_TYPE 0x7FFD
 #define GPU_BRICK_ATLAS_W 2048
 #define GPU_BRICK_ATLAS_H 2048
 
@@ -626,17 +621,12 @@ static void Common_BuildDrawParams(GpuDrawParams *out) {
        bricks additionally write iso GEQUAL depth so the nearer brick wins
        regardless of grid draw order and later sprites can test against the
        nearest room surface; exterior never draws brick quads, so without
-       the interior mark keep the plain no-depth batch. A front-wall
-       re-blit (GPU_BRICKOVER_TYPE) takes no depth at all in either mark:
-       it must land over the body unconditionally, exactly as the software
-       CopyMask did, and must leave the room pass's depth for the re-blits
-       that follow it. */
-    if (s_currentTypePoly == GPU_BRICK_TYPE || s_currentTypePoly == GPU_BRICKOVER_TYPE) {
+       the interior mark keep the plain no-depth batch. */
+    if (s_currentTypePoly == GPU_BRICK_TYPE) {
         out->polyMode = 7;
         out->bilinear = 0;
         out->spriteAtlas = 0;
-        out->depthTest =
-            (s_currentTypePoly == GPU_BRICK_TYPE && s_sceneInterior) ? 1 : 0;
+        out->depthTest = s_sceneInterior ? 1 : 0;
         out->depthWrite = out->depthTest;
         out->screenScale[0] = s_screenScale[0];
         out->screenScale[1] = s_screenScale[1];
@@ -995,14 +985,10 @@ void GpuRenderer_SetBrickBank(const void *bank) {
     s_uploadedBrickAtlas = NULL;
 }
 
-/* Shared body of DrawBrick / DrawBrickOver: pack the brick, clip its rect to
-   the live window and enqueue the quad. over selects the re-blit variant —
-   batched as GPU_BRICKOVER_TYPE (no depth) and it must not publish the
-   unclipped rect in ScreenXMin/Max, because the caller is mid-object and
-   reads back the sprite it has just drawn. The room pass does publish:
-   AffOneBrick accumulates those bounds after AffBrickBlockOnly returns. */
-static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo,
-                                  S32 over) {
+/* Pack the brick, clip its rect to the live window and enqueue the quad. The
+   unclipped rect goes to ScreenXMin/Max: AffOneBrick accumulates those bounds
+   after AffBrickBlockOnly returns. */
+static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo) {
     const U32 *offsets;
     const U8 *data;
     S32 hotX, hotY, deltaX, nbLine;
@@ -1010,7 +996,6 @@ static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo,
     S32 u0, v0, u1, v1;
     const GpuBrickRect *rect;
     GpuVertex *v;
-    U32 typePoly;
 
     if (!s_active || !GpuScene || s_brickBank == NULL) {
         return 0;
@@ -1039,12 +1024,10 @@ static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo,
     y0 = y + hotY;
     x1 = x0 + deltaX - 1;
     y1 = y0 + nbLine - 1;
-    if (!over) {
-        ScreenXMin = x0;
-        ScreenYMin = y0;
-        ScreenXMax = x1;
-        ScreenYMax = y1;
-    }
+    ScreenXMin = x0;
+    ScreenYMin = y0;
+    ScreenXMax = x1;
+    ScreenYMax = y1;
 
     cx0 = (x0 < ClipXMin) ? ClipXMin : x0;
     cy0 = (y0 < ClipYMin) ? ClipYMin : y0;
@@ -1057,16 +1040,15 @@ static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo,
     Common_UploadPalette();
     Common_UploadBricks();
 
-    typePoly = over ? (U32)GPU_BRICKOVER_TYPE : (U32)GPU_BRICK_TYPE;
     if (s_batchVertCount > 0) {
-        if (s_currentTypePoly != typePoly ||
+        if (s_currentTypePoly != (U32)GPU_BRICK_TYPE ||
             s_batchAtlas != (const void *)s_brickAtlasData ||
             s_batchClipX0 != ClipXMin || s_batchClipY0 != ClipYMin ||
             s_batchClipX1 != ClipXMax || s_batchClipY1 != ClipYMax) {
             GpuRenderer_FlushBatch();
         }
     }
-    s_currentTypePoly = typePoly;
+    s_currentTypePoly = (U32)GPU_BRICK_TYPE;
     s_currentColorPoly = 0;
     s_batchAtlas = (const void *)s_brickAtlasData;
     s_batchCLUTGouraud = NULL;
@@ -1135,16 +1117,7 @@ static S32 Common_SubmitBrickQuad(S32 brickIdx, S32 x, S32 y, U16 zo,
 }
 
 S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
-    return Common_SubmitBrickQuad(brickIdx, x, y, zo, 0);
-}
-
-S32 GpuRenderer_DrawBrickOver(S32 brickIdx, S32 x, S32 y, U16 zo) {
-    /* Interior only: elsewhere DrawOverBrick does not run, and a stray
-       enqueue would overpaint the exterior terrain pass. */
-    if (!s_sceneInterior) {
-        return 0;
-    }
-    return Common_SubmitBrickQuad(brickIdx, x, y, zo, 1);
+    return Common_SubmitBrickQuad(brickIdx, x, y, zo);
 }
 
 //──────────────────────────────────────────────────────────────────────────
@@ -2735,13 +2708,6 @@ void GpuRenderer_ShadowSpan(S32 x0, S32 y, S32 x1) {
 void GpuRenderer_ShadowEnd(void) {}
 void GpuRenderer_SetBrickBank(const void *bank) { (void)bank; }
 S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo) {
-    (void)brickIdx;
-    (void)x;
-    (void)y;
-    (void)zo;
-    return 0;
-}
-S32 GpuRenderer_DrawBrickOver(S32 brickIdx, S32 x, S32 y, U16 zo) {
     (void)brickIdx;
     (void)x;
     (void)y;

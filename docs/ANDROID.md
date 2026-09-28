@@ -367,9 +367,15 @@ theme also styles the dialogs SDL builds against the activity.
 
 ## Limitations
 
-- **Software renderer**: The game uses a software 8-bit→ARGB pipeline.
-  Performance on modern ARM64 devices is acceptable at 640x480.
+- **Software renderer**: The default. The game uses a software 8-bit→ARGB
+  pipeline. Performance on modern ARM64 devices is acceptable at 640x480.
   On older 32-bit ARM (armeabi-v7a) devices, expect lower framerates.
+- **GPU renderers**: Both are selectable (`Renderer` in lba2.cfg, or the
+  Display menu) and fall back to the software renderer when the device
+  cannot create them. The OpenGL backend compiles as GLES 2.0 — that is the
+  only GL Android has — and asks for an ES 2.0 context, so it runs on devices
+  with neither desktop GL nor Vulkan; see the backend section of
+  [RENDERER.md](RENDERER.md). The SDL3 GPU backend needs Vulkan.
 - **CD audio**: CD-ROM music tracks are not available. Use the digital
   sample backend (`SOUND_BACKEND=sdl`).
 - **Text input**: Console commands still require a hardware keyboard. Save-game

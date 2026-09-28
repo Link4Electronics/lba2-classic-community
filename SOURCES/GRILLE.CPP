@@ -32,8 +32,8 @@ S16 NbBrickColon[NB_COLON];
 
 /* When set, AffBrickBlock / AffBrickBlockOnly force the software AffGraph
    path and skip GpuRenderer_DrawBrick. AffGrille_BuildScreenPlate sets this
-   so the on-demand Screen plate (2D modals) rasterizes without submitting a
-   second FBO batch. */
+   so the Screen plate (AFF_ALL under GpuScene, and the 2D modals) rasterizes
+   without submitting a second FBO batch. */
 static S32 s_swPlateBricks = 0;
 
 typedef struct
@@ -674,21 +674,16 @@ void InitBufferCube() {
  *══════════════════════════════════════════════════════════════════════════*/
 /*──────────────────────────────────────────────────────────────────────────*/
 
-/* Recouvrement: paint one front-wall brick over the actor. Under GpuScene
-   the interior room lives in the FBO and Screen carries no plate on a normal
-   frame, so the same brick quad is submitted again after the body — batch
-   order is paint order, and bodies take no depth so the wall lands on top.
-   The mask bank contributes nothing the atlas does not already hold:
-   CalcGraphMsk derives it from the brick's own RLE spans, which the atlas
-   encodes in G, so the shader's G == 0 discard is CopyMask's gate. Whenever
-   the backend declines (flag off, no backend, pack failure) CopyMask runs
-   exactly as before. */
+/* Recouvrement: paste one front-wall brick over the actor. The source is the
+   software room plate in Screen — the composited room, which is the pixel the
+   wall must show: where two bricks overlap on screen the plate holds the
+   depth-winning neighbour, not necessarily this brick's own texels. The paste
+   lands in Log, so it sits above Log sprites and FBO bodies alike, which is
+   what puts the wall in front of the actor when the room is batched into the
+   FBO. Screen keeps that plate because AffScene rebuilds it at AFF_ALL under
+   GpuRenderer_IsSceneInterior (Cls leaves Log empty there, and mirroring an
+   empty Log would paste zeros over the actor). */
 static void ReBlitOverActorBrick(const T_COLONB *ptrlbc) {
-    if (GpuRenderer_DrawBrickOver(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys,
-                                  GpuRenderer_IsoWorldZO(ptrlbc->Xm, ptrlbc->Ym,
-                                                         ptrlbc->Zm))) {
-        return;
-    }
     CopyMask(ptrlbc->Brick, ptrlbc->Xs, ptrlbc->Ys, BufferMaskBrick, Screen);
 }
 
@@ -1145,12 +1140,14 @@ void AffGrilleLabyrinthe() {
     }
 }
 
-/* Rebuild the software room into Screen for the 2D modals that shade through
-   it (inventory wheel, behaviour panel), then clear Log so the present shows
-   the FBO room through the overlay. A normal frame needs no plate — DrawOverBrick
-   re-blits its front walls as FBO quads — so AFF_ALL never calls this; the
-   callers that do are under GpuRenderer_IsSceneInterior(). The plate pass
-   forces AffGraph so no second FBO batch is submitted. */
+/* Rebuild the software room into Screen — the plate ReBlitOverActorBrick
+   pastes front walls out of, and the buffer the 2D modals that shade through
+   Screen (inventory wheel, behaviour panel) expect to find. Then clear Log so
+   the present shows the FBO room through the overlay. Callers are under
+   GpuRenderer_IsSceneInterior(): AFF_ALL builds it in place of mirroring Log
+   (Cls left Log empty, so a mirror would hand the re-blit zeros), and the
+   modals rebuild it on demand after shading through it. The plate pass forces
+   AffGraph so no second FBO batch is submitted. */
 void AffGrille_BuildScreenPlate(void) {
     s_swPlateBricks = 1;
     if (ModeLabyrinthe) {

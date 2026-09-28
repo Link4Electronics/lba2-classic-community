@@ -80,6 +80,12 @@ option(LBA2_NATIVE_ARCH "Use -march=native for host-optimized build (not portabl
 # renderer as the default at runtime; see docs/ (GPU renderer).
 option(GPURENDERER "Build the GPU renderer backends (OpenGL + SDL3 GPU)" ON)
 
+# GL dialect: GLES 2.0 instead of desktop GL 2.1. Android builds it always —
+# it is the only GL that platform has. LBA2_GLES2 forces the same dialect on a
+# desktop host, where an EGL context (Mesa) runs the exact compile, context
+# creation, capability probes and upload paths the Android build runs.
+option(LBA2_GLES2 "Build the GL backend in the GLES 2.0 dialect" OFF)
+
 # Release packaging — static-link SDL3 and the GCC runtime so the binary
 # has no DLL dependencies beyond OS libraries. Used by the Windows release
 # workflow (single-exe portable ZIP). Default OFF; dev workflows keep the

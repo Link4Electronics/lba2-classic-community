@@ -5649,12 +5649,16 @@ startaffscene:
         ChangeIncrustPos(oldxporg, oldyporg, XpOrgw, YpOrgw);
         //			HQ_ChangeBalanceSamples( oldxporg, oldyporg ) ;
 
-        /* The FBO holds the room and Cls left Log empty of it, so Screen
-           mirrors Log — the same contract the exterior path runs on. The
-           front-wall re-blit no longer reads Screen (DrawOverBrick submits
-           those bricks into the FBO after the body), and the 2D modals that
-           shade through Screen rebuild a plate on demand. */
-        CopyScreen(Log, Screen);
+        /* The front-wall re-blit pastes wall pixels out of Screen (CopyMask),
+           so Screen has to hold the composited room. With the room batched
+           into the FBO, Cls left Log empty and mirroring it would hand
+           DrawOverBrick zeros to paint over the body; the software plate pass
+           rebuilds the same composite the software path would have in Screen.
+           The 2D modals that shade through Screen rebuild it on demand. */
+        if (GpuRenderer_IsSceneInterior())
+            AffGrille_BuildScreenPlate();
+        else
+            CopyScreen(Log, Screen);
 
         /* The GPU backend draws the exterior terrain into its own target, so
            its depth is read back for the object pass's ZBufBoxOverWrite2 test;
@@ -5727,7 +5731,16 @@ startaffscene:
             if ((Xp > VIEW_X0) AND(Xp < VIEW_X1) AND(Yp > VIEW_Y0) AND(Yp < VIEW_Y1)) {
                 ptrobj->WorkFlags |= WAS_DRAWN;
             }
-            continue;
+
+            /* The bake on the AFF_ALL frame copies this object into Screen, and
+               BoxClean puts Screen back into Log, which is what keeps an object
+               that these frames skip visible afterwards. GpuRenderer_IsSceneInterior
+               is the mark where BoxClean clears Log instead (the room lives in the
+               FBO and Screen may hold a modal plate), so there nothing restores
+               the baked copy and the object has to be drawn like any other. */
+            if (!GpuRenderer_IsSceneInterior()) {
+                continue;
+            }
         }
 
         if ((ptrobj->Obj.Body.Num == -1)

@@ -59,11 +59,55 @@ S32 AtlasTextureDirty = 0;
 #define FMT_BGRA 0x80E1 /* GL_BGRA_EXT */
 #endif
 
+/* ── Dialect capability probes ────────────────────────────────────────────
+   GLES 2.0 core has no unpack row stride (it arrives with
+   GL_EXT_unpack_subimage, under the *_EXT token) and no BGRA texel source
+   (GL_EXT_texture_format_BGRA8888). Desktop GL has both outright, so it
+   never probes: the flags stay 1 and every upload below takes the same path
+   it always did. A GLES driver missing either gets the CPU-side upload
+   instead of a dropped frame — probed once per context. */
+static S32 s_capsBgra = 1;      /* BGRA texel sources accepted as-is */
+static S32 s_capsRowLength = 1; /* unpack row stride expressible */
+
+#ifdef USE_GLES2
+#define UNPACK_ROW_LENGTH GL_UNPACK_ROW_LENGTH_EXT
+#else
+#define UNPACK_ROW_LENGTH GL_UNPACK_ROW_LENGTH
+#endif
+
+/* Source format for a texture whose engine-side bytes are BGRA: native on a
+   driver with the extension, GL_RGBA for one that only takes RGBA (the
+   callers then swizzle — see SwizzleBGRAtoRGBA). With no data at allocation
+   time this only has to be a format the context accepts. */
+static GLenum BgraSrcFormat(void) {
+    return s_capsBgra ? (GLenum)FMT_BGRA : (GLenum)GL_RGBA;
+}
+
+/* 0xAARRGGBB is [B, G, R, A] in memory; GL_RGBA reads that as B and R
+   swapped. Rewrites a caller-owned copy — never engine palette state. */
+static void SwizzleBGRAtoRGBA(U32 *pixels, U32 count) {
+    U32 i;
+    for (i = 0; i < count; i++) {
+        const U32 v = pixels[i];
+        pixels[i] = (v & 0xFF00FF00u) | ((v & 0x000000FFu) << 16) |
+                    ((v & 0x00FF0000u) >> 16);
+    }
+}
+
 /* ── Shader sources (GL 2.1 / GLES 2.0 compatible) ─────────────────────── */
 
 #ifdef USE_GLES2
 #define GLSL_VERT_HEADER "#version 100\n"
-#define GLSL_FRAG_HEADER "#version 100\nprecision mediump float;\n"
+/* Highp where the fragment stage offers it — mediump is fp16 on real mobile
+   GPUs, and fp16 atlas coordinates quantise to whole texels at this atlas
+   size. Drivers without highp still get a working mediump shader. */
+#define GLSL_FRAG_HEADER                  \
+    "#version 100\n"                      \
+    "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" \
+    "precision highp float;\n"            \
+    "#else\n"                             \
+    "precision mediump float;\n"          \
+    "#endif\n"
 #else
 #define GLSL_VERT_HEADER "#version 110\n"
 #define GLSL_FRAG_HEADER "#version 110\n"
@@ -486,6 +530,9 @@ static U32 s_blendDstW = 0;
 static U32 s_blendDstH = 0;
 static U8 *s_blendReadback = NULL; /* rect staging for TargetCopyColorRect */
 static U32 s_blendReadbackBytes = 0;
+static U8 *s_uploadScratch = NULL; /* repacked present rows (GLES drivers
+                                      without a row stride or BGRA source) */
+static U32 s_uploadScratchBytes = 0;
 
 /* ── GL state — batch VBO ───────────────────────────────────────────────── */
 
@@ -537,6 +584,8 @@ static const GLfloat s_fboQuadVerts[] = {
 static GLuint CompileShader(GLenum type, const char *src) {
     GLuint shader = glCreateShader(type);
     if (shader == 0) {
+        Log_Warn("[GL] glCreateShader failed (%s)",
+                 type == GL_VERTEX_SHADER ? "vertex" : "fragment");
         return 0;
     }
     glShaderSource(shader, 1, &src, NULL);
@@ -545,6 +594,14 @@ static GLuint CompileShader(GLenum type, const char *src) {
     GLint ok = 0;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
     if (!ok) {
+        /* The driver is the only one who knows which line of this dialect's
+           source it rejected; without the log a failed context looks like a
+           bare "CreateContext failed". */
+        char info[512];
+        info[0] = '\0';
+        glGetShaderInfoLog(shader, sizeof(info), NULL, info);
+        Log_Warn("[GL] %s shader compile failed: %s",
+                 type == GL_VERTEX_SHADER ? "vertex" : "fragment", info);
         glDeleteShader(shader);
         return 0;
     }
@@ -563,6 +620,10 @@ static GLuint LinkProgram(GLuint vert, GLuint frag) {
     GLint ok = 0;
     glGetProgramiv(prog, GL_LINK_STATUS, &ok);
     if (!ok) {
+        char info[512];
+        info[0] = '\0';
+        glGetProgramInfoLog(prog, sizeof(info), NULL, info);
+        Log_Warn("[GL] program link failed: %s", info);
         glDeleteProgram(prog);
         return 0;
     }
@@ -650,6 +711,12 @@ static void GL_CreateFBO(U32 width, U32 height) {
                  GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
 
+#ifndef USE_GLES2
+    /* GLES 2.0 has no depth copy — glCopyTexSubImage2D reads the colour
+       attachment there — so a depth texture would be allocated and never
+       written. Nothing samples it (restore paints colour only), so the
+       dialect simply skips it; the s_terrainDepthTex test in the snapshot
+       keeps the copy out. */
     glGenTextures(1, &s_terrainDepthTex);
     glBindTexture(GL_TEXTURE_2D, s_terrainDepthTex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -659,9 +726,36 @@ static void GL_CreateFBO(U32 width, U32 height) {
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, (GLsizei)width,
                  (GLsizei)height, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
+#endif
 }
 
 /* ── Context lifecycle ──────────────────────────────────────────────────── */
+
+#ifdef USE_GLES2
+/* Whole-token search of the context's extension string: a bare strstr would
+   report GL_FOO_bar when asked for GL_FOO. */
+static S32 GL_ExtensionPresent(const char *name) {
+    const char *exts = (const char *)glGetString(GL_EXTENSIONS);
+    const size_t len = strlen(name);
+    const char *p = exts;
+
+    if (p == NULL || len == 0) {
+        return 0;
+    }
+    while (*p != '\0') {
+        while (*p == ' ') {
+            p++;
+        }
+        if (strncmp(p, name, len) == 0 && (p[len] == ' ' || p[len] == '\0')) {
+            return 1;
+        }
+        while (*p != '\0' && *p != ' ') {
+            p++;
+        }
+    }
+    return 0;
+}
+#endif
 
 static S32 GL_CreateContext(U32 resX, U32 resY) {
     if (s_initialized) {
@@ -676,6 +770,20 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     }
 
     Log_Info("[GL] Initializing renderer (%ux%u)...", resX, resY);
+
+#ifdef USE_GLES2
+    /* Probed with the context current, before the first upload consults them.
+       Both features have a CPU-side substitute below; the log says which one
+       this driver will run. */
+    s_capsBgra = GL_ExtensionPresent("GL_EXT_texture_format_BGRA8888");
+    s_capsRowLength = GL_ExtensionPresent("GL_EXT_unpack_subimage");
+    Log_Info("[GL] GLES 2.0 dialect: BGRA sources %s, row-stride uploads %s",
+             s_capsBgra ? "native" : "CPU swizzle",
+             s_capsRowLength ? "native" : "CPU repack");
+    Log_Info("[GL] GLES 2.0 dialect: no depth readback (glReadPixels takes "
+             "colour only) and no terrain depth snapshot (glCopyTexSubImage2D "
+             "reads colour only)");
+#endif
 
     /* ── Compile present shader ── */
     GLuint vert = CompileShader(GL_VERTEX_SHADER, s_vertSrc);
@@ -801,7 +909,7 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, FMT_BGRA,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, BgraSrcFormat(),
                  GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -816,7 +924,7 @@ static S32 GL_CreateContext(U32 resX, U32 resY) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, FMT_BGRA,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 1, 0, BgraSrcFormat(),
                  GL_UNSIGNED_BYTE, NULL);
     glBindTexture(GL_TEXTURE_2D, 0);
 
@@ -995,8 +1103,16 @@ static U32 GL_TargetHeight(void) {
 
 /* Raw depth readback. Rows come back bottom-up; the common layer flips them
    and applies the aZ inverse. Readable whenever the FBO has a depth buffer,
-   so the result is FALSE only when there is none to read. */
+   so the result is FALSE only when there is none to read — or, on GLES, when
+   the API has no depth readback to give. */
 static S32 GL_TargetReadDepth(void *depthDst, U32 width, U32 height) {
+#ifdef USE_GLES2
+    /* GLES 2.0's glReadPixels accepts colour formats only. */
+    (void)depthDst;
+    (void)width;
+    (void)height;
+    return FALSE;
+#else
     if (!s_initialized || !s_fbo || depthDst == NULL) {
         return FALSE;
     }
@@ -1007,6 +1123,7 @@ static S32 GL_TargetReadDepth(void *depthDst, U32 width, U32 height) {
     glReadPixels(0, 0, (GLsizei)width, (GLsizei)height, GL_DEPTH_COMPONENT,
                  GL_UNSIGNED_SHORT, depthDst);
     return TRUE;
+#endif
 }
 
 /* Raw colour readback: U32 0x00RRGGBB, bottom-up (GL origin). The common
@@ -1061,9 +1178,13 @@ static S32 GL_TargetSnapshotTerrain(void) {
     glBindTexture(GL_TEXTURE_2D, s_terrainColorTex);
     glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
                         (GLsizei)s_fboWidth, (GLsizei)s_fboHeight);
-    glBindTexture(GL_TEXTURE_2D, s_terrainDepthTex);
-    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
-                        (GLsizei)s_fboWidth, (GLsizei)s_fboHeight);
+    /* Absent when the dialect has no depth copy (see GL_CreateFBO): the
+       colour restore below is the one that scrubs the frame. */
+    if (s_terrainDepthTex) {
+        glBindTexture(GL_TEXTURE_2D, s_terrainDepthTex);
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0,
+                            (GLsizei)s_fboWidth, (GLsizei)s_fboHeight);
+    }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glBindTexture(GL_TEXTURE_2D, 0);
     return TRUE;
@@ -1175,11 +1296,19 @@ static void GL_TexUpdatePalette(const void *argb) {
         sceneCopy[i] = (lut[i] & 0x00FFFFFFu) | ((U32)i << 24);
     }
 
+    /* A driver without the BGRA extension reads RGBA instead: swap the two
+       colour bytes in the copies above (never in the engine's LUT). */
+    if (!s_capsBgra) {
+        SwizzleBGRAtoRGBA(paletteCopy, 256);
+        SwizzleBGRAtoRGBA(sceneCopy, 256);
+    }
     glBindTexture(GL_TEXTURE_2D, s_paletteTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, FMT_BGRA,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                    s_capsBgra ? (GLenum)FMT_BGRA : (GLenum)GL_RGBA,
                     GL_UNSIGNED_BYTE, paletteCopy);
     glBindTexture(GL_TEXTURE_2D, s_clutPaletteTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1, FMT_BGRA,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                    s_capsBgra ? (GLenum)FMT_BGRA : (GLenum)GL_RGBA,
                     GL_UNSIGNED_BYTE, sceneCopy);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
@@ -1440,8 +1569,8 @@ static void GL_TexUpdatePresent(const void *pixels, U32 pitch, U32 width,
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
                             linear ? GL_LINEAR : GL_NEAREST);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei)width,
-                         (GLsizei)height, 0, FMT_BGRA, GL_UNSIGNED_BYTE,
-                         NULL);
+                         (GLsizei)height, 0, BgraSrcFormat(),
+                         GL_UNSIGNED_BYTE, NULL);
         }
         s_texWidth = width;
         s_texHeight = height;
@@ -1474,21 +1603,64 @@ static void GL_TexUpdatePresent(const void *pixels, U32 pitch, U32 width,
            arbitrary, so no row start is guaranteed 4-byte aligned: upload
            byte-aligned and restore the GL default afterwards (same pairing
            the atlas uploads use). */
+        const U32 bpp = indexed ? 1u : 4u;
+        const U8 *src =
+            (const U8 *)pixels + (size_t)rectY * pitch + (size_t)rectX * bpp;
+        const U32 rowBytes = (U32)rectW * bpp;
+        const U32 rows = (U32)rectH;
+        const GLenum format =
+            indexed ? (GLenum)GL_LUMINANCE
+                    : (s_capsBgra ? (GLenum)FMT_BGRA : (GLenum)GL_RGBA);
+        GLint rowLength = (GLint)(pitch / bpp);
+
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        if (indexed) {
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)pitch);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, rectX, rectY, rectW, rectH,
-                            GL_LUMINANCE, GL_UNSIGNED_BYTE,
-                            (const U8 *)pixels + (size_t)rectY * pitch +
-                                (size_t)rectX);
-        } else {
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4));
-            glTexSubImage2D(GL_TEXTURE_2D, 0, rectX, rectY, rectW, rectH,
-                            FMT_BGRA, GL_UNSIGNED_BYTE,
-                            (const U8 *)pixels + (size_t)rectY * pitch +
-                                (size_t)rectX * 4);
+        if (!s_capsRowLength || (!indexed && !s_capsBgra)) {
+            /* No row stride to express, or a BGRA source the driver will not
+               take: repack the rect tight (and swap R/B) into one buffer and
+               upload that — one glTexSubImage2D either way. */
+            const U32 need = rowBytes * rows;
+            U32 row;
+            if (s_uploadScratchBytes < need) {
+                free(s_uploadScratch);
+                s_uploadScratch = (U8 *)malloc(need);
+                s_uploadScratchBytes = s_uploadScratch ? need : 0;
+            }
+            if (s_uploadScratch == NULL) {
+                rowLength = -1; /* nothing to upload; state still restored */
+            } else {
+                for (row = 0; row < rows; row++) {
+                    const U8 *srow = src + (size_t)row * pitch;
+                    U8 *drow = s_uploadScratch + (size_t)row * rowBytes;
+                    if (!indexed && !s_capsBgra) {
+                        /* The format chosen for this upload is GL_RGBA, so
+                           the copy is where the B and R bytes trade places;
+                           a BGRA-capable driver only loses the stride and
+                           keeps the source layout. */
+                        U32 x;
+                        for (x = 0; x + 3 < rowBytes; x += 4) {
+                            drow[x + 0] = srow[x + 2];
+                            drow[x + 1] = srow[x + 1];
+                            drow[x + 2] = srow[x + 0];
+                            drow[x + 3] = srow[x + 3];
+                        }
+                    } else {
+                        memcpy(drow, srow, rowBytes);
+                    }
+                }
+                src = s_uploadScratch;
+                rowLength = 0;
+            }
         }
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        if (rowLength > 0) {
+            glPixelStorei(UNPACK_ROW_LENGTH, rowLength);
+        }
+        if (rowLength >= 0) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, rectX, rectY, rectW, rectH,
+                            format, GL_UNSIGNED_BYTE, src);
+        }
+        if (rowLength > 0) {
+            glPixelStorei(UNPACK_ROW_LENGTH, 0);
+        }
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     }
 

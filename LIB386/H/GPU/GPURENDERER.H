@@ -144,17 +144,6 @@ void GpuRenderer_ShadowEnd(void);
 void GpuRenderer_SetBrickBank(const void *bank);
 S32 GpuRenderer_DrawBrick(S32 brickIdx, S32 x, S32 y, U16 zo);
 
-// Front-wall re-blit (DrawOverBrick*, GpuScene interiors): the very same
-// brick quad the room pass drew, submitted again after the body so it paints
-// over it, which is CopyMask's job without the Screen plate. The mask bank
-// is redundant here — CalcGraphMsk derives it from the same RLE spans the
-// atlas valid channel (G) encodes, so the fragment's G == 0 discard is
-// already CopyMask's gate. Only consumes under the interior mark (the caller
-// keeps CopyMask otherwise, and always when the flag is off); returns TRUE
-// when consumed. Unlike DrawBrick it never publishes ScreenXMin/Max — the
-// caller has just drawn a sprite and reads its rect back.
-S32 GpuRenderer_DrawBrickOver(S32 brickIdx, S32 x, S32 y, U16 zo);
-
 // Opaque world sprites (GpuScene phase 3). DrawSprite packs one sprite from
 // bank into the sprite RG8 atlas (R = palette index, G = valid; transparent
 // pixels and AffGraph RLE skips leave G = 0 so the shader discards) and
