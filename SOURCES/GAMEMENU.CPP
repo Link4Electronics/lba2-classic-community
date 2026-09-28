@@ -2701,8 +2701,9 @@ void Menu_MainCapture(const char *path) {
 
 /* Harness capture state — see Menu_RequestCapture() in GAMEMENU.H.  When the
    path is non-empty, DoGameMenu's modal loop counts down per iteration;
-   on reaching zero it SavePNGs and returns 1000 (the "ESC" sentinel) so the
-   wrapping menu loop (OptionsMenu, MainGameMenu, ...) sees a clean exit.
+   on reaching zero it writes the settled frame (Control_ScreenshotTo) and
+   returns 1000 (the "ESC" sentinel) so the wrapping menu loop
+   (OptionsMenu, MainGameMenu, ...) sees a clean exit.
    The countdown gives the menu's fade-in and any per-frame text/sprite
    animations time to settle into a steady visual state. */
 static char s_menu_capture_path[ADELINE_MAX_PATH] = "";
@@ -3159,15 +3160,17 @@ S32 DoGameMenu(U16 *ptrmenu) {
         }
 
         /* Harness one-shot capture: count down per iteration; on reaching
-           zero SavePNG the rendered menu and return the ESC sentinel so
-           the wrapping menu loop exits cleanly.  Read Log (back buffer),
-           not Screen -- DrawGameMenu composites the menu into Log, and the
-           BoxUpdate inside only flushes dirty regions to Screen; without a
-           prior frame populating Screen, the unflushed regions stay black.
-           The third surface to need this (after holomap and dialog). */
+           zero write the settled frame and return the ESC sentinel so
+           the wrapping menu loop exits cleanly.  The frame's Log half comes
+           from the back buffer, not Screen -- DrawGameMenu composites the
+           menu into Log, and the BoxUpdate inside only flushes dirty
+           regions to Screen; without a prior frame populating Screen, the
+           unflushed regions stay black. Under a GPU backend the same write
+           also composes the offscreen target (Control_ScreenshotTo), so the
+           capture carries the scene the menu is drawn over. The third
+           surface to need this (after holomap and dialog). */
         if (s_menu_capture_path[0] && --s_menu_capture_countdown <= 0) {
-            SavePNG(s_menu_capture_path, Log, (S32)ModeDesiredX,
-                    (S32)ModeDesiredY, PtrPal);
+            Control_ScreenshotTo(s_menu_capture_path);
             s_menu_capture_path[0] = '\0';
             AsciiMode = FALSE;
             return 1000;
@@ -3690,6 +3693,7 @@ S32 OptionsMenu(S32 flagflip) {
             /* Cleanroom golden — menu panel composites over solid black. */
             memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
             memset(Screen, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
+            Control_ClearCaptureTarget();
         } else {
             AffScene(AFF_ALL_NO_FLIP);
         }
@@ -4922,7 +4926,7 @@ void Credits(S32 mode) {
 
 /* Harness capture state — see SlideShow_RequestCapture() in GAMEMENU.H. When
    armed, SlideShow's main loop breaks out after the first frame's Dial returns
-   (Dial itself does the SavePNG via Dial_RequestCapture, which we arm
+   (Dial itself does the frame write via Dial_RequestCapture, which we arm
    alongside this flag). Same compose pattern as Menu_*Capture / Inv_*Capture. */
 static int s_slideshow_capture_active = 0;
 
@@ -4933,7 +4937,7 @@ void SlideShow_RequestCapture(const char *path) {
         return;
     }
     s_slideshow_capture_active = 1;
-    /* The actual SavePNG happens inside Dial's typewriter loop — same hook
+    /* The actual frame write happens inside Dial's typewriter loop — same hook
        used by `ui dialog`. We just need to break out of the slideshow loop
        after that fires so the harness doesn't iterate the remaining shots. */
     Dial_RequestCapture(path);
@@ -5004,8 +5008,8 @@ S32 SlideShow(void) {
 
         Dial(START_SLIDESHOW_TEXT + n, FALSE);
 
-        /* Harness: SlideShow_RequestCapture arms a one-shot SavePNG in Dial
-           above. After it fires, exit cleanly without iterating remaining
+        /* Harness: SlideShow_RequestCapture arms a one-shot frame write in
+           Dial above. After it fires, exit cleanly without iterating remaining
            shots so the harness's --exit can finish promptly. */
         if (s_slideshow_capture_active) {
             s_slideshow_capture_active = 0;

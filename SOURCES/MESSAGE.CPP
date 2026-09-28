@@ -2041,6 +2041,10 @@ void SpeakAnimation() {
             size_t bytes = (size_t)ModeDesiredX * (size_t)Dial_Y0;
             memset(Log, 0, bytes);
             memset(Screen, 0, bytes);
+            /* Full-screen, unlike the memsets above: the composed capture
+               reads the offscreen target, which is black behind the strip
+               below Dial_Y0 as well. */
+            Control_ClearCaptureTarget();
         } else {
             AffScene(AFF_OBJETS_NO_FLIP);
         }
@@ -2073,8 +2077,9 @@ void SpeakAnimation() {
 /* Harness capture state — definitions hoisted above SpeakAnimation; see the
    forward declarations there. The state machine: when the path is non-empty,
    Dial's typewriter loop counts down per iteration; on reaching zero it
-   SavePNGs and sets flagabort so Dial exits cleanly without waiting for
-   input. The countdown lets the typewriter draw substantial text before the
+   writes the settled frame (Control_ScreenshotTo) and sets flagabort so
+   Dial exits cleanly without waiting for input. The countdown lets the
+   typewriter draw substantial text before the
    snapshot — ~1 game-second at fixed-dt 16 is enough for most LBA2 dialogue
    lines. We don't gate on ret==0/2 because that fires the moment NextDialCar
    returns "page break" or "done", which on short or empty texts can be the
@@ -2139,6 +2144,7 @@ void Dial(S32 text, S32 drawscene) {
         /* Cleanroom golden — dialog box composites over solid black. */
         memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
         memset(Screen, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
+        Control_ClearCaptureTarget();
     } else if (FirstTime == AFF_ALL_FLIP) {
         AffScene(AFF_ALL_FLIP);
     } else if (!(FlagDial & (DIAL_BIG | DIAL_FUL | DIAL_EXP | DIAL_DEM))) {
@@ -2199,15 +2205,17 @@ void Dial(S32 text, S32 drawscene) {
         TestSpeak();
         SpeakAnimation();
 
-        /* Harness one-shot capture.  Read Log (back buffer), not Screen --
-           Dial's typewriter renders into Log via the dialogue compositor
-           and SpeakAnimation's BoxUpdate flushes a subset to Screen; the
-           full bubble + portrait + text live in Log.  Countdown-driven so
-           the typewriter has time to draw substantial text. */
+        /* Harness one-shot capture.  The frame's Log half comes from the
+           back buffer, not Screen -- Dial's typewriter renders into Log via
+           the dialogue compositor and SpeakAnimation's BoxUpdate flushes a
+           subset to Screen; the full bubble + portrait + text live in Log.
+           Under a GPU backend Control_ScreenshotTo composes the offscreen
+           target behind it, so the capture carries the scene too.
+           Countdown-driven so the typewriter has time to draw substantial
+           text. */
         if (s_dial_capture_path[0]) {
             if (--s_dial_capture_countdown <= 0 || ret == 0 || ret == 2) {
-                SavePNG(s_dial_capture_path, Log, (S32)ModeDesiredX,
-                        (S32)ModeDesiredY, PtrPal);
+                Control_ScreenshotTo(s_dial_capture_path);
                 s_dial_capture_path[0] = '\0';
                 flagabort = 1;
                 break;
@@ -2321,6 +2329,7 @@ S32 MyDial(S32 nummess) // attends une touche si autre page sinon continue
            across multi-page advances. */
         memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
         memset(Screen, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
+        Control_ClearCaptureTarget();
     } else if (FirstTime == AFF_ALL_FLIP) {
         AffScene(AFF_ALL_NO_FLIP);
     } else

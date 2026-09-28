@@ -83,6 +83,20 @@ S32 Control_SetDigestVersion(S32 v);
    from outside wants one per probe, so the console `dumpstate` verb routes here. */
 void Control_DumpStateTo(const char *path);
 
+/* Write the frame the player sees to \a path as a PNG: Log on software; under a GPU
+   backend, Log composited over a colour readback of the offscreen target (index 0
+   transparent, matching the present). The UI-capture hooks in the modal loops route
+   here for the same reason --screenshot does: Log alone is only the overlay once the
+   3D lives in the target, so SavePNG(Log) would write the UI over nothing. */
+void Control_ScreenshotTo(const char *path);
+
+/* Cleanroom background for a --black-bg capture: the composed screenshot reads Log
+   over the offscreen target, so a surface that zeroes Log/Screen for the golden has
+   to zero the target as well, or the scene a GPU backend left there composes behind
+   the UI. The clear lands on palette index 0 (black), which is what the software
+   memset produces; the next terrain pass re-arms the scene's own clear colour. */
+void Control_ClearCaptureTarget(void);
+
 /* --listen: open the command socket if this run asked for one, then service it.
    Call once per presented frame (PERSO.CPP's pre-present chain) rather than per
    tick, because the tick hook does not run inside a modal's own loop, which is where a

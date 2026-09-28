@@ -337,7 +337,7 @@ static void cmd_screenshot(int argc, const char *argv[]) {
     char path[ADELINE_MAX_PATH];
 
     unique_shoot_path("shot", "png", &seq, path, ADELINE_MAX_PATH);
-    Console_RequestScreenshot(path, 1); /* 1 = PNG via SavePNG in game */
+    Console_RequestScreenshot(path, 1); /* 1 = PNG, composed by Control_ScreenshotTo in game */
     Console_Print("Screenshot (no console): %s", path);
 }
 
@@ -543,7 +543,8 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
     if (argc >= 3 && !strcmp(argv[1], "holomap")) {
         /* HoloMap fades to black, opens HoloGlobe (the rotating planet view),
            and runs until FlagHoloEnd.  Holo_RequestCapture arms a one-shot
-           SavePNG inside HoloGlobe's loop after the fade-in + zoom-in settle,
+           frame write (Control_ScreenshotTo) inside HoloGlobe's loop after the
+           fade-in + zoom-in settle,
            then sets FlagHoloEnd so HoloMap exits cleanly. */
         Holo_RequestCapture(argv[2]);
         HoloMap();
@@ -587,9 +588,10 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
     if (argc >= 4 && !strcmp(argv[1], "dialog")) {
         /* Dial(text, drawscene) opens a dialogue bubble + portrait for the
            given text-id in the currently-loaded dialogue bank.  Dial_Request-
-           Capture arms a one-shot SavePNG that fires the first time the
-           typewriter completes a page (ret == 0 or 2), then sets flagabort
-           so Dial exits cleanly without waiting for input. */
+           Capture arms a one-shot Control_ScreenshotTo (Log; under a GPU
+           backend, Log composed over the offscreen target) that fires the
+           first time the typewriter completes a page (ret == 0 or 2), then
+           sets flagabort so Dial exits cleanly without waiting for input. */
         S32 text_id = (S32)atoi(argv[2]);
         Dial_RequestCapture(argv[3]);
         Dial(text_id, TRUE);
@@ -598,8 +600,9 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
     }
     if (argc >= 3 && !strcmp(argv[1], "menu-options")) {
         /* OptionsMenu(FALSE) opens the in-game options/pause menu and drives
-           DoGameMenu.  Menu_RequestCapture arms a one-shot SavePNG inside
-           DoGameMenu's loop; on capture, DoGameMenu returns 1000 (ESC
+           DoGameMenu.  Menu_RequestCapture arms a one-shot Control_ScreenshotTo
+           inside DoGameMenu's loop (composed: Log over the offscreen target
+           under a GPU backend); on capture, DoGameMenu returns 1000 (ESC
            sentinel) and OptionsMenu's case-1000 exits cleanly. */
         Menu_RequestCapture(argv[2]);
         OptionsMenu(FALSE);
@@ -616,6 +619,7 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
         if (Console_GetCaptureBlackBg()) {
             memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
             memset(Screen, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
+            Control_ClearCaptureTarget();
         }
         Display_MainCapture(argv[2]);
         Console_Print("ui display -> %s", argv[2]);
@@ -629,6 +633,7 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
         if (Console_GetCaptureBlackBg()) {
             memset(Log, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
             memset(Screen, 0, (size_t)ModeDesiredX * (size_t)ModeDesiredY);
+            Control_ClearCaptureTarget();
         }
         Resolution_MainCapture(argv[2]);
         Console_Print("ui resolution -> %s", argv[2]);
@@ -646,8 +651,8 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
     if (argc >= 3 && !strcmp(argv[1], "slideshow")) {
         /* End-of-island / end-game still-image montage. SlideShow loads
            pre-rendered screenshots from scrshot.hqr, each shown with a story
-           caption via Dial. SlideShow_RequestCapture arms a one-shot SavePNG
-           inside the first frame's Dial typewriter loop, exits the slideshow
+           caption via Dial. SlideShow_RequestCapture arms a one-shot frame
+           write inside the first frame's Dial typewriter loop, exits the slideshow
            loop cleanly after the capture fires. Centred PCX + letterboxed
            dialog flow — useful for verifying the Dial_Letterbox path.
            NOTE: requires scrshot.hqr in the game data (typically Demo only);
@@ -703,7 +708,7 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
         /* Controls-remapping screen (keyboard). Config_MainCapture loads the
            menu PCX into Screen (the background MenuConfig normally inherits
            from its Main Menu → Options → Controls invocation chain), arms a
-           one-shot SavePNG, and calls MenuConfig directly. */
+           one-shot Control_ScreenshotTo, and calls MenuConfig directly. */
         Config_MainCapture(argv[2]);
         Console_Print("ui config -> %s", argv[2]);
         return;
@@ -770,7 +775,7 @@ static void cmd_ui_dispatch(int argc, const char *argv[]) {
         /* DoFoundObj(numvar) opens the found-object cinematic: 3D rotation
            of the discovered item alongside a typewriter dialogue.  numvar
            is the TabInv slot index (e.g. FLAG_BALLE_MAGIQUE).
-           DoFoundObj_RequestCapture arms a one-shot SavePNG that fires
+           DoFoundObj_RequestCapture arms a one-shot frame write that fires
            after the countdown elapses; the hook sets flag=2 so the modal's
            while-loop exits cleanly. */
         S32 numvar = (S32)atoi(argv[2]);
@@ -2451,8 +2456,9 @@ void Console_RegisterAll(void) {
                               "ui {inventory|holomap|menu-options|menu-main|config|slideshow} <path> | ui holoplan <island> <path> | ui video <name> <path> | ui {dialog|found-object} <id> <path> | ui pcx-message <pcx-idx> <text-id> [<path>] [big|full|normal] | ui askchoice [--press <key>] <question-id> <choice-id>...",
                               "Composite verb for UI regression fixtures: opens a UI modal "
                               "with a deterministic auto-exit, writes the settled frame to <path> "
-                              "via SavePNG, then closes.  Compose with --load / --exec to drive "
-                              "headless captures of UI state.");
+                              "via Control_ScreenshotTo (Log; under a GPU backend, Log composed "
+                              "over the offscreen target), then closes.  Compose with --load / "
+                              "--exec to drive headless captures of UI state.");
     Console_RegisterCommandEx("savebug", cmd_savebug, "Save current game to bugs dir (optional name)", "savebug [name]",
                               "Requires in-game loaded cube (not during video); writes bugs/<name>.lba.");
     Console_RegisterCommandEx("resolution", cmd_resolution,

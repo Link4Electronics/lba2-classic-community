@@ -842,12 +842,15 @@ restartloop:
         /* Console screenshot (PNG): performed here where Log + PtrPal are valid.
            Capture Log, the presented buffer (SDL PresentFrame uploads Log); Screen
            is the clean-background secondary and misses the per-frame 3D models and
-           the foreground-brick re-blit. */
+           the foreground-brick re-blit. Under a GPU backend Log is only the
+           palette-index overlay, so the write composes it over the offscreen
+           target (Control_ScreenshotTo) and the capture still shows the frame
+           the player sees. */
         {
             char shotPath[ADELINE_MAX_PATH];
             int is_png = 0;
             if (Console_HasPendingScreenshot(shotPath, sizeof(shotPath), &is_png) && is_png) {
-                SavePNG(shotPath, Log, ModeDesiredX, ModeDesiredY, PtrPal);
+                Control_ScreenshotTo(shotPath);
                 Console_ClearPendingScreenshot();
             }
         }

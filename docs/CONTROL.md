@@ -538,19 +538,39 @@ whole savegame baseline corpus) are byte-identical to the merged behaviour. See
 
 ## UI capture
 
-Six console verbs drive each modal UI surface from the harness, render a settled frame,
-write a PNG via `SavePNG`, then exit cleanly. The world-space `--dump-state` is the
-guardrail for *simulation* state; these are the guardrail for *UI* rendering — what
-widescreen, font, palette, or layout changes are most likely to disturb.
+Thirteen verbs drive each modal UI surface from the harness, render a settled frame,
+write the PNG, then exit cleanly. Most of them write through `Control_ScreenshotTo`: Log
+under a software backend; under a GPU backend, Log composed over a colour readback of the
+offscreen target — the same write `--screenshot` uses, so the capture shows the frame the
+player sees rather than the overlay alone. Two write their own buffer instead: `ui
+inventory` reads `Screen`, and `ui video` writes Log with the cinematic's own palette. The
+world-space `--dump-state` is the guardrail for *simulation* state; these are the guardrail
+for *UI* rendering — what widescreen, font, palette, or layout changes are most likely to
+disturb.
 
 | Verb | Captures |
 |---|---|
 | `ui inventory <path>` | The inventory wheel + items + scene background |
 | `ui holomap <path>` | The rotating planet globe + island name strip |
+| `ui holoplan <island> <path>` | The zoomed-in planet/island view for one island index |
 | `ui dialog <text-id> <path>` | The dialogue bubble + portrait + typewriter text for that text-id |
-| `ui menu-options <path>` | The in-game ESC menu (Volume / Language / Advanced / Controls) over the shaded scene |
+| `ui menu-options <path>` | The in-game ESC menu (Volume / Language / Advanced / Controls) over the live scene |
 | `ui menu-main <path>` | The boot-time main menu (Resume / New Game / Load / Options / Quit) |
+| `ui display <path>` | The Display submenu (resolution, vsync, renderer, filter rows) |
+| `ui resolution <path>` | The resolution catalog submenu |
+| `ui config <path>` | The controls-remapping screen over the boot-menu backdrop |
 | `ui found-object <numvar> <path>` | The found-object cinematic — 3D rotation of `TabInv[numvar]`'s item + dialogue |
+| `ui video <name> <path>` | A settled frame of a named ACF / Smacker cinematic |
+| `ui slideshow <path>` | The end-of-island still-image montage |
+| `ui pcx-message <pcx-idx> <text-id> <path> …` | A `screen.hqr` PCX with a dialogue caption over it |
+
+`--black-bg` before the verb zeroes the backdrop for a cleanroom golden: `Log` and `Screen`
+the same way a software capture wants them, and — through `Control_ClearCaptureTarget` — the
+offscreen target as well, or the scene a GPU backend left there composes behind the UI.
+
+`ui menu-options` captures the backdrop its own harness path renders. `FlagShadeMenu`, which
+dims the scene behind the menu items, is set only for a session opened from the boot menu
+the way a player opens one, so a `--load` run captures the menu unshaded.
 
 Each verb takes the destination path as its last argument. Compose with `--load` and
 `--exec` like any other console command; the verb opens the modal, captures, and exits
@@ -593,7 +613,7 @@ is the windowless-but-audible pairing; see `test_askchoice_menus_consume.sh`.
 
 ### Test fixtures and goldens
 
-Ten `tests/automation/test_ui_*.sh` fixtures byte-compare each verb's output against a
+Fourteen `tests/automation/test_ui_*.sh` fixtures byte-compare each verb's output against a
 committed PNG golden under `tests/savegame/corpus/baselines/ui/`. They run in
 `tests/automation/run.sh` alongside the other harness tests. The goldens were rendered
 under the dummy video driver, so the comparison must be too; `ctl_headless` in `lib.sh`
@@ -704,8 +724,9 @@ following:
   cleanly.
 
 The pieces of a new surface are: a public `Modal_RequestCapture(path)` setter that
-arms a static path + iteration countdown; a capture hook in the modal's loop that
-SavePNGs and triggers the exit sentinel; a `cmd_ui` dispatcher branch; one
+arms a static path + iteration countdown; a capture hook in the modal's loop that writes
+the frame through `Control_ScreenshotTo` and triggers the exit sentinel; a `cmd_ui`
+dispatcher branch; one
 `test_ui_modal.sh` + one committed golden PNG under
 `tests/savegame/corpus/baselines/ui/`.
 

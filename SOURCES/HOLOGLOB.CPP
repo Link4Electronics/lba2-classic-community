@@ -3,6 +3,7 @@
 //
 
 #include "C_EXTERN.H" // include LBA2
+#include "CONTROL.H"
 #include "DIRECTORIES.H"
 #include "INPUT.H"
 #include "UI_LAYOUT.H" /* UI_VCENTER_OFS */
@@ -969,8 +970,9 @@ S32 GoToArrow() {
 }
 //────────────────────────────────────────────────────────────────────────────
 /* Harness capture state — see Holo_RequestCapture() in HOLO.H.  When the path
-   is non-empty, HoloGlobe's modal loop fires a one-shot SavePNG after the
-   countdown elapses, then sets FlagHoloEnd and breaks so the wrapper HoloMap
+   is non-empty, HoloGlobe's modal loop writes the settled frame
+   (Control_ScreenshotTo) after the countdown elapses, then sets FlagHoloEnd
+   and breaks so the wrapper HoloMap
    exits cleanly.  The countdown gives the fade-in (~200 ms via the palette
    fade in HoloMap) and the zoom-in animation (ZoomPlanet ramps over 500 ms
    from ZOOM_INIT_PLANET to ZoomPlanetDest) time to settle into the steady
@@ -1124,8 +1126,7 @@ void HoloGlobe(S32 planet) {
            strip composited from a prior iteration's AffHoloMess, which is
            exactly the frame a player sees. */
         if (s_holo_capture_path[0] && --s_holo_capture_countdown <= 0) {
-            SavePNG(s_holo_capture_path, Log, (S32)ModeDesiredX,
-                    (S32)ModeDesiredY, PtrPal);
+            Control_ScreenshotTo(s_holo_capture_path);
             s_holo_capture_path[0] = '\0';
             FlagHoloEnd = TRUE;
             break;

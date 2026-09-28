@@ -174,7 +174,6 @@ static int s_captured_at_stream_end = 0;
 static long s_left_for_menu_tick = -1;
 
 static void control_dump_state(const char *path);
-static void control_screenshot(const char *path);
 static void control_console_echo(const char *line);
 int Control_UnfiredExecAt(void);
 
@@ -1142,7 +1141,7 @@ static void control_dump_state(const char *path) {
     fclose(f);
 }
 
-static void control_screenshot(const char *path) {
+void Control_ScreenshotTo(const char *path) {
     /* Capture the frame the player sees. On software that is Log (the
        presented buffer). Under a GPU backend the 3D lives in the offscreen
        target and Log is only the palette-index overlay (index 0 transparent),
@@ -1187,6 +1186,20 @@ static void control_screenshot(const char *path) {
     SavePNG((char *)path, Log, (S32)ModeDesiredX, (S32)ModeDesiredY, PtrPal);
 }
 
+void Control_ClearCaptureTarget(void) {
+    if (!GpuRenderer_IsActive()) {
+        return;
+    }
+    /* Index 0, not the scene's clear colour: the cleanroom golden is black
+       behind the UI, and an exterior's fog fill would show through wherever
+       Log stays transparent. */
+    GpuRenderer_SetSceneClearIndex(0);
+    /* Deferred by the backend until the frame's first pass or present, so the
+       target goes black on the next present even though a modal menu draws no
+       GPU geometry of its own. */
+    GpuRenderer_ClearFBO();
+}
+
 /* The capture half of finalize: dump/screenshot only, no exit. Shared by the tick-budget
    path (control_finalize) and the natural-return path (Control_End). Idempotent. */
 static void control_capture(void) {
@@ -1197,7 +1210,7 @@ static void control_capture(void) {
     if (s_have_dump)
         control_dump_state(s_dump_path);
     if (s_have_shot)
-        control_screenshot(s_shot_path);
+        Control_ScreenshotTo(s_shot_path);
     /* Flush projection capture last so any final-frame SetProjection from the dump/
        screenshot present path is included. End is idempotent; safe even if never armed,
        and closes both sinks in one call. */

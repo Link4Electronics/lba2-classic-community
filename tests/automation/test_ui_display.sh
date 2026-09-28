@@ -22,5 +22,8 @@ GOLDEN="$REPO/tests/savegame/corpus/baselines/ui/display_Anon1.png"
 
 [ -f "$LBA2_TEST_SAVE" ] || skip "fixture save missing: $LBA2_TEST_SAVE"
 
-# Plasma strip excluded, as in test_ui_menu_main.sh.
-ui_compare --exclude 46,127,549,49 "--black-bg display" "$GOLDEN"
+# Plasma strip excluded, as in test_ui_menu_main.sh. The band tracks the panel's
+# first row: the Renderer and Bilinear rows added two rows to this submenu, the
+# panel re-centred with them, and a band left at the old 4-row offset landed on
+# the Resolution row instead and read as a missing strip.
+ui_compare --exclude 46,71,549,49 "--black-bg display" "$GOLDEN"

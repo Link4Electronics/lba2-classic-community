@@ -6,10 +6,11 @@ extern void DrawConfigFire(S32 xmin, S32 ymin, S32 xmax, S32 ymax, S32 coul);
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 extern void MenuConfig(void);
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-/* Arm a one-shot SavePNG inside MenuConfig's modal loop. After the loop
-   settles past initial draw, SavePNGs to <path> and exits cleanly (no key
-   bindings changed). Pass NULL to disarm. Mirror of Menu_RequestCapture /
-   Inv_RequestCapture / Holo_RequestCapture (see GAMEMENU.H, INVENT.H, HOLO.H). */
+/* Arm a one-shot capture inside MenuConfig's modal loop. After the loop
+   settles past initial draw, Control_ScreenshotTo writes the settled frame
+   to <path> and exits cleanly (no key bindings changed). Pass NULL to
+   disarm. Mirror of Menu_RequestCapture / Inv_RequestCapture /
+   Holo_RequestCapture (see GAMEMENU.H, INVENT.H, HOLO.H). */
 extern void Config_RequestCapture(const char *path);
 
 //▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀

@@ -60,8 +60,9 @@ extern S32 DoGameMenu(U16 *ptrmenu);
 extern S32 OptionsMenu(S32 flagflip);
 /* Harness hook: arm a one-shot screenshot inside the next DoGameMenu call.
    After a countdown of iterations (long enough for the menu to fade in and
-   settle), SavePNG is called with the supplied path and DoGameMenu returns
-   1000 (the "ESC" sentinel) so the wrapping menu loop exits cleanly.
+   settle), Control_ScreenshotTo writes the settled frame to the supplied
+   path and DoGameMenu returns 1000 (the "ESC" sentinel) so the wrapping
+   menu loop exits cleanly.
    Pass NULL or "" to disarm.  Used by the console "ui menu-options <path>"
    verb. */
 extern void Menu_RequestCapture(const char *path);
@@ -131,7 +132,7 @@ extern void Credits(S32 mode);
 /*--------------------------------------------------------------------------*/
 extern S32 SlideShow(void);
 /*--------------------------------------------------------------------------*/
-/* Arm a one-shot SavePNG inside SlideShow's first frame and exit cleanly
+/* Arm a one-shot frame write inside SlideShow's first frame and exit cleanly
    after capturing. Mirrors Inv_RequestCapture / Menu_RequestCapture /
    Dial_RequestCapture etc. Wire into the harness via `ui slideshow <path>`. */
 extern void SlideShow_RequestCapture(const char *path);

@@ -106,9 +106,10 @@ extern void SpeakAnimation(void);
 extern void Dial(S32 text, S32 drawscene);
 /* Harness hook: arm a one-shot screenshot inside the next Dial call.
    When the dialogue's typewriter completes the current page (NextDialCar
-   returns 0 or 2), SavePNG is called with the supplied path and flagabort
-   is set so Dial exits cleanly without waiting for input.  Pass NULL or
-   "" to disarm.  Used by the console "ui dialog <text-id> <path>" verb. */
+   returns 0 or 2), Control_ScreenshotTo writes the settled frame to the
+   supplied path and flagabort is set so Dial exits cleanly without waiting
+   for input.  Pass NULL or ""
+   to disarm.  Used by the console "ui dialog <text-id> <path>" verb. */
 extern void Dial_RequestCapture(const char *path);
 extern S32 MyDial(S32 nummess);
 /*	GetMultiText() copies up to 255 bytes of the entry and always terminates at

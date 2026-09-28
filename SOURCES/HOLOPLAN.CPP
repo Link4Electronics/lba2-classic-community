@@ -1,4 +1,5 @@
 #include "C_EXTERN.H"
+#include "CONTROL.H"
 #include "DIRECTORIES.H"
 #include "IMAGE_LOAD.H"
 #include "INPUT.H"
@@ -753,9 +754,9 @@ void SearchObjectifIsland(S32 dir) {
 }
 //════════════════════════════════════════════════════════════════════════════
 /* Harness capture state — see HoloPlan_RequestCapture() in HOLO.H.  When
-   the path is non-empty, HoloPlan's modal loop fires a one-shot SavePNG
-   once the post-fade steady state is reached, then sets FlagHoloEnd and
-   breaks so HoloPlan exits cleanly. */
+   the path is non-empty, HoloPlan's modal loop writes the settled frame
+   (Control_ScreenshotTo) once the post-fade steady state is reached, then
+   sets FlagHoloEnd and breaks so HoloPlan exits cleanly. */
 static char s_holoplan_capture_path[ADELINE_MAX_PATH] = "";
 static int s_holoplan_capture_countdown = 0;
 
@@ -927,8 +928,7 @@ void HoloPlan(S32 numplan) {
            centred via SetProjection, and any reticule + dialogue strip the
            player would see at rest. */
         if (s_holoplan_capture_path[0] && --s_holoplan_capture_countdown <= 0) {
-            SavePNG(s_holoplan_capture_path, Log, (S32)ModeDesiredX,
-                    (S32)ModeDesiredY, PtrPal);
+            Control_ScreenshotTo(s_holoplan_capture_path);
             s_holoplan_capture_path[0] = '\0';
             FlagHoloEnd = TRUE;
             break;

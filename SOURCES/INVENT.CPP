@@ -1467,8 +1467,9 @@ extern S32 Dial_Y0;
 /*──────────────────────────────────────────────────────────────────────────*/
 /* Harness capture state — see DoFoundObj_RequestCapture() in INVENT.H.  When
    the path is non-empty, DoFoundObj's modal loop counts down per iteration;
-   on reaching zero it SavePNGs and sets flag=2 so the loop exits cleanly
-   without waiting for input.  Countdown gives the open-rotation animation
+   on reaching zero it writes the settled frame and sets flag=2 so the loop
+   exits cleanly without waiting for input.  Countdown gives the open-rotation
+   animation
    and the typewriter text time to settle into the steady "item showcase"
    state a player sees mid-cinematic. */
 static char s_found_capture_path[ADELINE_MAX_PATH] = "";
@@ -1786,12 +1787,12 @@ void DoFoundObj(S32 numvar) {
         BoxUpdate();
 
         /* Harness one-shot capture: count down per iteration; on reaching
-           zero SavePNG (read Log -- the cinematic composites the rotating
-           item and dialogue strip there, same pattern as ui dialog and ui
-           holomap) and set flag=2 so the modal loop exits cleanly. */
+           zero write the settled frame (read Log -- the cinematic composites
+           the rotating item and dialogue strip there, same pattern as ui
+           dialog and ui holomap) and set flag=2 so the modal loop exits
+           cleanly. */
         if (s_found_capture_path[0] && --s_found_capture_countdown <= 0) {
-            SavePNG(s_found_capture_path, Log, (S32)ModeDesiredX,
-                    (S32)ModeDesiredY, PtrPal);
+            Control_ScreenshotTo(s_found_capture_path);
             s_found_capture_path[0] = '\0';
             flag = 2;
             break;

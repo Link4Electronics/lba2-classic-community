@@ -109,8 +109,9 @@ extern void DoFoundObj(S32 numobj);
    The found-object cinematic shows a 3D rotation of the discovered item
    alongside a typewriter-text dialogue.  After a countdown of iterations
    (long enough for the rotation to settle into a steady frame and the text
-   to draw), SavePNG is called with the supplied path and flag=2 is set so
-   the modal loop exits cleanly without waiting for input.  Pass NULL or ""
+   to draw), Control_ScreenshotTo writes the settled frame to the supplied
+   path and flag=2 is set so the modal loop exits cleanly without waiting
+   for input.  Pass NULL or ""
    to disarm.  Used by the console "ui found-object <numvar> <path>" verb. */
 extern void DoFoundObj_RequestCapture(const char *path);
 /*--------------------------------------------------------------------------*/

@@ -16,6 +16,7 @@
 
 #include "C_EXTERN.H"
 #include "CONFIG.H"
+#include "CONTROL.H"
 #include "IMAGE_LOAD.H"
 #include "DIRECTORIES.H"
 #include "INPUT.H"
@@ -637,8 +638,9 @@ S32 CheckKeyConfig(S32 key) {
 
 /* Harness capture state — see Config_RequestCapture() in CONFIG.H. When the
    path is non-empty, MenuConfig's modal loop counts down per iteration; on
-   reaching zero it SavePNGs the rendered config screen and sets `ok = TRUE`
-   so the loop exits cleanly without modifying the saved key bindings.
+   reaching zero it writes the rendered config screen (Control_ScreenshotTo)
+   and sets `ok = TRUE` so the loop exits cleanly without modifying the saved
+   key bindings.
    Mirror of Menu_RequestCapture (GAMEMENU.CPP) / Inv_RequestCapture etc. */
 static char s_config_capture_path[ADELINE_MAX_PATH] = "";
 static int s_config_capture_countdown = 0;
@@ -715,8 +717,7 @@ void MenuConfig(void) {
         BoxUpdate();
 
         if (s_config_capture_path[0] && --s_config_capture_countdown <= 0) {
-            SavePNG(s_config_capture_path, Log, (S32)ModeDesiredX,
-                    (S32)ModeDesiredY, PtrPal);
+            Control_ScreenshotTo(s_config_capture_path);
             s_config_capture_path[0] = '\0';
             ok = TRUE; /* exit cleanly without restoring MemoDefKeys */
             break;
